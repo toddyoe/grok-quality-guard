@@ -260,9 +260,10 @@ func (p *Plugin) handleProbeFailure(authID string, raw map[string]json.RawMessag
 	if reEnabled || (meta.Managed && meta.DisableKind != "") {
 		kind := DisableKindCooldown
 		duration := cooldownForClass(class, policy.Quality)
+		allowPermanent := policy.AutoAction != "cooldown_only"
 		switch class {
 		case ClassMissingThinking:
-			if meta.StrikeMissingThinking {
+			if allowPermanent && meta.StrikeMissingThinking {
 				kind = DisableKindPermanent
 				duration = 0
 			}
@@ -274,7 +275,7 @@ func (p *Plugin) handleProbeFailure(authID string, raw map[string]json.RawMessag
 		if duration <= 0 && kind == DisableKindCooldown {
 			duration = policy.Quality.MissingThinkingCooldown.Duration
 		}
-		if errDisable := p.applyGuardDisableLocked(context.Background(), authID, kind, duration, class, "probe", class == ClassMissingThinking); errDisable != nil {
+		if errDisable := p.applyGuardDisableLocked(context.Background(), authID, kind, duration, class, "probe", allowPermanent && class == ClassMissingThinking); errDisable != nil {
 			return errDisable
 		}
 	}

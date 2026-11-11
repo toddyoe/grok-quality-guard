@@ -222,3 +222,56 @@ func TestReconcileRepairsTemporaryProbeEnable(t *testing.T) {
 		t.Fatalf("unexpected reconciled state: %#v", account)
 	}
 }
+
+func TestCooldownOnlyRecoveryFailureKeepsCooling(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", map[string]any{
+		"grok_quality_guard": map[string]any{
+			"managed":                 true,
+			"disable_kind":            DisableKindCooldown,
+			"strike_missing_thinking": true,
+		},
+	})
+	host := newMockHostCall(entries, auths)
+	plugin := newTestPlugin(t, host, func(cfg *Config) { cfg.AutoAction = "cooldown_only" })
+	_, response, raw, errResolve := plugin.resolveAuth(context.Background(), "auth-1")
+	if errResolve != nil {
+		t.Fatal(errResolve)
+	}
+	lock := plugin.accountLock("auth-1")
+	lock.Lock()
+	errFailure := plugin.handleProbeFailure("auth-1", raw, response, true, ClassMissingThinking, nil)
+	lock.Unlock()
+	if errFailure != nil {
+		t.Fatal(errFailure)
+	}
+	account, _ := plugin.stateAccount("auth-1")
+	if account.State != StateCooling || account.DisableKind != DisableKindCooldown {
+		t.Fatalf("cooldown-only mode did not keep cooling: %#v", account)
+	}
+	if account.CooldownUntil.IsZero() {
+		t.Fatal("cooldown deadline was not refreshed")
+	}
+	saved, err := rawAuthToMap(host.saves["auth-1"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !authDisabled(saved) || guardMeta(saved).DisableKind != DisableKindCooldown {
+		t.Fatalf("unexpected auth metadata: %#v", guardMeta(saved))
+	}
+}
+
+func TestCooldownOnlyAppliesCooldownOnConfirmedAnomaly(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	plugin := newTestPlugin(t, host, func(cfg *Config) { cfg.AutoAction = "cooldown_only" })
+	if err := plugin.ApplyVerdict(context.Background(), "auth-1", QualityVerdict{Class: ClassMissingThinking}, "passive", ""); err != nil {
+		t.Fatal(err)
+	}
+	account, _ := plugin.stateAccount("auth-1")
+	if account.State != StateCooling || account.DisableKind != DisableKindCooldown {
+		t.Fatalf("cooldown-only anomaly was not cooled: %#v", account)
+	}
+	if account.CooldownUntil.IsZero() {
+		t.Fatal("cooldown deadline is missing")
+	}
+}

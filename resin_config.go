@@ -52,6 +52,7 @@ type resinValidationResult struct {
 	AdminTokenValid   bool      `json:"admin_token_valid"`
 	PlatformValid     bool      `json:"platform_valid"`
 	Platform          string    `json:"platform"`
+	PlatformID        string    `json:"platform_id,omitempty"`
 	ProxyTokenValid   bool      `json:"proxy_token_valid"`
 	ValidatedAt       time.Time `json:"validated_at"`
 }
@@ -185,6 +186,9 @@ func (p *Plugin) actionResinConfigSave(ctx context.Context, params map[string]an
 	if result.Platform != "" {
 		normalized.Platform = result.Platform
 	}
+	if result.PlatformID != "" {
+		normalized.PlatformID = result.PlatformID
+	}
 	normalized.LocalOnly = result.LocalOnly
 	normalized.Configured = true
 	normalized.ValidatedAt = result.ValidatedAt
@@ -275,12 +279,6 @@ func normalizeResinAdminSettings(settings ResinSettings) (ResinSettings, error) 
 	if settings.Platform == "" {
 		return ResinSettings{}, resinConfigErrorf(http.StatusBadRequest, "resin platform is required")
 	}
-	if settings.PlatformID == "" {
-		return ResinSettings{}, resinConfigErrorf(http.StatusBadRequest, "resin platform_id is required")
-	}
-	if !resinPlatformIDPattern.MatchString(settings.PlatformID) {
-		return ResinSettings{}, resinConfigErrorf(http.StatusBadRequest, "resin platform_id must be a UUID")
-	}
 	if settings.AdminURL == "" {
 		return ResinSettings{}, resinConfigErrorf(http.StatusBadRequest, "resin admin_url is required")
 	}
@@ -360,12 +358,13 @@ func validateResinSettings(ctx context.Context, settings ResinSettings) (resinVa
 	}
 	result.AdminAPIReachable = true
 	result.AdminTokenValid = true
-	platformName, errPlatform := validateResinPlatform(ctx, settings)
+	resolved, errPlatform := resolveResinPlatformByName(ctx, settings)
 	if errPlatform != nil {
 		return result, errPlatform
 	}
-	settings.Platform = platformName
-	result.Platform = platformName
+	settings = resolved
+	result.Platform = settings.Platform
+	result.PlatformID = settings.PlatformID
 	result.PlatformValid = true
 	if errProxy := validateResinProxyToken(ctx, settings); errProxy != nil {
 		return result, errProxy
@@ -420,17 +419,77 @@ func validateResinPlatform(ctx context.Context, settings ResinSettings) (string,
 	}
 }
 
+type resinPlatformSummary struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+func resolveResinPlatformByName(ctx context.Context, settings ResinSettings) (ResinSettings, error) {
+	requested := strings.TrimSpace(settings.Platform)
+	if requested == "" {
+		return ResinSettings{}, resinConfigErrorf(http.StatusBadRequest, "resin platform is required")
+	}
+	query := url.Values{}
+	query.Set("keyword", requested)
+	query.Set("sort_by", "name")
+	query.Set("sort_order", "asc")
+	query.Set("limit", "1000")
+	query.Set("offset", "0")
+	status, body, errRequest := resinAdminRequest(ctx, settings, http.MethodGet, "/api/v1/platforms?"+query.Encode())
+	if errRequest != nil {
+		return ResinSettings{}, resinConfigErrorf(http.StatusBadGateway, "resin platform validation failed: %s", sanitizeError(errRequest))
+	}
+	switch status {
+	case http.StatusOK:
+		var page struct {
+			Items []resinPlatformSummary `json:"items"`
+		}
+		if errUnmarshal := json.Unmarshal(body, &page); errUnmarshal != nil {
+			return ResinSettings{}, resinConfigErrorf(http.StatusBadGateway, "resin platform API returned an invalid response")
+		}
+		exact := make([]resinPlatformSummary, 0, 1)
+		folded := make([]resinPlatformSummary, 0, 1)
+		for _, platform := range page.Items {
+			if platform.Name == requested {
+				exact = append(exact, platform)
+			}
+			if strings.EqualFold(platform.Name, requested) {
+				folded = append(folded, platform)
+			}
+		}
+		matches := exact
+		if len(matches) == 0 {
+			matches = folded
+		}
+		if len(matches) == 0 {
+			return ResinSettings{}, resinConfigErrorf(http.StatusBadRequest, "resin platform name was not found")
+		}
+		if len(matches) > 1 {
+			return ResinSettings{}, resinConfigErrorf(http.StatusBadRequest, "resin platform name is ambiguous")
+		}
+		matched := matches[0]
+		if !resinPlatformIDPattern.MatchString(matched.ID) || strings.TrimSpace(matched.Name) == "" {
+			return ResinSettings{}, resinConfigErrorf(http.StatusBadGateway, "resin platform API returned an invalid response")
+		}
+		settings.Platform = matched.Name
+		settings.PlatformID = matched.ID
+		return settings, nil
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return ResinSettings{}, resinConfigErrorf(http.StatusBadRequest, "resin admin token was rejected with status %d", status)
+	default:
+		if status >= 500 {
+			return ResinSettings{}, resinConfigErrorf(http.StatusBadGateway, "resin platform API returned status %d", status)
+		}
+		return ResinSettings{}, resinConfigErrorf(http.StatusBadRequest, "resin platform API returned status %d", status)
+	}
+}
+
 func resolveResinAdminForOperation(ctx context.Context, settings ResinSettings) (ResinSettings, error) {
 	normalized, errNormalize := normalizeResinAdminSettings(settings)
 	if errNormalize != nil {
 		return ResinSettings{}, errNormalize
 	}
-	platformName, errPlatform := validateResinPlatform(ctx, normalized)
-	if errPlatform != nil {
-		return ResinSettings{}, errPlatform
-	}
-	normalized.Platform = platformName
-	return normalized, nil
+	return resolveResinPlatformReference(ctx, normalized)
 }
 
 func resolveResinPlatformForOperation(ctx context.Context, settings ResinSettings) (ResinSettings, error) {
@@ -441,12 +500,19 @@ func resolveResinPlatformForOperation(ctx context.Context, settings ResinSetting
 	if normalized.LocalOnly {
 		return ResinSettings{}, resinConfigErrorf(http.StatusBadRequest, "resin API mode is required for this operation")
 	}
-	platformName, errPlatform := validateResinPlatform(ctx, normalized)
-	if errPlatform != nil {
-		return ResinSettings{}, errPlatform
+	return resolveResinPlatformReference(ctx, normalized)
+}
+
+func resolveResinPlatformReference(ctx context.Context, settings ResinSettings) (ResinSettings, error) {
+	if strings.TrimSpace(settings.PlatformID) != "" {
+		platformName, errPlatform := validateResinPlatform(ctx, settings)
+		if errPlatform != nil {
+			return ResinSettings{}, errPlatform
+		}
+		settings.Platform = platformName
+		return settings, nil
 	}
-	normalized.Platform = platformName
-	return normalized, nil
+	return resolveResinPlatformByName(ctx, settings)
 }
 
 func resinAdminRequest(ctx context.Context, settings ResinSettings, method, path string) (int, []byte, error) {

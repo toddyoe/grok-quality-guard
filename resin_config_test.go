@@ -125,14 +125,14 @@ func TestResinConfigSavePersistsValidatedSettingsAndPreservesBlankTokens(t *test
 	host := newMockHostCall(entries, auths)
 	plugin := newTestPlugin(t, host, nil)
 	params := validResinParams(adminServer.URL, socksAddr)
-	params["platform"] = "Stale"
+	params["platform"] = "default"
 	response := actionManagementForTest(t, plugin, "resin.config.save", params)
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d body=%s", response.StatusCode, response.Body)
 	}
 	state := plugin.store.Snapshot()
 	if state.Resin.Platform != "Default" {
-		t.Fatalf("saved platform was not canonicalized from platform_id: %#v", state.Resin)
+		t.Fatalf("saved platform was not canonicalized from platform name: %#v", state.Resin)
 	}
 	if !state.Resin.Configured || state.Resin.AdminToken != "admin-secret" || state.Resin.ProxyToken != "proxy-secret" {
 		t.Fatalf("validated resin config was not persisted: %#v", state.Resin)
@@ -221,6 +221,9 @@ func newResinValidationServers(t *testing.T, adminToken, proxyToken string, acce
 		case "/api/v1/system/info":
 			writer.Header().Set("Content-Type", "application/json")
 			_, _ = writer.Write([]byte(`{"version":"test"}`))
+		case "/api/v1/platforms":
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = writer.Write([]byte(`{"items":[{"id":"` + testResinPlatformID + `","name":"Default"}],"total":1,"limit":1000,"offset":0}`))
 		case "/api/v1/platforms/" + testResinPlatformID:
 			writer.Header().Set("Content-Type", "application/json")
 			_, _ = writer.Write([]byte(`{"id":"` + testResinPlatformID + `","name":"Default"}`))
@@ -342,5 +345,32 @@ func TestValidateResinPlatformReturnsCanonicalName(t *testing.T) {
 	name, errValidate := validateResinPlatform(context.Background(), settings)
 	if errValidate != nil || name != "Canonical" {
 		t.Fatalf("name=%q error=%v", name, errValidate)
+	}
+}
+
+func TestResolveResinPlatformByName(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/v1/platforms" {
+			writer.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if request.URL.Query().Get("keyword") != "canonical" {
+			t.Fatalf("keyword = %q", request.URL.Query().Get("keyword"))
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"items":[{"id":"` + testResinPlatformID + `","name":"Canonical"}],"total":1,"limit":1000,"offset":0}`))
+	}))
+	defer server.Close()
+	settings := ResinSettings{
+		Platform:   "canonical",
+		AdminURL:   server.URL,
+		AdminToken: "admin-secret",
+	}
+	resolved, errResolve := resolveResinPlatformByName(context.Background(), settings)
+	if errResolve != nil {
+		t.Fatal(errResolve)
+	}
+	if resolved.Platform != "Canonical" || resolved.PlatformID != testResinPlatformID {
+		t.Fatalf("unexpected resolved platform: %#v", resolved)
 	}
 }

@@ -50,3 +50,13 @@ func TestConfigRevisionStable(t *testing.T) {
 		t.Fatal("different config should produce different revision")
 	}
 }
+
+func TestDecodeConfigCooldownOnly(t *testing.T) {
+	cfg, errDecode := decodeConfig([]byte("auto_action: cooldown_only\n"))
+	if errDecode != nil {
+		t.Fatalf("decodeConfig() error = %v", errDecode)
+	}
+	if cfg.AutoAction != "cooldown_only" {
+		t.Fatalf("auto_action = %q", cfg.AutoAction)
+	}
+}

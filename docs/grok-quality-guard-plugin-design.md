@@ -547,12 +547,14 @@ suspect
 
 degraded
   ├─ auto_action=observe -> degraded
+  ├─ auto_action=cooldown_only -> cooling
   └─ auto_action=cooldown_then_disable -> cooling
 
 cooling
   ├─ cooldown not expired -> cooling
   ├─ probe pass -> healthy, keep missing-thinking strike
-  ├─ missing_thinking after cooldown -> disabled_by_guard
+  ├─ cooldown_only + missing_thinking after cooldown -> cooling again
+  ├─ cooldown_then_disable + missing_thinking after cooldown -> disabled_by_guard
   └─ probe error -> cooling + backoff
 
 disabled_by_guard
@@ -569,6 +571,15 @@ disabled_by_guard
 - 不自动轮换 Resin
 - 不写 disabled
 - 历史 anomaly 数量用于展示，不在切换到自动策略时追溯处罚
+
+`auto_action=cooldown_only`：
+
+1. 第一次确认异常：写临时 `disabled=true`、`disable_kind=cooldown`、`cooldown_until=now+对应冷却时长`，状态 `cooling`。
+2. 冷却期内再次观测到异常：保持当前冷却，不重复延长。
+3. 冷却到期后执行恢复探测。
+4. 恢复探测成功：恢复 `disabled=false`，状态 `healthy`。
+5. 恢复探测仍异常：重新进入冷却，状态保持 `cooling`，不写永久禁用。
+6. 恢复探测网络错误：重新进入 cooldown + backoff，不写永久禁用。
 
 `auto_action=cooldown_then_disable`：
 
@@ -856,7 +867,8 @@ UsagePlugin 只作为辅助指标来源：
 passive 发现 confirmed anomaly 时：
 
 - `observe`：只记录
-- `cooldown_then_disable`：执行第 5 节的状态机
+- `cooldown_only`：执行第 5 节的冷却状态机，恢复探测失败时继续冷却
+- `cooldown_then_disable`：执行第 5 节的状态机，恢复探测失败时永久禁用
 
 被动路径无法阻止当前请求，状态更新只影响后续请求和 CPA auth selection。
 
@@ -947,7 +959,6 @@ CPA 不允许直接执行 disabled auth。恢复探测流程必须：
 - `resin.enabled`
 - `resin.local_only`
 - `resin.platform`
-- `resin.platform_id`
 - `resin.admin_url`
 - `resin.admin_token`
 - `resin.proxy_token`
@@ -967,13 +978,13 @@ API 模式保存时必须同时验证：
 
 1. `admin_url` 是带 host 的合法 `http` 或 `https` URL，且不包含 userinfo、query 或 fragment。
 2. 使用 Admin Token 调用 `GET /api/v1/system/info`，验证 Admin API 可达且 Token 有效。
-3. 使用同一 Admin Token 调用 `GET /api/v1/platforms/{platform_id}`，验证平台 ID 存在，并以 API 返回的 `name` 作为后续代理模板使用的规范平台名。
+3. 使用同一 Admin Token 调用 `GET /api/v1/platforms?keyword={platform}`，按平台名称精确解析 `platform_id`，并以 API 返回的 `name` 作为后续代理模板使用的规范平台名。
 4. 按代理模板渲染验证账号 `grok-validation`，对代理主机执行 SOCKS5 RFC1929 用户名/密码认证，验证 Proxy Token 被接受。
 5. 任一步失败都返回明确错误，且不得写入 state。
 
 `admin_token` 和 `proxy_token` 只在 API 模式全部验证通过后写入 state。管理页与 JSON API 永远不返回 token 原值，只返回 `admin_token_set` 和 `proxy_token_set`；留空再次保存时保留已有 token。
 
-`platform_id` 是 API 模式下租约 API 必需的 UUID。`platform_id` 是唯一事实源，`platform` 是展示值。保存时会把 Admin API 返回的规范平台名写回 state。绑定和轮换运行时还会以 `platform_id` 再次查询平台名，因此即使 YAML 初始化、state 被人工修改或 Resin 平台改名，删除租约和代理模板也不会继续使用过期名称。
+Resin 平台名称在 Resin 内唯一。管理员只填写 `platform`，保存时插件通过平台列表接口解析出内部 `platform_id` 并写入 state。绑定和轮换运行时以内部 `platform_id` 再次查询规范平台名，因此即使 YAML 初始化、state 被人工修改或 Resin 平台改名，删除租约和代理模板也不会继续使用过期名称。
 
 ### 9.2 Account 命名
 
@@ -1343,7 +1354,6 @@ plugins:
         enabled: false
         local_only: false
         platform: "Default"
-        platform_id: ""
         admin_url: ""
         admin_token_env: "RESIN_ADMIN_TOKEN"
         proxy_token_env: "RESIN_PROXY_TOKEN"

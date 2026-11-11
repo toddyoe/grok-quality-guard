@@ -103,16 +103,19 @@ func TestAccountsListMasksSecrets(t *testing.T) {
 		t.Fatalf("status = %d body=%s", response.StatusCode, response.Body)
 	}
 	text := string(response.Body)
-	for _, forbidden := range []string{"proxy-secret", "access-auth-1", "refresh-auth-1", "alice@example.com"} {
+	for _, forbidden := range []string{"proxy-secret", "access-auth-1", "refresh-auth-1"} {
 		if strings.Contains(text, forbidden) {
 			t.Fatalf("management response leaked %q: %s", forbidden, text)
 		}
 	}
-	if !strings.Contains(text, "a***@example.com") || !strings.Contains(text, "socks5h://example.com:1080") {
+	if !strings.Contains(text, "al***e@example.com") || !strings.Contains(text, "socks5h://example.com:1080") {
 		t.Fatalf("management response did not include masked values: %s", text)
 	}
 	if !strings.Contains(text, "auth_id_display") {
 		t.Fatalf("management response missing masked auth id: %s", text)
+	}
+	if !strings.Contains(text, "display_full") {
+		t.Fatalf("management response missing full display value: %s", text)
 	}
 	var decoded struct {
 		OK   bool `json:"ok"`

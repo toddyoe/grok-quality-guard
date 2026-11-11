@@ -210,6 +210,7 @@ td { font-size: 11px; }
 tbody tr:last-child td { border-bottom: 0; }
 tbody tr:hover td { background: var(--surface-hover); }
 .account-name { font-size: 12px; font-weight: 600; }
+.account-name[title] { cursor: help; }
 .subline { margin-top: 2px; color: var(--subtle); font-size: 10px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 .mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-variant-numeric: tabular-nums; }
 .nowrap { white-space: nowrap; }
@@ -454,7 +455,7 @@ body.drawer-open { overflow: hidden; }
         </div>
         <div class="toolbar">
           <div class="toolbar-left">
-            <label class="search"><svg class="icon"><use href="#i-search"></use></svg><input id="leaseSearch" type="search" placeholder="搜索账号或代理账号" autocomplete="off"></label>
+            <label class="search"><svg class="icon"><use href="#i-search"></use></svg><input id="leaseSearch" type="search" placeholder="搜索账号、代理地址或租约账号" autocomplete="off"></label>
             <select class="control" id="leaseFilter" aria-label="筛选代理状态">
               <option value="all">全部租约</option>
               <option value="bound">已绑定</option>
@@ -472,7 +473,7 @@ body.drawer-open { overflow: hidden; }
           </div>
         </div>
         <div class="table-wrap">
-          <table style="min-width:960px"><thead><tr><th class="select-cell"><input id="leaseSelectAll" type="checkbox" aria-label="选择本页全部账号" title="选择本页全部账号"></th><th>账号</th><th>代理</th><th>代理账号</th><th>轮换代数</th><th>状态</th><th style="text-align:right">操作</th></tr></thead><tbody id="leaseRows"></tbody></table>
+          <table style="min-width:960px"><thead><tr><th class="select-cell"><input id="leaseSelectAll" type="checkbox" aria-label="选择本页全部账号" title="选择本页全部账号"></th><th>账号</th><th>代理地址</th><th>租约账号</th><th>轮换代数</th><th>状态</th><th style="text-align:right">操作</th></tr></thead><tbody id="leaseRows"></tbody></table>
         </div>
         <div class="pagination" id="leasesPager" hidden></div>
         <div class="empty" id="leaseEmpty" hidden><svg class="icon"><use href="#i-database"></use></svg><div>没有匹配的租约数据</div></div>
@@ -517,8 +518,8 @@ body.drawer-open { overflow: hidden; }
                 <div class="field-grid">
                   <label class="check-card"><input id="p_passive" type="checkbox"><span class="check-copy"><span class="check-title">被动观测</span><span class="check-desc">分析真实请求的响应和流式 Chunk，不改变路由</span></span></label>
                   <label class="check-card"><input id="p_transparent" type="checkbox"><span class="check-copy"><span class="check-title">透明保护</span><span class="check-desc">仅在首个客户端可见 Chunk 前保护可安全重放的文本请求</span></span></label>
-                  <div class="field"><label for="p_auto_action">自动处置</label><select id="p_auto_action"><option value="observe">仅观察</option><option value="cooldown_then_disable">冷却后永久禁用</option></select><span class="hint">默认只观察，不写入 OAuth 文件</span></div>
-                  <div class="field"><label for="p_model_prefixes">模型前缀</label><input id="p_model_prefixes" type="text" autocomplete="off" placeholder="grok-"><span class="hint">多个前缀使用英文逗号分隔</span></div>
+                  <div class="field"><label for="p_auto_action">自动处置</label><select id="p_auto_action"><option value="cooldown_only">冷却</option><option value="observe">仅观察</option><option value="cooldown_then_disable">冷却后永久禁用</option></select><span class="hint">默认只观察，不写入 OAuth 文件</span></div>
+                  <div class="field"><label for="p_model_prefixes">模型前缀</label><input id="p_model_prefixes" type="text" autocomplete="off" placeholder="grok-"><span class="hint">用于识别不含 grok 的自定义模型别名；标准 grok-* 名称会自动识别</span></div>
                   <div class="field"><label for="p_events_limit">事件保留上限</label><input id="p_events_limit" type="number" min="1" max="10000"><span class="hint">超过上限时裁剪最旧事件</span></div>
                 </div>
               </div>
@@ -543,7 +544,7 @@ body.drawer-open { overflow: hidden; }
                   <div class="field"><label for="p_hold_max_bytes">最大缓冲字节</label><input id="p_hold_max_bytes" type="number" min="1"></div>
                   <div class="field"><label for="p_max_attempts">透明模式最大尝试次数</label><input id="p_max_attempts" type="number" min="1"></div>
                   <div class="field"><label for="p_on_exhausted">候选耗尽行为</label><select id="p_on_exhausted"><option value="fail_closed">失败关闭</option><option value="fail_open">失败放行</option></select></div>
-                  <label class="check-card"><input id="p_probe_recovery_only" type="checkbox"><span class="check-copy"><span class="check-title">仅恢复性探测</span><span class="check-desc">healthy 账号不做周期探测</span></span></label>
+                  <label class="check-card"><input id="p_probe_recovery_only" type="checkbox"><span class="check-copy"><span class="check-title">仅恢复性探测</span><span class="check-desc">健康账号不做周期探测</span></span></label>
                   <div class="field"><label for="p_probe_model">探测模型</label><input id="p_probe_model" type="text" autocomplete="off" placeholder="grok-4.5"></div>
                   <div class="field"><label for="p_probe_timeout">探测超时</label><input id="p_probe_timeout" type="text" placeholder="90s"></div>
                   <div class="field"><label for="p_probe_max_output">探测最大输出 Token</label><input id="p_probe_max_output" type="number" min="1"></div>
@@ -575,8 +576,7 @@ body.drawer-open { overflow: hidden; }
                 <div class="field-grid">
                   <label class="check-card full"><input id="r_enabled" type="checkbox"><span class="check-copy"><span class="check-title">启用代理轮换</span><span class="check-desc">关闭后不会自动写入或轮换 OAuth 文件中的代理</span></span></label>
                   <label class="check-card full"><input id="r_local_only" type="checkbox"><span class="check-copy"><span class="check-title">仅本地轮换，无需 API 和 Key</span><span class="check-desc">不调用 Resin API，只修改 OAuth 文件中已有代理的用户名，不会删除远端旧租约</span></span></label>
-                  <div class="field"><label for="r_platform">平台名称</label><input id="r_platform" type="text" autocomplete="off" placeholder="例如 Default"><span class="hint">API 模式下会以 Platform ID 查询到的规范名称为准</span></div>
-                  <div class="field"><label for="r_platform_id">Platform ID</label><input id="r_platform_id" type="text" autocomplete="off" placeholder="UUID"><span class="hint">仅 API 模式需要，用于定位平台和删除旧租约</span></div>
+                  <div class="field"><label for="r_platform">平台名称</label><input id="r_platform" type="text" autocomplete="off" placeholder="例如 Default"><span class="hint">保存时按名称查询 Resin 平台并自动取得 UUID</span></div>
                   <div class="field full"><label for="r_admin_url">Admin API URL</label><input id="r_admin_url" type="url" autocomplete="off" placeholder="http://resin:2260"><span class="hint">仅 API 模式需要，必须可从 CPA 插件进程直接访问</span></div>
                 </div>
               </div>
@@ -599,9 +599,9 @@ body.drawer-open { overflow: hidden; }
           <aside class="card sticky-card">
             <div class="card-header compact"><div><h2 class="section-title"><svg class="icon"><use href="#i-check"></use></svg>连接状态</h2><p>密钥不会回填到页面</p></div><span class="badge" id="resinValidateState">未验证</span></div>
             <div class="card-body stack">
-              <div class="notice"><svg class="icon"><use href="#i-check"></use></svg><span>API 模式下，Admin Token 通过系统信息接口验证，Platform ID 通过平台接口校验，Proxy Token 通过 SOCKS5 用户名密码握手验证</span></div>
-              <div class="notice"><svg class="icon"><use href="#i-shield"></use></svg><span>API 模式下验证通过后才允许保存；仅本地轮换无需 Admin API、Platform ID 或 Key。密钥仅写入本地状态文件，管理页只显示是否已配置</span></div>
-              <div class="notice"><svg class="icon"><use href="#i-database"></use></svg><span>API 模式下，删除旧租约与代理模板始终使用同一 Platform ID 和同一次平台解析结果</span></div>
+              <div class="notice"><svg class="icon"><use href="#i-check"></use></svg><span>API 模式下，Admin Token 通过系统信息接口验证，平台名称通过平台接口解析并校验，Proxy Token 通过 SOCKS5 用户名密码握手验证</span></div>
+              <div class="notice"><svg class="icon"><use href="#i-shield"></use></svg><span>API 模式下验证通过后才允许保存；仅本地轮换无需 Admin API 或 Key。密钥仅写入本地状态文件，管理页只显示是否已配置</span></div>
+              <div class="notice"><svg class="icon"><use href="#i-database"></use></svg><span>API 模式下，平台 UUID 由名称自动解析，删除旧租约与代理模板使用同一次平台解析结果</span></div>
             </div>
           </aside>
         </form>
@@ -688,7 +688,7 @@ const modeLabel = (policy) => {
   if (policy.passive_guard) return '被动观测';
   return '仅管理';
 };
-const autoActionLabel = (value) => value === 'cooldown_then_disable' ? '冷却后永久禁用' : '仅观察';
+const autoActionLabel = (value) => value === 'cooldown_then_disable' ? '冷却后永久禁用' : (value === 'cooldown_only' ? '冷却' : '仅观察');
 const formatTime = (value) => {
   if (!value) return '-';
   const date = new Date(value);
@@ -950,7 +950,7 @@ function accountFilteredList() {
   return state.accounts.filter((account) => {
     if (state.accountState !== 'all' && account.state !== state.accountState) return false;
     if (!query) return true;
-    return [account.display, account.email, account.label, account.auth_id, account.auth_id_display, account.resin_account].join(' ').toLowerCase().includes(query);
+    return [account.display, account.display_full, account.email, account.label, account.auth_id, account.auth_id_display, account.resin_account].join(' ').toLowerCase().includes(query);
   });
 }
 function renderAccounts() {
@@ -977,7 +977,7 @@ function accountRow(account) {
   const cooldown = account.cooldown_until ? '冷却至 ' + esc(formatFullTime(account.cooldown_until)) : '无冷却';
   const probe = account.probe_backoff_until ? '探测退避至 ' + esc(formatFullTime(account.probe_backoff_until)) : '可立即探测';
   const strike = account.strike_missing_thinking ? badge('思考命中', 'warn') : '';
-  return '<tr><td><div class="account-name">' + esc(account.display || account.label || '未命名账号') + '</div><div class="subline">' + esc(account.auth_id_display || account.auth_id) + '</div></td><td><div>' + badge(stateLabel(account.state), stateTone(account.state)) + ' ' + strike + '</div><div class="subtle-line">' + esc(account.state === 'externally_disabled' ? '外部禁用' : '') + '</div></td><td><div>' + esc(reasonLabel(account.last_reason)) + '</div><div class="subline">' + esc(formatTime(account.last_observed_at)) + '</div></td><td><div class="metric-inline"><strong>' + esc(num(account.tps, 1)) + '</strong><span class="muted">TPS</span></div><div class="subline">输出 ' + esc(num(account.output_tokens)) + ' · 推理 ' + esc(num(account.reasoning_tokens)) + ' · 密文 ' + esc(formatBytes(account.encrypted_bytes)) + '</div></td><td>' + resin + resinDetail + '</td><td><div>' + cooldown + '</div><div class="subline">' + probe + '</div></td><td><div class="actions"><button class="btn btn-xs" type="button" data-account-action="accounts.probe" data-auth="' + authID + '">' + icon('play') + '检测</button><button class="btn btn-xs" type="button" data-open-account="' + authID + '">' + icon('eye') + '详情</button></div></td></tr>';
+  return '<tr><td><div class="account-name" title="' + esc(account.display_full || account.display || account.label || '未命名账号') + '">' + esc(account.display || account.label || '未命名账号') + '</div><div class="subline" title="' + esc(account.auth_id) + '">' + esc(account.auth_id_display || account.auth_id) + '</div></td><td><div>' + badge(stateLabel(account.state), stateTone(account.state)) + ' ' + strike + '</div><div class="subtle-line">' + esc(account.state === 'externally_disabled' ? '外部禁用' : '') + '</div></td><td><div>' + esc(reasonLabel(account.last_reason)) + '</div><div class="subline">' + esc(formatTime(account.last_observed_at)) + '</div></td><td><div class="metric-inline"><strong>' + esc(num(account.tps, 1)) + '</strong><span class="muted">TPS</span></div><div class="subline">输出 ' + esc(num(account.output_tokens)) + ' · 推理 ' + esc(num(account.reasoning_tokens)) + ' · 密文 ' + esc(formatBytes(account.encrypted_bytes)) + '</div></td><td>' + resin + resinDetail + '</td><td><div>' + cooldown + '</div><div class="subline">' + probe + '</div></td><td><div class="actions"><button class="btn btn-xs" type="button" data-account-action="accounts.probe" data-auth="' + authID + '">' + icon('play') + '检测</button><button class="btn btn-xs" type="button" data-open-account="' + authID + '">' + icon('eye') + '详情</button></div></td></tr>';
 }
 function leaseStatus(account) {
   if (account.resin_managed || account.proxy_status === 'bound') return 'bound';
@@ -989,7 +989,7 @@ function leaseFilteredList() {
   return state.accounts.filter((account) => {
     if (state.leaseFilter !== 'all' && leaseStatus(account) !== state.leaseFilter) return false;
     if (!query) return true;
-    return [account.display, account.email, account.label, account.auth_id, account.auth_id_display, account.resin_account, account.proxy].join(' ').toLowerCase().includes(query);
+    return [account.display, account.display_full, account.email, account.label, account.auth_id, account.auth_id_display, account.resin_account, account.proxy].join(' ').toLowerCase().includes(query);
   });
 }
 function selectedLeaseAccounts() {
@@ -1090,7 +1090,7 @@ function leaseRow(account) {
   }
   const proxy = account.proxy ? '<div class="mono">' + esc(account.proxy) + '</div>' : '<span class="subtle">-</span>';
   return '<tr><td class="select-cell"><input type="checkbox" data-lease-select="' + authID + '" aria-label="选择账号" ' + (selected ? 'checked' : '') + '></td>' +
-    '<td><div class="account-name">' + esc(account.display || account.label || '未命名账号') + '</div><div class="subline">' + esc(account.auth_id_display || account.auth_id) + '</div></td>' +
+    '<td><div class="account-name" title="' + esc(account.display_full || account.display || account.label || '未命名账号') + '">' + esc(account.display || account.label || '未命名账号') + '</div><div class="subline" title="' + esc(account.auth_id) + '">' + esc(account.auth_id_display || account.auth_id) + '</div></td>' +
     '<td>' + proxy + '</td><td class="mono">' + esc(account.resin_account || '-') + '</td><td class="mono">' + esc(account.resin_generation || 0) + '</td><td>' + statusBadge + '</td><td><div class="actions">' + actions + '</div></td></tr>';
 }
 function eventMatches(event) {
@@ -1205,7 +1205,6 @@ function populateResinForm() {
   setChecked('r_enabled', Boolean(resin.enabled));
   setChecked('r_local_only', Boolean(resin.local_only));
   setValue('r_platform', resin.platform || '');
-  setValue('r_platform_id', resin.platform_id || '');
   setValue('r_admin_url', resin.admin_url || '');
   setValue('r_proxy_template', resin.proxy_template || 'socks5h://{platform}.{account}:{proxy_token}@resin:2260');
   setChecked('r_auto_rotate', Boolean(resin.auto_rotate_after_quality_failure));
@@ -1218,7 +1217,7 @@ function populateResinForm() {
 function updateResinModeFields() {
   const resin = state.resin || {};
   const localMode = document.getElementById('r_local_only').checked;
-  ['r_platform', 'r_platform_id', 'r_admin_url', 'r_admin_token', 'r_proxy_token', 'r_proxy_template'].forEach((id) => {
+  ['r_platform', 'r_admin_url', 'r_admin_token', 'r_proxy_token', 'r_proxy_template'].forEach((id) => {
     const el = document.getElementById(id);
     if (el) el.disabled = localMode;
   });
@@ -1245,7 +1244,6 @@ function resinInput() {
     enabled: document.getElementById('r_enabled').checked,
     local_only: document.getElementById('r_local_only').checked,
     platform: valueOf('r_platform'),
-    platform_id: valueOf('r_platform_id'),
     admin_url: valueOf('r_admin_url'),
     admin_token: valueOf('r_admin_token'),
     proxy_token: valueOf('r_proxy_token'),
@@ -1305,7 +1303,7 @@ function openAccountDrawer(authID) {
   window.setTimeout(() => document.getElementById('drawerClose').focus(), 20);
 }
 function renderDrawer(account) {
-  document.getElementById('drawerTitle').textContent = account.display || account.label || '账号详情';
+  document.getElementById('drawerTitle').textContent = account.display_full || account.display || account.label || '账号详情';
   document.getElementById('drawerSubtitle').textContent = account.auth_id_display || account.auth_id || '';
   const resinStatus = account.resin_managed ? badge((state.resin && state.resin.local_only) ? '本地管理' : '已绑定 Resin', 'info') : (account.proxy_status === 'conflict' ? badge('代理冲突', 'warn') : badge('未绑定 Resin', ''));
   const actionButtons = [
@@ -1339,7 +1337,7 @@ function renderDrawer(account) {
       '<div class="detail-cell"><div class="detail-label">探测退避</div><div class="detail-value">' + esc(formatFullTime(account.probe_backoff_until)) + '</div></div>',
     '</div></div>',
     '<div class="drawer-section"><h3>代理与租约</h3><div class="detail-grid">',
-      '<div class="detail-cell"><div class="detail-label">代理账号</div><div class="detail-value mono">' + esc(account.resin_account || '-') + '</div></div>',
+      '<div class="detail-cell"><div class="detail-label">租约账号</div><div class="detail-value mono">' + esc(account.resin_account || '-') + '</div></div>',
       '<div class="detail-cell"><div class="detail-label">代理地址</div><div class="detail-value mono">' + esc(account.proxy || '-') + '</div></div>',
     '</div></div>',
     '<div class="drawer-section"><h3>操作</h3><div class="drawer-actions">' + actionButtons.join('') + '</div><p class="hint" style="margin-top:9px">永久禁用会写入 OAuth 文件的 disabled=true。恢复仅解除插件管理的禁用状态</p></div>'

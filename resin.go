@@ -526,6 +526,17 @@ func maskProxyURL(value string) string {
 	return parsed.Scheme + "://" + parsed.Host
 }
 
+func maskAccountIdentity(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if strings.Contains(value, "@") {
+		return maskEmail(value)
+	}
+	return maskAuthID(value)
+}
+
 func maskEmail(value string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -533,17 +544,23 @@ func maskEmail(value string) string {
 	}
 	at := strings.IndexByte(value, '@')
 	if at <= 0 {
-		if len(value) <= 1 {
-			return "*"
-		}
-		return value[:1] + "***"
+		return maskAuthID(value)
 	}
-	return value[:1] + "***" + value[at:]
+	local := value[:at]
+	domain := value[at:]
+	switch {
+	case len(local) <= 2:
+		return local[:1] + "***" + domain
+	case len(local) >= 8:
+		return local[:3] + "***" + local[len(local)-2:] + domain
+	default:
+		return local[:2] + "***" + local[len(local)-1:] + domain
+	}
 }
 
 func maskAuthID(value string) string {
-	if len(value) <= 8 {
+	if len(value) <= 12 {
 		return value
 	}
-	return value[:8] + "..."
+	return value[:12] + "..." + value[len(value)-4:]
 }

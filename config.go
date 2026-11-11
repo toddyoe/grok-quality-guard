@@ -213,8 +213,8 @@ func normalizeConfig(cfg *Config) error {
 		cfg.AutoAction = "observe"
 	}
 	cfg.AutoAction = strings.ToLower(strings.TrimSpace(cfg.AutoAction))
-	if cfg.AutoAction != "observe" && cfg.AutoAction != "cooldown_then_disable" {
-		return fmt.Errorf("auto_action must be observe or cooldown_then_disable")
+	if cfg.AutoAction != "observe" && cfg.AutoAction != "cooldown_then_disable" && cfg.AutoAction != "cooldown_only" {
+		return fmt.Errorf("auto_action must be observe, cooldown_then_disable, or cooldown_only")
 	}
 	if len(cfg.ModelPrefixes) == 0 {
 		cfg.ModelPrefixes = []string{"grok-"}

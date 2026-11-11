@@ -46,7 +46,7 @@ func pluginRegistration() registration {
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "passive_guard", Type: pluginapi.ConfigFieldTypeBoolean, Default: true, Description: "Observe request quality without changing routing."},
 				{Name: "transparent_guard", Type: pluginapi.ConfigFieldTypeBoolean, Default: false, Description: "Hold and validate safe replayable Grok streams before emitting them."},
-				{Name: "auto_action", Type: pluginapi.ConfigFieldTypeEnum, Default: "observe", EnumValues: []string{"observe", "cooldown_then_disable"}, Description: "Quality policy action for confirmed anomalies."},
+				{Name: "auto_action", Type: pluginapi.ConfigFieldTypeEnum, Default: "observe", EnumValues: []string{"observe", "cooldown_then_disable", "cooldown_only"}, Description: "Quality policy action for confirmed anomalies."},
 				{Name: "model_prefixes", Type: pluginapi.ConfigFieldTypeArray, Default: []string{"grok-"}, Description: "Model prefixes considered Grok traffic."},
 				{Name: "priority", Type: pluginapi.ConfigFieldTypeInteger, Default: 10, Description: "Plugin priority when multiple routing plugins are installed."},
 				{Name: "quality.soft_tps", Type: pluginapi.ConfigFieldTypeNumber, Default: 500, Description: "Soft output tokens-per-second warning threshold."},

@@ -32,6 +32,7 @@ type accountView struct {
 	AuthID                string    `json:"auth_id"`
 	AuthIDDisplay         string    `json:"auth_id_display"`
 	Display               string    `json:"display"`
+	DisplayFull           string    `json:"display_full"`
 	Email                 string    `json:"email,omitempty"`
 	Label                 string    `json:"label,omitempty"`
 	State                 string    `json:"state"`
@@ -244,12 +245,12 @@ func catalogAccountState(account Account, state State) string {
 }
 
 func catalogAccountMatches(account Account, query string) bool {
-	label := strings.TrimSpace(account.Label)
-	if strings.Contains(label, "@") {
-		label = maskEmail(label)
-	}
-	display := maskEmail(firstNonEmpty(account.Email, account.Label, account.ID))
-	text := strings.ToLower(display + " " + account.ID + " " + label + " " + maskEmail(account.Email))
+	text := strings.ToLower(strings.Join([]string{
+		firstNonEmpty(account.Email, account.Label, account.ID),
+		account.ID,
+		account.Label,
+		account.Email,
+	}, " "))
 	return strings.Contains(text, query)
 }
 
@@ -534,6 +535,7 @@ func (p *Plugin) accountView(ctx context.Context, account Account) (accountView,
 	if meta.ResinGeneration > resinGeneration {
 		resinGeneration = meta.ResinGeneration
 	}
+	displayFull := strings.TrimSpace(firstNonEmpty(account.Email, account.Label, account.ID))
 	displayLabel := strings.TrimSpace(account.Label)
 	if strings.Contains(displayLabel, "@") {
 		displayLabel = maskEmail(displayLabel)
@@ -541,7 +543,8 @@ func (p *Plugin) accountView(ctx context.Context, account Account) (accountView,
 	view := accountView{
 		AuthID:                account.ID,
 		AuthIDDisplay:         maskAuthID(account.ID),
-		Display:               maskEmail(firstNonEmpty(account.Email, account.Label, account.ID)),
+		Display:               maskAccountIdentity(displayFull),
+		DisplayFull:           displayFull,
 		Email:                 maskEmail(account.Email),
 		Label:                 displayLabel,
 		State:                 stateAccount.State,

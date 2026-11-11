@@ -74,7 +74,7 @@ func (p *Plugin) ApplyVerdict(ctx context.Context, authID string, verdict Qualit
 	}); errEvent != nil {
 		return errEvent
 	}
-	if isConfirmedClass(verdict.Class) && policy.AutoAction == "cooldown_then_disable" {
+	if isConfirmedClass(verdict.Class) && (policy.AutoAction == "cooldown_then_disable" || policy.AutoAction == "cooldown_only") {
 		return p.applyAutoCooldown(authID, verdict, source)
 	}
 	return nil
@@ -97,11 +97,12 @@ func (p *Plugin) applyAutoCooldown(authID string, verdict QualityVerdict, source
 		duration = policy.Quality.MissingThinkingCooldown.Duration
 	}
 	kind := DisableKindCooldown
-	if verdict.Class == ClassMissingThinking && account.QualityStrikeMissingThinking {
+	allowPermanent := policy.AutoAction != "cooldown_only"
+	if allowPermanent && verdict.Class == ClassMissingThinking && account.QualityStrikeMissingThinking {
 		kind = DisableKindPermanent
 		duration = 0
 	}
-	return p.applyGuardDisable(authID, kind, duration, verdict.Class, source, verdict.Class == ClassMissingThinking)
+	return p.applyGuardDisable(authID, kind, duration, verdict.Class, source, allowPermanent && verdict.Class == ClassMissingThinking)
 }
 
 func (p *Plugin) applyGuardDisable(authID, kind string, duration time.Duration, class, source string, strike bool) error {

@@ -39,7 +39,7 @@ func TestGuardMetadataAndAuthIdentity(t *testing.T) {
 	if base := resinAccountBase(raw); base != "alice" {
 		t.Fatalf("resin base = %q, want alice", base)
 	}
-	if mask := maskEmail("alice@example.com"); mask != "a***@example.com" {
+	if mask := maskEmail("alice@example.com"); mask != "al***e@example.com" {
 		t.Fatalf("masked email = %q", mask)
 	}
 	if !strings.Contains(maskProxyURL("socks5h://user:pass@example.com:1080/path"), "socks5h://example.com:1080") {
