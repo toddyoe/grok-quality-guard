@@ -1,0 +1,500 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+)
+
+type Account struct {
+	ID          string
+	AuthIndex   string
+	Name        string
+	Type        string
+	Provider    string
+	Label       string
+	Email       string
+	Disabled    bool
+	Unavailable bool
+	Priority    int
+	ProxyURL    string
+}
+
+type PendingObservation struct {
+	AuthID    string
+	RequestID string
+	Body      []byte
+	Analyzer  *StreamAnalyzer
+	StartedAt time.Time
+	Completed bool
+	Source    string
+	Model     string
+}
+
+type Plugin struct {
+	mu            sync.RWMutex
+	cfg           Config
+	policy        Policy
+	yamlPolicy    Policy
+	yamlRevision  string
+	store         *StateStore
+	ctx           context.Context
+	cancel        context.CancelFunc
+	wg            sync.WaitGroup
+	workersActive bool
+	quiescing     bool
+
+	catalogMu sync.RWMutex
+	catalog   []Account
+	catalogAt time.Time
+
+	accountLocksMu sync.Mutex
+	accountLocks   map[string]*sync.Mutex
+
+	pendingMu sync.Mutex
+	pending   map[string]*PendingObservation
+
+	probeMu     sync.Mutex
+	probeSkipMu sync.Mutex
+	probeSkip   map[string]time.Time
+
+	recentSuccessMu sync.Mutex
+	recentSuccess   map[string]time.Time
+
+	modelStreamsMu sync.Mutex
+	modelStreams   map[string]struct{}
+}
+
+func NewPlugin() *Plugin {
+	return &Plugin{
+		cfg:           DefaultConfig(),
+		policy:        PolicyFromConfig(DefaultConfig()),
+		accountLocks:  make(map[string]*sync.Mutex),
+		pending:       make(map[string]*PendingObservation),
+		probeSkip:     make(map[string]time.Time),
+		recentSuccess: make(map[string]time.Time),
+		modelStreams:  make(map[string]struct{}),
+	}
+}
+
+func (p *Plugin) markRecentSuccess(authID string) {
+	if p == nil || strings.TrimSpace(authID) == "" {
+		return
+	}
+	p.recentSuccessMu.Lock()
+	p.recentSuccess[authID] = time.Now().UTC()
+	p.recentSuccessMu.Unlock()
+}
+
+func (p *Plugin) recentSuccessAt(authID string) time.Time {
+	if p == nil {
+		return time.Time{}
+	}
+	p.recentSuccessMu.Lock()
+	defer p.recentSuccessMu.Unlock()
+	return p.recentSuccess[authID]
+}
+
+func (p *Plugin) stateStore() *StateStore {
+	if p == nil {
+		return nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.store
+}
+
+func (p *Plugin) Configure(raw []byte) error {
+	cfg, errDecode := decodeConfig(raw)
+	if errDecode != nil {
+		return errDecode
+	}
+	revision := configRevision(raw)
+	p.mu.Lock()
+	oldPath := ""
+	if p.store != nil {
+		oldPath = p.store.Path()
+	}
+	path := strings.TrimSpace(cfg.StateFile)
+	if path == "" {
+		path = defaultStatePath()
+	}
+	if p.store == nil || oldPath != path {
+		p.store = NewStateStore(path)
+		if errLoad := p.store.Load(PolicyFromConfig(cfg), revision); errLoad != nil {
+			p.mu.Unlock()
+			return errLoad
+		}
+	}
+	p.cfg = cfg
+	p.yamlPolicy = PolicyFromConfig(cfg)
+	p.yamlRevision = revision
+	state := p.store.Snapshot()
+	if state.Policy.PassiveGuard || state.Policy.EventsLimit > 0 || state.Policy.AutoAction != "" {
+		p.policy = state.Policy
+	} else {
+		p.policy = p.yamlPolicy
+		if errUpdate := p.store.Update(func(s *State) error {
+			s.Policy = p.policy
+			s.PolicyYAMLRevision = revision
+			return nil
+		}); errUpdate != nil {
+			p.mu.Unlock()
+			return errUpdate
+		}
+	}
+	if errApply := ApplyPolicy(&p.cfg, p.policy); errApply != nil {
+		p.mu.Unlock()
+		return errApply
+	}
+	p.quiescing = false
+	if p.cfg.Enabled {
+		p.startWorkersLocked()
+	} else {
+		p.stopWorkersLocked()
+	}
+	p.mu.Unlock()
+	return nil
+}
+
+func (p *Plugin) startWorkersLocked() {
+	if p.workersActive || !p.cfg.Enabled {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	p.ctx = ctx
+	p.cancel = cancel
+	p.workersActive = true
+	p.wg.Add(2)
+	go func() {
+		defer p.wg.Done()
+		p.refreshLoop(ctx)
+	}()
+	go func() {
+		defer p.wg.Done()
+		p.probeLoop(ctx)
+	}()
+}
+
+func (p *Plugin) stopWorkersLocked() {
+	if p.cancel != nil {
+		p.cancel()
+	}
+	p.cancel = nil
+	p.ctx = nil
+	p.workersActive = false
+}
+
+func (p *Plugin) Quiesce() {
+	p.mu.Lock()
+	p.quiescing = true
+	p.stopWorkersLocked()
+	p.mu.Unlock()
+	p.closeAllModelStreams()
+}
+
+func (p *Plugin) Shutdown() {
+	p.mu.Lock()
+	p.stopWorkersLocked()
+	p.mu.Unlock()
+	p.closeAllModelStreams()
+	done := make(chan struct{})
+	go func() {
+		p.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+	}
+	if p.stateStore() != nil {
+		_ = p.stateStore().Update(func(*State) error { return nil })
+	}
+}
+
+func (p *Plugin) refreshLoop(ctx context.Context) {
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-timer.C:
+	}
+	_ = p.RefreshCatalog(ctx)
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_ = p.RefreshCatalog(ctx)
+		}
+	}
+}
+
+func (p *Plugin) RefreshCatalog(ctx context.Context) error {
+	_ = ctx
+	entries, errList := p.listAuths()
+	if errList != nil {
+		return errList
+	}
+	accounts := make([]Account, 0, len(entries))
+	for _, entry := range entries {
+		provider := strings.TrimSpace(entry.Provider)
+		if provider == "" {
+			provider = strings.TrimSpace(entry.Type)
+		}
+		if provider != "" && !isGrokProvider(provider) && !isGrokProvider(entry.Type) {
+			continue
+		}
+		id := strings.TrimSpace(entry.ID)
+		if id == "" {
+			id = strings.TrimSpace(entry.AuthIndex)
+		}
+		if id == "" {
+			continue
+		}
+		account := Account{
+			ID:          id,
+			AuthIndex:   strings.TrimSpace(entry.AuthIndex),
+			Name:        entry.Name,
+			Type:        entry.Type,
+			Provider:    provider,
+			Label:       entry.Label,
+			Email:       entry.Email,
+			Disabled:    entry.Disabled,
+			Unavailable: entry.Unavailable,
+			Priority:    entry.Priority,
+		}
+		accounts = append(accounts, account)
+	}
+	sort.Slice(accounts, func(i, j int) bool {
+		if accounts[i].Priority != accounts[j].Priority {
+			return accounts[i].Priority < accounts[j].Priority
+		}
+		return accounts[i].ID < accounts[j].ID
+	})
+	p.catalogMu.Lock()
+	p.catalog = accounts
+	p.catalogAt = time.Now().UTC()
+	p.catalogMu.Unlock()
+	_ = p.syncCatalogState(accounts)
+	return nil
+}
+
+func (p *Plugin) syncCatalogState(accounts []Account) error {
+	if p.stateStore() == nil {
+		return nil
+	}
+	now := time.Now().UTC()
+	live := make(map[string]struct{}, len(accounts))
+	for _, account := range accounts {
+		live[account.ID] = struct{}{}
+	}
+	return p.stateStore().UpdateIfChanged(func(state *State) error {
+		for authID := range state.Accounts {
+			if _, ok := live[authID]; !ok {
+				delete(state.Accounts, authID)
+			}
+		}
+		for _, account := range accounts {
+			existing := state.Accounts[account.ID]
+			if existing == nil {
+				existing = &AccountState{
+					AuthID:      account.ID,
+					State:       StateUnknown,
+					FirstSeenAt: now,
+				}
+				state.Accounts[account.ID] = existing
+			}
+			if account.Email != "" {
+				existing.Email = account.Email
+			}
+			if account.Label != "" {
+				existing.Label = account.Label
+			}
+			if account.Disabled {
+				switch existing.State {
+				case StateCooling, StateDisabledByGuard:
+				default:
+					existing.State = StateExternallyDisabled
+				}
+			}
+			if !account.Disabled && existing.State == StateExternallyDisabled {
+				existing.State = StateUnknown
+			}
+		}
+		return nil
+	})
+}
+
+func (p *Plugin) catalogSnapshot() []Account {
+	p.catalogMu.RLock()
+	defer p.catalogMu.RUnlock()
+	return append([]Account(nil), p.catalog...)
+}
+
+func (p *Plugin) findAccount(authID string) (Account, bool) {
+	normalized := strings.TrimSpace(authID)
+	if normalized == "" {
+		return Account{}, false
+	}
+	for _, account := range p.catalogSnapshot() {
+		if account.ID == normalized || account.AuthIndex == normalized {
+			return account, true
+		}
+	}
+	return Account{}, false
+}
+
+func (p *Plugin) resolveAuth(ctx context.Context, authID string) (Account, pluginapi.HostAuthGetResponse, map[string]json.RawMessage, error) {
+	account, okAccount := p.findAccount(authID)
+	if !okAccount {
+		if errRefresh := p.RefreshCatalog(ctx); errRefresh != nil {
+			return Account{}, pluginapi.HostAuthGetResponse{}, nil, errRefresh
+		}
+		account, okAccount = p.findAccount(authID)
+	}
+	if !okAccount {
+		return Account{}, pluginapi.HostAuthGetResponse{}, nil, errors.New("auth not found")
+	}
+	index := account.AuthIndex
+	if index == "" {
+		index = account.ID
+	}
+	response, errGet := p.getAuth(index)
+	if errGet != nil {
+		return account, response, nil, errGet
+	}
+	raw, errMap := rawAuthToMap(response.JSON)
+	if errMap != nil {
+		return account, response, nil, errMap
+	}
+	return account, response, raw, nil
+}
+
+func (p *Plugin) accountLock(authID string) *sync.Mutex {
+	p.accountLocksMu.Lock()
+	defer p.accountLocksMu.Unlock()
+	lock := p.accountLocks[authID]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		p.accountLocks[authID] = lock
+	}
+	return lock
+}
+
+func (p *Plugin) ensureStateAccount(state *State, authID, email, label string) *AccountState {
+	if state.Accounts == nil {
+		state.Accounts = make(map[string]*AccountState)
+	}
+	account := state.Accounts[authID]
+	if account == nil {
+		account = &AccountState{AuthID: authID, State: StateUnknown, FirstSeenAt: time.Now().UTC()}
+		state.Accounts[authID] = account
+	}
+	if email != "" {
+		account.Email = email
+	}
+	if label != "" {
+		account.Label = label
+	}
+	if account.FirstSeenAt.IsZero() {
+		account.FirstSeenAt = time.Now().UTC()
+	}
+	return account
+}
+
+func (p *Plugin) stateAccount(authID string) (AccountState, bool) {
+	if p.stateStore() == nil {
+		return AccountState{}, false
+	}
+	state := p.stateStore().Snapshot()
+	account, ok := state.Accounts[authID]
+	if !ok || account == nil {
+		return AccountState{}, false
+	}
+	return *account, true
+}
+
+func (p *Plugin) updateStateAccount(authID string, fn func(*AccountState) error) error {
+	if p.stateStore() == nil {
+		return errors.New("state store is not initialized")
+	}
+	return p.stateStore().UpdateIfChanged(func(state *State) error {
+		account := p.ensureStateAccount(state, authID, "", "")
+		return fn(account)
+	})
+}
+
+func (p *Plugin) recordEvent(state *State, authID, class, action, result, detail string) {
+	appendEvent(state, Event{
+		Time:   time.Now().UTC(),
+		AuthID: authID,
+		Class:  class,
+		Action: action,
+		Result: result,
+		Detail: detail,
+	})
+}
+
+func (p *Plugin) isProbeAuth(authID string) bool {
+	p.probeSkipMu.Lock()
+	defer p.probeSkipMu.Unlock()
+	now := time.Now()
+	for key, expiry := range p.probeSkip {
+		if now.After(expiry) {
+			delete(p.probeSkip, key)
+		}
+	}
+	_, ok := p.probeSkip[authID]
+	return ok
+}
+
+func (p *Plugin) markProbeAuth(authID string, ttl time.Duration) {
+	if authID == "" {
+		return
+	}
+	p.probeSkipMu.Lock()
+	p.probeSkip[authID] = time.Now().Add(ttl)
+	p.probeSkipMu.Unlock()
+}
+func (p *Plugin) trackModelStream(streamID string) {
+	if p == nil || strings.TrimSpace(streamID) == "" {
+		return
+	}
+	p.modelStreamsMu.Lock()
+	p.modelStreams[streamID] = struct{}{}
+	p.modelStreamsMu.Unlock()
+}
+
+func (p *Plugin) untrackModelStream(streamID string) {
+	if p == nil || strings.TrimSpace(streamID) == "" {
+		return
+	}
+	p.modelStreamsMu.Lock()
+	delete(p.modelStreams, streamID)
+	p.modelStreamsMu.Unlock()
+}
+
+func (p *Plugin) closeAllModelStreams() {
+	if p == nil {
+		return
+	}
+	p.modelStreamsMu.Lock()
+	streamIDs := make([]string, 0, len(p.modelStreams))
+	for streamID := range p.modelStreams {
+		streamIDs = append(streamIDs, streamID)
+	}
+	p.modelStreamsMu.Unlock()
+	for _, streamID := range streamIDs {
+		_ = p.closeModelStream(streamID)
+	}
+}

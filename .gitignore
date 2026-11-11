@@ -1,0 +1,63 @@
+# Binaries
+*.exe
+
+# Configuration
+config.yaml
+.env
+
+# Generated content
+bin/*
+/logs
+conv/*
+temp/*
+refs/*
+plugins/*
+examples/plugin/bin/*
+
+# Storage backends
+pgstore/*
+gitstore/*
+objectstore/*
+
+# Static assets
+static/*
+
+# Authentication data
+auths/*
+/auths
+!auths/.gitkeep
+
+# Documentation
+references/*
+docs/*
+!docs/management-api-v8.md
+!docs/grok-quality-guard-plugin-design.md
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+AGENTS.override.md
+
+# Tooling metadata
+.vscode/*
+.worktrees/
+.codex/*
+.claude/*
+.claude
+.gemini/*
+.serena/*
+.agent/*
+.agents
+.pi
+.agents/*
+.opencode/*
+.idea/*
+.beads/*
+.bmad/*
+_bmad/*
+_bmad-output/*
+.gocache/
+.gitnexus/
+
+# macOS
+.DS_Store
+._*
