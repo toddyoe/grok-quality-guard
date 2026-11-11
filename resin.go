@@ -29,6 +29,16 @@ func (e *resinDeleteError) Error() string {
 	return fmt.Sprintf("resin lease delete failed with status %d", e.Status)
 }
 
+type ResinClearResult struct {
+	AuthID             string `json:"auth_id"`
+	Account            string `json:"account,omitempty"`
+	ProxyURL           string `json:"proxy_url,omitempty"`
+	Cleared            bool   `json:"cleared"`
+	RemoteLeaseDeleted bool   `json:"remote_lease_deleted,omitempty"`
+	Skipped            bool   `json:"skipped,omitempty"`
+	Error              string `json:"error,omitempty"`
+}
+
 type ResinBindResult struct {
 	AuthID   string `json:"auth_id"`
 	Account  string `json:"account"`
@@ -46,6 +56,9 @@ func (p *Plugin) BindResin(ctx context.Context, authID string, dryRun bool) (Res
 	cfg := p.ResinConfig()
 	if !cfg.Enabled {
 		return ResinBindResult{AuthID: authID, DryRun: dryRun, Error: "resin is disabled"}, fmt.Errorf("resin is disabled")
+	}
+	if cfg.LocalOnly {
+		return ResinBindResult{AuthID: authID, DryRun: dryRun, Error: "local rotation does not create new proxy bindings"}, fmt.Errorf("resin API mode is required to bind new proxies")
 	}
 	_, response, raw, errResolve := p.resolveAuth(ctx, authID)
 	if errResolve != nil {
@@ -105,7 +118,99 @@ func (p *Plugin) BindResin(ctx context.Context, authID string, dryRun bool) (Res
 	return result, nil
 }
 
+func (p *Plugin) ClearResinProxy(ctx context.Context, authID string) (ResinClearResult, error) {
+	lock := p.accountLock(authID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	_, response, raw, errResolve := p.resolveAuth(ctx, authID)
+	if errResolve != nil {
+		return ResinClearResult{AuthID: authID, Error: errResolve.Error()}, errResolve
+	}
+	meta := guardMeta(raw)
+	stateAccount, _ := p.stateAccount(authID)
+	generation := stateAccount.Resin.Generation
+	if meta.ResinGeneration > generation {
+		generation = meta.ResinGeneration
+	}
+	account := firstNonEmpty(meta.ResinAccount, stateAccount.Resin.Account)
+	proxyURL := strings.TrimSpace(authRawString(raw, "proxy_url"))
+	result := ResinClearResult{
+		AuthID:   authID,
+		Account:  account,
+		ProxyURL: maskProxyURL(proxyURL),
+	}
+	hasManagedLease := meta.Managed || stateAccount.Resin.Managed || account != ""
+	if proxyURL == "" && !hasManagedLease {
+		result.Skipped = true
+		return result, nil
+	}
+	remoteLeaseSkipped := false
+	if account != "" {
+		cfg := p.ResinConfig()
+		if cfg.LocalOnly {
+			remoteLeaseSkipped = true
+		} else {
+			operationCfg, errResolveAdmin := resolveResinAdminForOperation(ctx, cfg)
+			if errResolveAdmin != nil {
+				result.Error = errResolveAdmin.Error()
+				return result, errResolveAdmin
+			}
+			if errDelete := deleteResinLease(ctx, operationCfg.AdminURL, operationCfg.PlatformID, operationCfg.AdminToken, account); errDelete != nil {
+				result.Error = errDelete.Error()
+				return result, errDelete
+			}
+			result.RemoteLeaseDeleted = true
+		}
+	}
+	delete(raw, "proxy_url")
+	meta.Managed = false
+	meta.ResinAccount = ""
+	if errMeta := setGuardMeta(raw, meta); errMeta != nil {
+		result.Error = errMeta.Error()
+		return result, errMeta
+	}
+	encoded, errMarshal := marshalRawMap(raw)
+	if errMarshal != nil {
+		result.Error = errMarshal.Error()
+		return result, errMarshal
+	}
+	if _, errSave := p.saveAuth(response.Name, encoded); errSave != nil {
+		result.Error = errSave.Error()
+		return result, errSave
+	}
+	if errUpdate := p.updateStateAccount(authID, func(stateAccount *AccountState) error {
+		stateAccount.Resin = ResinState{Managed: false, Generation: generation}
+		return nil
+	}); errUpdate != nil {
+		result.Error = errUpdate.Error()
+		return result, errUpdate
+	}
+	result.Cleared = true
+	detail := "external proxy_url cleared"
+	if account != "" {
+		detail = "account=" + account
+		if result.RemoteLeaseDeleted {
+			detail += " remote_lease=deleted"
+		} else if remoteLeaseSkipped {
+			detail += " remote_lease=skipped_local_only"
+		}
+	}
+	_ = p.stateStore().Update(func(state *State) error {
+		p.recordEvent(state, authID, "", "resin_clear", "cleared", detail)
+		return nil
+	})
+	return result, nil
+}
+
 func (p *Plugin) BindUnboundResin(ctx context.Context, dryRun bool) ([]ResinBindResult, error) {
+	cfg := p.ResinConfig()
+	if !cfg.Enabled {
+		return nil, fmt.Errorf("resin is disabled")
+	}
+	if cfg.LocalOnly {
+		return nil, fmt.Errorf("resin API mode is required to bind new proxies")
+	}
 	if errRefresh := p.RefreshCatalog(ctx); errRefresh != nil {
 		return nil, errRefresh
 	}
@@ -142,28 +247,44 @@ func (p *Plugin) RotateResin(ctx context.Context, authID string) error {
 		return errResolve
 	}
 	meta := guardMeta(raw)
-	if !meta.Managed || strings.TrimSpace(meta.ResinAccount) == "" {
-		return fmt.Errorf("auth is not managed by resin")
+	stateAccount, _ := p.stateAccount(authID)
+	proxyURL := strings.TrimSpace(authRawString(raw, "proxy_url"))
+	previousAccount := firstNonEmpty(meta.ResinAccount, stateAccount.Resin.Account, resinAccountFromProxyURL(proxyURL))
+	if proxyURL == "" && previousAccount == "" {
+		return fmt.Errorf("auth has no proxy_url to rotate")
 	}
-	previousAccount := meta.ResinAccount
-	operationCfg, errResolvePlatform := resolveResinPlatformForOperation(ctx, cfg)
-	if errResolvePlatform != nil {
-		return errResolvePlatform
-	}
-	adminToken := strings.TrimSpace(operationCfg.AdminToken)
-	if errDelete := deleteResinLease(ctx, operationCfg.AdminURL, operationCfg.PlatformID, adminToken, meta.ResinAccount); errDelete != nil {
-		if typed, ok := errDelete.(*resinDeleteError); ok && (typed.Status == 401 || typed.Status == 403) {
-			return fmt.Errorf("resin admin authentication failed: status %d", typed.Status)
-		}
-		return errDelete
-	}
-	newAccount, errGenerate := p.generateResinAccount(ctx, authID, raw)
+	newAccount, errGenerate := p.generateResinAccountAvoiding(ctx, authID, raw, previousAccount)
 	if errGenerate != nil {
 		return errGenerate
 	}
-	proxyURL, errRender := renderResinProxy(operationCfg, newAccount)
-	if errRender != nil {
-		return errRender
+	remoteLeaseDeleted := false
+	if !cfg.LocalOnly && (meta.Managed || stateAccount.Resin.Managed) && previousAccount != "" {
+		operationCfg, errResolvePlatform := resolveResinPlatformForOperation(ctx, cfg)
+		if errResolvePlatform != nil {
+			return errResolvePlatform
+		}
+		adminToken := strings.TrimSpace(operationCfg.AdminToken)
+		if errDelete := deleteResinLease(ctx, operationCfg.AdminURL, operationCfg.PlatformID, adminToken, previousAccount); errDelete != nil {
+			if typed, ok := errDelete.(*resinDeleteError); ok && (typed.Status == 401 || typed.Status == 403) {
+				return fmt.Errorf("resin admin authentication failed: status %d", typed.Status)
+			}
+			return errDelete
+		}
+		remoteLeaseDeleted = true
+		renderedProxyURL, errRender := renderResinProxy(operationCfg, newAccount)
+		if errRender != nil {
+			return errRender
+		}
+		proxyURL = renderedProxyURL
+	} else {
+		if proxyURL == "" {
+			return fmt.Errorf("local proxy rotation requires an existing proxy_url")
+		}
+		rotatedProxyURL, errRotateProxy := rewriteResinProxyAccount(proxyURL, newAccount)
+		if errRotateProxy != nil {
+			return errRotateProxy
+		}
+		proxyURL = rotatedProxyURL
 	}
 	meta.Managed = true
 	meta.ResinAccount = newAccount
@@ -185,16 +306,62 @@ func (p *Plugin) RotateResin(ctx context.Context, authID string) error {
 	}); errUpdate != nil {
 		return errUpdate
 	}
+	oldLabel := previousAccount
+	if oldLabel == "" {
+		oldLabel = "unknown"
+	}
+	detail := fmt.Sprintf("旧代理账号：%s → 新代理账号：%s，未调用 Resin API", oldLabel, newAccount)
+	if remoteLeaseDeleted {
+		detail = fmt.Sprintf("旧租约：%s → 新租约：%s", oldLabel, newAccount)
+	}
 	_ = p.stateStore().Update(func(state *State) error {
-		p.recordEvent(state, authID, "", "resin_rotate", "rotated", fmt.Sprintf("旧租约：%s → 新租约：%s", previousAccount, newAccount))
+		p.recordEvent(state, authID, "", "resin_rotate", "rotated", detail)
 		return nil
 	})
 	return nil
 }
 
+func resinAccountFromProxyURL(proxyURL string) string {
+	parsed, errParse := url.Parse(strings.TrimSpace(proxyURL))
+	if errParse != nil || parsed.User == nil {
+		return ""
+	}
+	username := parsed.User.Username()
+	dot := strings.LastIndexByte(username, '.')
+	if dot <= 0 || dot >= len(username)-1 {
+		return ""
+	}
+	return username[dot+1:]
+}
+
+func rewriteResinProxyAccount(proxyURL, account string) (string, error) {
+	account = strings.TrimSpace(account)
+	if account == "" {
+		return "", fmt.Errorf("resin account is empty")
+	}
+	parsed, errParse := url.Parse(strings.TrimSpace(proxyURL))
+	if errParse != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User == nil {
+		return "", fmt.Errorf("proxy_url is invalid")
+	}
+	username := parsed.User.Username()
+	password, hasPassword := parsed.User.Password()
+	if username == "" || !hasPassword {
+		return "", fmt.Errorf("proxy_url must contain username and password")
+	}
+	dot := strings.LastIndexByte(username, '.')
+	if dot <= 0 || dot >= len(username)-1 {
+		return "", fmt.Errorf("proxy_url username does not contain a resin account")
+	}
+	parsed.User = url.UserPassword(username[:dot+1]+account, password)
+	return parsed.String(), nil
+}
+
 func (p *Plugin) generateResinAccount(ctx context.Context, authID string, raw map[string]json.RawMessage) (string, error) {
+	return p.generateResinAccountAvoiding(ctx, authID, raw, guardMeta(raw).ResinAccount)
+}
+
+func (p *Plugin) generateResinAccountAvoiding(ctx context.Context, authID string, raw map[string]json.RawMessage, oldAccount string) (string, error) {
 	base := resinAccountBase(raw)
-	oldAccount := guardMeta(raw).ResinAccount
 	state := p.stateStore().Snapshot()
 	used := make(map[string]struct{}, len(state.Accounts))
 	for _, account := range state.Accounts {

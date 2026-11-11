@@ -14,8 +14,8 @@ Grok Quality Guard 观测 Grok / xAI auth 的真实响应质量，识别 HTTP 20
 - 检测 `missing_thinking`、`buffered_burst`、`cipher_drool`、`fake_encrypted_dump`、`fast_reasoning_ratio_dump`、`soft_tps`、`hard_tps`、`empty_stream`、`probe_error`、`proxy_error`
 - 账号状态机：`unknown`、`healthy`、`suspect`、`degraded`、`cooling`、`disabled_by_guard`、`externally_disabled`
 - 首次确认异常可配置为只观察或临时冷却，冷却到期通过固定 prompt 恢复探测
-- Resin 账号级租约绑定和显式轮换，不使用出口节点聚合状态
-- 内嵌中文化管理页，按概览、账号质量、Resin 租约、事件日志和设置分 Tab
+- Resin 账号级租约绑定、显式轮换、批量绑定和代理清除；无 API 时可仅本地改写已有代理用户名
+- 内嵌中文化管理页，按概览、账号质量、Resin 租约、事件日志和设置分 Tab，账号、租约与事件列表支持分页
 - auth、proxy URL、Admin Token、xAI token 全程脱敏
 
 ## 质量判定要点
@@ -56,7 +56,7 @@ TPS = outputTokens * 1000 / generationWindow
   - Windows：MinGW GCC
   - Linux：GCC
   - macOS：Clang
-- 可选：Resin Admin API 和代理环境
+- 可选：Resin Admin API 和代理环境；仅本地轮换不需要 Resin API 或 Key
 
 项目通过 Go module 引入 CLIProxyAPI v8，仅使用其中的 `sdk/pluginabi` 和 `sdk/pluginapi` 作为协议类型。
 
@@ -171,6 +171,7 @@ plugins:
 
       resin:
         enabled: false
+        local_only: false
         platform: "Default"
         platform_id: ""
         admin_url: ""
@@ -203,9 +204,13 @@ plugins:
 
 透明模式在首次向客户端 emit 前完成质量门。一旦开始 emit，插件不能回滚已经发送的内容；如果所有候选账号耗尽，默认返回 `503 quality_degraded`。可配置 `on_exhausted: fail_open` 在失败时返回最后一个已缓冲响应，但这会牺牲 fail-closed 语义。
 
-## Resin
+## Resin 与本地代理轮换
 
-Resin 的 Admin API URL、Platform、Platform ID、Admin Token、Proxy Token 和代理模板在管理页中配置。点击“Validate and save”时，插件会先完成以下验证，全部通过后才写入 state：
+代理轮换支持两种模式。
+
+### API 模式
+
+API 模式用于创建新的代理绑定，并管理 Resin 远端租约。Admin API URL、Platform、Platform ID、Admin Token、Proxy Token 和代理模板在管理页中配置。保存时会按顺序验证：
 
 1. 使用 Admin Token 请求 Resin `GET /api/v1/system/info`
 2. 使用同一 Admin Token 请求 `GET /api/v1/platforms/{platform_id}`，确认平台存在并读取规范平台名称
@@ -215,15 +220,40 @@ Resin 的 Admin API URL、Platform、Platform ID、Admin Token、Proxy Token 和
 
 `platform_id` 是 Resin 平台配置的唯一事实源。管理页保存时会写回 API 返回的规范平台名称；绑定和轮换运行时也会按 `platform_id` 重新查询名称，并让 DELETE 租约和代理模板使用同一次解析结果。
 
-Resin 绑定必须由管理员显式触发，不会在首次启动时自动覆盖已有 `proxy_url`。轮换顺序固定为：
+Resin 绑定必须由管理员显式触发，不会在首次启动时自动覆盖已有 `proxy_url`。API 模式轮换顺序固定为：
 
 1. 删除旧 Resin 租约，`204` 和 `404` 都视为成功
 2. 生成新的 `grok-<email-local>-<4位随机 base36>` account
 3. 写回 auth 的 `proxy_url`
 4. 保留 access/refresh token 等所有非代理字段
 
-Resin 没有“立即创建指定出口 IP 租约”的 API，插件不查询新 egress IP，也不保证新租约一定使用不同出口 IP。
+API 模式清除 `proxy_url` 时，插件管理的 Resin 租约会先调用 `DELETE /api/v1/platforms/{platform_id}/leases/{account}`，`204` 或 `404` 后才会清空 auth 中的 `proxy_url`。
 
+### 仅本地轮换
+
+仅本地轮换用于只修改 auth 中已有代理、但不管理 Resin 远端租约的场景。它不需要 Admin API URL、Platform ID、Admin Token、Proxy Token 或代理模板：
+
+```yaml
+resin:
+  enabled: true
+  local_only: true
+```
+
+本地轮换要求 auth 中已有代理包含用户名和密码，且用户名最后一个 `.` 后是当前 account。例如：
+
+```text
+socks5h://Default.grok-alice-old1:proxy-secret@resin:2260
+```
+
+轮换时只替换用户名中的 account 后缀，生成新的 `grok-<email-local>-<4位随机 base36>`，同时保留 scheme、代理主机、端口、密码和路径等其余部分：
+
+```text
+socks5h://Default.grok-alice-new1:proxy-secret@resin:2260
+```
+
+本地模式不会调用任何 Resin API，也不会删除远端旧租约。本地清除只移除 auth 中的 `proxy_url`，同样不会处理远端租约。由于没有 API 可用，本地模式不能创建新的代理绑定；首次绑定仍必须使用 API 模式。
+
+Resin 没有“立即创建指定出口 IP 租约”的 API，插件不查询新 egress IP，也不保证轮换后一定使用不同出口 IP。批量清除会对每个选中账号执行同一套模式语义；+
 ## 管理页与 API
 
 管理页：
@@ -262,18 +292,19 @@ curl -X POST \
 | `accounts.cooldown` | 手动冷却 |
 | `accounts.disable` | 手动永久禁用 |
 | `accounts.restore` | 恢复 guard-owned 账号并清除 strike |
-| `resin.bind` | 显式绑定单个或多个 auth |
-| `resin.bind_unbound` | 批量绑定未绑定账号 |
-| `resin.rotate` | 删除旧租约并生成新绑定 |
+| `resin.bind` | 显式绑定单个或多个 auth；仅 API 模式可用 |
+| `resin.bind_unbound` | API 模式下批量绑定未绑定账号 |
+| `resin.rotate` | API 模式删除旧租约并重绑；本地模式只改写已有代理用户名 |
+| `resin.clear` | 清除单个或多个 auth 的代理；API 模式先删除管理租约，本地模式不处理远端租约 |
 | `resin.config.get` | 查看脱敏的 Resin 配置与 Secret 是否已设置 |
-| `resin.config.validate` | 验证 Admin API、Admin Token、平台和 Proxy Token，不保存 |
-| `resin.config.save` | 再次验证，成功后持久化 Resin 配置 |
+| `resin.config.validate` | API 模式验证 Admin API、Admin Token、平台和 Proxy Token；本地模式直接返回本地配置 |
+| `resin.config.save` | API 模式再次验证后持久化；本地模式直接持久化本地轮换配置 |
 | `policy.get` | 查看运行时策略 |
 | `policy.update` | 校验并持久化策略 |
 | `policy.reset` | 重置为 YAML 初始值 |
 | `events.list` | 查看质量事件日志 |
 
-API 只接受 POST，并由 CPA management 层完成认证。插件不要求自定义 Header 或请求体 UI 标记，避免管理网关剥离 Header 时页面请求失败。响应中的 email、proxy URL、token 和密码均会脱敏；账号列表同时提供 `auth_id_display` 供展示，操作 API 使用稳定的 `auth_id` 作为标识。
+API 只接受 POST，并由 CPA management 层完成认证。插件不要求自定义 Header 或请求体 UI 标记，避免管理网关剥离 Header 时页面请求失败。响应中的 email、proxy URL、token 和密码均会脱敏；账号列表同时提供 `auth_id_display` 供展示，操作 API 使用稳定的 `auth_id` 作为标识。`proxy_url` 可能内嵌 Proxy Token，因此管理页只显示 `scheme://host`，不会展示完整凭据。
 
 ## 状态文件
 
@@ -283,7 +314,7 @@ API 只接受 POST，并由 CPA management 层完成认证。插件不要求自�
 <UserConfigDir>/cliproxyapi/grok-quality-guard/state.json
 ```
 
-可通过 `state_file` 覆盖。状态文件使用版本化 schema、原子替换写入，Unix 权限为目录 `0700`、文件 `0600`。策略首次从 YAML 初始化，之后管理页修改会持久化到 state；`policy.reset` 会恢复为当前 YAML 的默认值。通过管理页验证后保存的 Resin 配置和 token 也存储在本地 state 中，API 与页面只返回是否已设置的布尔标记。
+可通过 `state_file` 覆盖。状态文件使用版本化 schema、原子替换写入，Unix 权限为目录 `0700`、文件 `0600`。策略首次从 YAML 初始化，之后管理页修改会持久化到 state；`policy.reset` 会恢复为当前 YAML 的默认值。通过管理页保存的 Resin 配置和 API 模式 token 也存储在本地 state 中，API 与页面只返回是否已设置的布尔标记。
 
 ## 开发与测试
 
@@ -319,5 +350,5 @@ git push origin v0.1.0
 - streaming 开始后无法回滚，也无法在已经 emit 后换号
 - stored responses、compaction、媒体输入和有副作用的 hosted tools 不属于透明重放范围
 - CPA 不能直接以固定 AuthID 探测 disabled auth，恢复探测存在短暂重新启用窗口
-- Resin 删除租约后不保证换到不同出口 IP
+- Resin 删除租约后不保证换到不同出口 IP；本地轮换不会删除远端租约
 - 不实现 OAuth 登录或账号导入导出

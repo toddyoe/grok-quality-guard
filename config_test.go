@@ -24,6 +24,15 @@ func TestDecodeConfigPartialKeepsDefaults(t *testing.T) {
 	}
 }
 
+func TestDecodeConfigResinLocalOnly(t *testing.T) {
+	cfg, errDecode := decodeConfig([]byte("resin:\n  enabled: true\n  local_only: true\n"))
+	if errDecode != nil {
+		t.Fatalf("decodeConfig() error = %v", errDecode)
+	}
+	if !cfg.Resin.Enabled || !cfg.Resin.LocalOnly {
+		t.Fatalf("unexpected local-only resin config: %#v", cfg.Resin)
+	}
+}
 func TestNormalizePolicyRejectsInvalidTPS(t *testing.T) {
 	policy := PolicyFromConfig(DefaultConfig())
 	policy.Quality.SoftTPS = 1000

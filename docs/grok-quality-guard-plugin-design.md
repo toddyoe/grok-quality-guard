@@ -793,13 +793,13 @@ host.stream.close(
 透明模式中检测到 `missing_thinking` 后：
 
 1. 记录异常
-2. 如果 Resin 管理和自动轮换开启，执行一次删除租约 + 生成新账号 + 写回 proxy_url
+2. 如果代理轮换和自动轮换开启，API 模式删除旧租约并重绑，本地模式只改写已有代理用户名并写回
 3. 同一账号可用新代理重试一次
 4. 新代理仍异常则换下一个账号
 5. 每个请求对每个账号最多轮换一次
 6. 总上游尝试次数仍受 `max_attempts=6` 限制
 
-如果没有 Resin 管理，直接换下一个账号。
+如果没有启用代理轮换，直接换下一个账号。
 
 ### 6.9 无法覆盖的场景
 
@@ -945,6 +945,7 @@ CPA 不允许直接执行 disabled auth。恢复探测流程必须：
 管理员在管理页配置以下字段：
 
 - `resin.enabled`
+- `resin.local_only`
 - `resin.platform`
 - `resin.platform_id`
 - `resin.admin_url`
@@ -953,9 +954,16 @@ CPA 不允许直接执行 disabled auth。恢复探测流程必须：
 - `resin.proxy_template`
 - `resin.auto_rotate_after_quality_failure`
 
-`platform_id` 是租约 API 必需的 UUID。不得用平台名称直接调用租约 API。
+代理轮换支持两种互斥模式：
 
-YAML 中的 `admin_token_env` 和 `proxy_token_env` 仅作为首次初始化或 state 未配置时的环境变量回退来源。管理页保存的配置优先于 YAML。保存时必须同时验证：
+- API 模式：管理 Resin 远端租约，可以首次绑定、轮换和清除租约
+- 仅本地轮换：不调用 Resin API，只改写 auth 中已有代理的用户名
+
+`local_only=true` 时不需要 Admin API URL、Platform ID、Admin Token、Proxy Token 或代理模板。保存该模式会清空 state 中已有的 API URL、Platform ID 和 token，避免界面显示本地模式但仍保留旧 API 凭据。再次切回 API 模式时必须重新填写并验证 API 配置。
+
+YAML 中的 `admin_token_env` 和 `proxy_token_env` 仅作为首次初始化或 state 未配置时的环境变量回退来源。管理页保存的配置优先于 YAML。
+
+API 模式保存时必须同时验证：
 
 1. `admin_url` 是带 host 的合法 `http` 或 `https` URL，且不包含 userinfo、query 或 fragment。
 2. 使用 Admin Token 调用 `GET /api/v1/system/info`，验证 Admin API 可达且 Token 有效。
@@ -963,9 +971,9 @@ YAML 中的 `admin_token_env` 和 `proxy_token_env` 仅作为首次初始化或 
 4. 按代理模板渲染验证账号 `grok-validation`，对代理主机执行 SOCKS5 RFC1929 用户名/密码认证，验证 Proxy Token 被接受。
 5. 任一步失败都返回明确错误，且不得写入 state。
 
-`admin_token` 和 `proxy_token` 只在全部验证通过后写入 state。管理页与 JSON API 永远不返回 token 原值，只返回 `admin_token_set` 和 `proxy_token_set`；留空再次保存时保留已有 token。
+`admin_token` 和 `proxy_token` 只在 API 模式全部验证通过后写入 state。管理页与 JSON API 永远不返回 token 原值，只返回 `admin_token_set` 和 `proxy_token_set`；留空再次保存时保留已有 token。
 
-`platform_id` 是唯一事实源，`platform` 是展示值。保存时会把 Admin API 返回的规范平台名写回 state。绑定和轮换运行时还会以 `platform_id` 再次查询平台名，因此即使 YAML 初始化、state 被人工修改或 Resin 平台改名，删除租约和代理模板也不会继续使用过期名称。
+`platform_id` 是 API 模式下租约 API 必需的 UUID。`platform_id` 是唯一事实源，`platform` 是展示值。保存时会把 Admin API 返回的规范平台名写回 state。绑定和轮换运行时还会以 `platform_id` 再次查询平台名，因此即使 YAML 初始化、state 被人工修改或 Resin 平台改名，删除租约和代理模板也不会继续使用过期名称。
 
 ### 9.2 Account 命名
 
@@ -1001,7 +1009,7 @@ grok-auth_7f3a82d1-3n5q
 
 ### 9.3 首次绑定
 
-默认不自动绑定。
+默认不自动绑定，首次绑定仅在 API 模式可用。`local_only=true` 时 `resin.bind` 和 `resin.bind_unbound` 必须返回明确错误，因为创建新代理绑定需要 Resin API 和 Proxy Token。
 
 管理页必须提供：
 
@@ -1024,22 +1032,43 @@ grok-auth_7f3a82d1-3n5q
 
 ### 9.4 轮换
 
-固定顺序：
+轮换分为 API 模式和仅本地轮换。两种模式共用以下步骤：
 
 1. 读取 auth 和 guard 元数据
-2. 取得该 auth 的 `resin_account`
-3. 使用 `platform_id` 调用 `GET /api/v1/platforms/{platform_id}`，取得规范平台名
-4. 使用同一份解析结果执行 `DELETE /api/v1/platforms/{platform_id}/leases/{account}`
-5. `204` 或 `404` 视为成功
-6. `401/403` 立即停止，记录配置错误，不循环
-7. `5xx` 或网络错误标记轮换失败并冷却，不无限重试
-8. 生成新 account，必须与旧 account 不同
-9. 使用步骤 3 得到的规范平台名渲染新 `proxy_url`
-10. 调用 `host.auth.save` 写回，保留 access/refresh token 等所有字段
-11. 更新 `resin_generation`
-12. 不调用 GET lease 查询 egress IP
+2. 从 guard 元数据、state 或现有代理用户名中取得旧 account
+3. 生成新 account，必须与旧 account 不同
+4. 调用 `host.auth.save` 写回，保留 access/refresh token 等所有字段
+5. 更新 `resin_generation`
+6. 每个 auth 使用独立互斥锁，防止并发请求重复轮换
 
-每个 auth 使用独立互斥锁，防止并发请求重复轮换。
+API 模式固定顺序：
+
+1. 使用 `platform_id` 调用 `GET /api/v1/platforms/{platform_id}`，取得规范平台名
+2. 使用同一份解析结果执行 `DELETE /api/v1/platforms/{platform_id}/leases/{account}`
+3. `204` 或 `404` 视为成功
+4. `401/403` 立即停止，记录配置错误，不循环
+5. `5xx` 或网络错误标记轮换失败并冷却，不无限重试
+6. 使用步骤 1 得到的规范平台名渲染新 `proxy_url`
+7. 不调用 GET lease 查询 egress IP
+
+仅本地轮换固定顺序：
+
+1. 要求 auth 中已有非空 `proxy_url`
+2. 解析代理 URL，要求包含 scheme、host、用户名和密码
+3. 用户名必须至少包含一个 `.`，最后一个 `.` 后的部分视为旧 account
+4. 只替换用户名中最后一个 `.` 后的 account，保留 scheme、host、port、password、path、query 等其余部分
+5. 写回 auth 和 guard 元数据
+6. 不调用任何 Resin API，不删除远端旧租约
+7. 事件详情必须标记本次轮换未调用 Resin API
+
+本地轮换示例：
+
+```text
+socks5h://Default.grok-alice-old1:proxy-secret@resin:2260
+  -> socks5h://Default.grok-alice-new1:proxy-secret@resin:2260
+```
+
+如果现有代理用户名没有 `.` 分隔的 account，或缺少用户名/密码，则本地轮换失败且不得修改 auth。本地模式不能创建新代理绑定，也不能保证远端不存在与旧用户名关联的租约。
 
 ### 9.5 失败矩阵
 
@@ -1054,10 +1083,13 @@ grok-auth_7f3a82d1-3n5q
 | auth save 失败 | 不更新 state，记录失败，保持旧绑定 |
 | 随机 account 冲突 | 重试最多 32 次 |
 | 新 proxy 渲染失败 | 不删除旧 auth 元数据，记录错误 |
+| 本地模式无 proxy_url | 返回错误，不写 auth |
+| 本地代理用户名无 account 后缀 | 返回错误，不写 auth |
+| 本地代理缺少密码 | 返回错误，不写 auth |
 
 ### 9.6 代理模板
 
-示例：
+代理模板仅在 API 模式使用。示例：
 
 ```text
 socks5h://{platform}.{account}:{proxy_token}@resin:2260
@@ -1069,9 +1101,11 @@ socks5h://{platform}.{account}:{proxy_token}@resin:2260
 - `{account}`：生成的 account
 - `{proxy_token}`：管理页验证并保存的代理 token，state 未配置时回退到 YAML 指定的环境变量
 
-`proxy_token` 写入插件 state 时必须依赖目录 `0700`、文件 `0600` 的本地权限保护。它不得出现在事件日志、管理页响应、JSON API 或错误消息中。写入 auth 的 `proxy_url` 是 CPA 运行所需，必须被视为敏感字段，管理页只显示脱敏形式。
+`proxy_token` 写入插件 state 时必须依赖目录 `0700`、文件 `0600` 的本地权限保护。它不得出现在事件日志、管理页响应、JSON API 或错误消息中。写入 auth 的 `proxy_url` 是 CPA 运行所需，必须被视为敏感字段，管理页只显示脱敏形式。仅本地轮换不读取或保存 `proxy_token`。
 
 ### 9.7 配置验证与保存时序
+
+API 模式：
 
 ```text
 管理员提交候选配置
@@ -1086,7 +1120,18 @@ socks5h://{platform}.{account}:{proxy_token}@resin:2260
   -> 返回非敏感配置视图
 ```
 
-失败分支：
+仅本地轮换：
+
+```text
+管理员提交 local_only=true
+  -> 清空 API URL、Platform ID 和 token
+  -> 不调用 Admin API，不执行代理握手
+  -> 原子写入 state.Resin
+  -> 更新运行时配置
+  -> 返回非敏感配置视图
+```
+
+API 模式失败分支：
 
 | 场景 | 状态码 | 行为 |
 | --- | ---: | --- |
@@ -1097,8 +1142,23 @@ socks5h://{platform}.{account}:{proxy_token}@resin:2260
 | 代理认证拒绝 | 400 | 不保存 |
 | state 写入失败 | 500 | 运行时配置保持不变 |
 
-验证与保存都执行同一套服务端验证逻辑。`resin.config.validate` 只验证不落盘；`resin.config.save` 必须再次验证，成功后才会覆盖已保存配置。
+API 模式的验证与保存都执行同一套服务端验证逻辑。`resin.config.validate` 只验证不落盘；`resin.config.save` 必须再次验证，成功后才会覆盖已保存配置。仅本地轮换模式跳过 API 验证，但仍执行本地模式规范化并持久化。
 
+### 9.8 清除与批量操作
+
+`Resin 租约` 页中的账号代理表是账号与代理生命周期的操作面，适合承载账号列表、脱敏代理、勾选、批量绑定和批量清除。账号质量判定仍保留在 `账号质量` Tab；连接凭据仍保留在 `设置 / Resin 连接`。不从该表直接编辑任意自定义代理 URL，也不展示包含 Proxy Token 的完整 URL。
+
+批量绑定通过 `resin.bind` 的 `auth_ids` 参数完成。已绑定账号保持原租约，非插件管理的外部代理返回冲突且不被覆盖。仅本地轮换模式禁用绑定操作。
+
+批量清除通过 `resin.clear` 的 `auth_ids` 参数完成：
+
+1. API 模式下，插件管理的租约先按 `platform_id` 解析平台并调用 `DELETE /api/v1/platforms/{platform_id}/leases/{account}`
+2. `204` 或 `404` 视为远端租约已删除
+3. 删除成功后移除 auth 中的 `proxy_url`，清除 guard 元数据中的 `managed` 和 `resin_account`，保留租约代数和其他 token 字段
+4. 外部代理没有插件管理的租约，只移除 auth 中的 `proxy_url`，不删除外部代理服务
+5. 仅本地轮换模式只移除 auth 中的代理，不调用 Resin API，也不处理远端租约
+6. 任一账号失败只影响该账号，批量接口继续处理其他账号并在结果中返回逐项错误
++
 ## 10. 管理页与 JSON API
 
 ### 10.1 路径
@@ -1141,10 +1201,10 @@ Action API 注册路径：
 页面采用与 CPA Management Center 一致的中性色视觉体系，自动跟随宿主页面的明暗主题，所有界面文字使用中文，并按任务频率拆分 Tab：
 
 - `概览`：守护状态、检测模式、账号总数、需关注账号、最近 24h 自动检测统计、质量分布、最近事件、当前策略摘要和 Resin 摘要
-- `账号质量`：搜索和状态筛选、脱敏账号信息、真实思考证据、TPS/TTFT/output/reasoning/encrypted 指标、Resin 绑定、冷却和探测退避；详情抽屉提供主动探测、冷却、恢复、禁用、绑定和轮换
-- `Resin 租约`：租约绑定/冲突统计、租约账号和代数、搜索与状态筛选、单账号绑定/轮换、批量绑定未绑定账号；连接凭据不在此页修改
-- `事件日志`：按关键词和事件类型筛选时间、auth ID、分类、动作、结果和脱敏详情
-- `设置`：低频配置集中在此 Tab，内部再分为 `守护策略` 与 `Resin 连接`；策略保存后热更新，Resin 连接必须先验证成功再保存
+- `账号质量`：搜索、状态筛选和分页、脱敏账号信息、真实思考证据、TPS/TTFT/output/reasoning/encrypted 指标、Resin 绑定、冷却和探测退避；详情抽屉提供主动探测、冷却、恢复、禁用、绑定和轮换
+- `Resin 租约`：每个 Grok 账号、脱敏代理、代理账号和轮换代数、搜索、状态筛选和分页、单账号绑定/轮换/清除，绑定仅 API 模式可用；表头复选框全选当前页，工具栏可全选当前筛选或全部账号，再批量绑定或清除代理；连接凭据不在此页修改
+- `事件日志`：按关键词和事件类型筛选并分页展示时间、auth ID、分类、动作、结果和脱敏详情
+- `设置`：低频配置集中在此 Tab，内部再分为 `守护策略` 与 `Resin 连接`；策略保存后热更新，API 模式的 Resin 连接必须先验证成功再保存，仅本地轮换无需 API 验证
 
 页面技术要求：
 
@@ -1212,12 +1272,13 @@ Content-Type: application/json
 | `accounts.cooldown` | `auth_id`、`duration` | 手动冷却 |
 | `accounts.disable` | `auth_id`、`reason` | 手动永久禁用 |
 | `accounts.restore` | `auth_id` | 恢复 guard-owned auth 并清除 strike |
-| `resin.bind` | `auth_id` 或 `auth_ids` | 显式绑定 |
+| `resin.bind` | `auth_id` 或 `auth_ids` | API 模式下显式绑定；仅本地轮换模式拒绝 |
 | `resin.bind_unbound` | `dry_run` | 批量绑定未绑定账号 |
-| `resin.rotate` | `auth_id` | 删除旧租约并重绑新 account |
+| `resin.rotate` | `auth_id` | API 模式删除旧租约并重绑；本地模式只改写已有代理用户名 |
+| `resin.clear` | `auth_id` 或 `auth_ids` | API 模式删除插件管理的远端租约并清除代理；外部代理或本地模式只清除 auth 配置 |
 | `resin.config.get` | 无 | 返回脱敏的 Resin 配置和 token 是否已设置 |
-| `resin.config.validate` | Resin 配置字段 | 验证 Admin API、Admin Token、平台和 Proxy Token，不保存 |
-| `resin.config.save` | Resin 配置字段 | 再次验证，成功后原子持久化 |
+| `resin.config.validate` | Resin 配置字段 | API 模式验证 Admin API、Admin Token、平台和 Proxy Token；本地模式直接返回 |
+| `resin.config.save` | Resin 配置字段 | API 模式再次验证后原子持久化；本地模式直接持久化 |
 | `policy.get` | 无 | 返回运行时策略 |
 | `policy.update` | `policy` | 校验并持久化策略 |
 | `policy.reset` | 无 | 重置为 YAML 默认值 |
@@ -1280,6 +1341,7 @@ plugins:
 
       resin:
         enabled: false
+        local_only: false
         platform: "Default"
         platform_id: ""
         admin_url: ""
@@ -1302,10 +1364,10 @@ YAML 始终决定以下部署级字段：
 
 Resin 配置采用“YAML 初始化，管理页验证后保存并优先使用”的规则：
 
-- state 未配置 Resin 时，使用 YAML 中的 `enabled`、`platform`、`platform_id`、`admin_url`、`proxy_template`、`auto_rotate_after_quality_failure`
+- state 未配置 Resin 时，使用 YAML 中的 `enabled`、`local_only`、`platform`、`platform_id`、`admin_url`、`proxy_template`、`auto_rotate_after_quality_failure`
 - state 未配置 Resin 且 token 为空时，从 `admin_token_env` 和 `proxy_token_env` 读取环境变量回退
-- 管理页 `resin.config.save` 成功后，state 中的完整 Resin 配置优先
-- 后续 YAML 修改不会静默覆盖已保存的 Resin 配置；管理员需在管理页重新验证并保存
+- 管理页 `resin.config.save` 成功后，state 中的完整 Resin 配置优先；`local_only=true` 时不读取 API 凭据
+- 后续 YAML 修改不会静默覆盖已保存的 Resin 配置；管理员需在管理页重新保存，API 模式还需重新验证
 
 运行时策略首次从 YAML 初始化到 state，之后由管理页修改：
 
@@ -1330,6 +1392,7 @@ Resin 配置采用“YAML 初始化，管理页验证后保存并优先使用”
 - `probe.recovery_only=true`
 - `probe.concurrency=1`
 - `resin.enabled=false`
+- `resin.local_only=false`
 - `resin.auto_rotate_after_quality_failure=true`，但仅在 Resin 已启用且当前模式允许动作时生效
 
 ## 12. 状态文件与持久化
@@ -1355,6 +1418,7 @@ Resin 配置采用“YAML 初始化，管理页验证后保存并优先使用”
   "resin": {
     "configured": true,
     "enabled": true,
+    "local_only": false,
     "platform": "Default",
     "platform_id": "11111111-1111-1111-1111-111111111111",
     "admin_url": "http://resin:2260",
@@ -1404,7 +1468,7 @@ Resin 配置采用“YAML 初始化，管理页验证后保存并优先使用”
 - 事件最多保留 `events_limit`
 - 纯观测更新可节流 1s 写入
 - 状态转换、disabled 修改、Resin 重绑必须立即写入
-- `resin.config.save` 仅在验证成功后写入，并与运行时配置在同一更新中切换
+- `resin.config.save` 在 API 模式仅在验证成功后写入；本地模式直接写入，并与运行时配置在同一更新中切换
 - Resin token 只存储在本机 state；依赖目录 `0700`、文件 `0600` 限制访问
 - 进程崩溃后启动时进行 reconcile
 
@@ -1466,7 +1530,7 @@ Resin 配置采用“YAML 初始化，管理页验证后保存并优先使用”
 
 - 管理页 token 输入框永不回填原值，只提示“已配置，留空保持”
 - `resin.config.get`、`resin.config.validate`、`resin.config.save` 均不返回 token 原值
-- 保存前必须完成 Admin API、平台和 SOCKS5 代理认证验证
+- API 模式保存前必须完成 Admin API、平台和 SOCKS5 代理认证验证；本地模式不调用 API
 - 验证失败时不得覆盖旧配置
 - state 内 token 为本地静态 secret，当前不提供操作系统 keychain 集成；安全边界为 `0600` 文件权限
 - 环境变量仍可作为 state 未配置时的回退来源
@@ -1483,6 +1547,7 @@ Resin 配置采用“YAML 初始化，管理页验证后保存并优先使用”
 8. hosted tool、stored response、compaction 等不可安全重放。
 9. auth 文件可能被管理员或其他进程并发修改；写回前必须重新读取并做字段级合并。
 10. 事件日志不能保存 prompt、响应正文和原始错误 body。
+11. 本地轮换只能改写已有代理用户名，不能创建新绑定，也不会删除远端旧租约。
 
 ## 16. 测试计划
 
@@ -1531,6 +1596,8 @@ Resin：
 - auth save 保留 access/refresh token
 - 每个请求最多轮换一次
 - 并发轮换互斥
+- 本地模式只改写代理 account 后缀并保留其余 URL 字段
+- 本地模式不发起 Resin Admin API 请求
 - `resin.config.get` 不返回 token
 - Admin API、Admin Token、平台 ID 和 SOCKS5 Proxy Token 验证
 - 平台 ID 查询返回的规范名称用于代理模板
@@ -1559,6 +1626,7 @@ Resin：
 - 第一候选 deliver 后不再换号
 - 4 MiB buffer overflow 放行并记录
 - Resin DELETE 后 auth proxy_url 更新
+- 本地模式轮换后 auth proxy_url 更新且旧租约接口未被调用
 - 新 account 与旧 account 不同
 - DELETE 404 仍继续
 - DELETE 401 不循环
@@ -1573,7 +1641,7 @@ Resin：
 - 安装插件后 management 页面可打开
 - 默认 passive、observe
 - 不修改任何 auth
-- 管理页 Resin 配置在验证成功前无法保存
+- API 模式的管理页 Resin 配置在验证成功前无法保存，本地模式可直接保存
 - 错误 Admin Token 或 Proxy Token 不会覆盖已保存配置
 - 留空 Secret 输入框再次保存会保留已有值
 - 手动绑定单个账号成功
@@ -1662,7 +1730,7 @@ git diff --check
 10. 透明模式仅在首个 emit 前换号。
 11. 所有候选耗尽返回 503 quality_degraded。
 12. 管理页和 API 不泄漏任何 secret。
-13. Resin 配置只有在 Admin API、Admin Token、平台 ID 和 Proxy Token 全部验证通过后才会保存。
+13. API 模式的 Resin 配置只有在 Admin API、Admin Token、平台 ID 和 Proxy Token 全部验证通过后才会保存；本地轮换模式无需这些字段。
 14. 插件注册和热重载不因账号扫描阻塞。
 15. 文档中的路径统一为 `/dashboard`、`/v0/resource/plugins/grok-quality-guard/dashboard`、`/plugins/grok-quality-guard/api` 和 `/v0/management/plugins/grok-quality-guard/api`。
 
@@ -1680,7 +1748,7 @@ git diff --check
 | 最大尝试次数 | 6 |
 | 主动探测 | 仅恢复性 |
 | Resin 首次绑定 | 管理员显式操作 |
-| Resin 轮换 | 删除旧租约，生成新 account，写新 proxy_url，不查 IP |
+| Resin 轮换 | API 模式删除旧租约并重绑；本地模式只改写已有代理用户名，不查 IP |
 | 自动恢复 | 仅 guard-owned 冷却账号 |
 | OAuth/导入/导出 | 不支持 |
 | auth 元数据命名空间 | `grok_quality_guard` |

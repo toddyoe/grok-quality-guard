@@ -103,6 +103,7 @@ type ProbeConfig struct {
 
 type ResinConfig struct {
 	Enabled                       bool   `yaml:"enabled" json:"enabled"`
+	LocalOnly                     bool   `yaml:"local_only" json:"local_only"`
 	Platform                      string `yaml:"platform" json:"platform"`
 	PlatformID                    string `yaml:"platform_id" json:"platform_id"`
 	AdminURL                      string `yaml:"admin_url" json:"admin_url"`

@@ -46,6 +46,55 @@ func TestResinConfigGetMasksSecretsAndUsesEnvironmentFallback(t *testing.T) {
 	}
 }
 
+func TestResinConfigSaveLocalOnlyWithoutAPI(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	plugin := newTestPlugin(t, host, nil)
+	params := map[string]any{
+		"enabled":                           true,
+		"local_only":                        true,
+		"platform":                          "Default",
+		"platform_id":                       testResinPlatformID,
+		"admin_url":                         "http://resin.local",
+		"admin_token":                       "admin-secret",
+		"proxy_token":                       "proxy-secret",
+		"proxy_template":                    "socks5h://{platform}.{account}:{proxy_token}@resin:2260",
+		"auto_rotate_after_quality_failure": true,
+	}
+	response := actionManagementForTest(t, plugin, "resin.config.save", params)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.StatusCode, response.Body)
+	}
+	state := plugin.store.Snapshot()
+	if !state.Resin.Configured || !state.Resin.Enabled || !state.Resin.LocalOnly {
+		t.Fatalf("local resin config was not persisted: %#v", state.Resin)
+	}
+	if state.Resin.PlatformID != "" || state.Resin.AdminURL != "" || state.Resin.AdminToken != "" || state.Resin.ProxyToken != "" {
+		t.Fatalf("local resin config persisted API credentials: %#v", state.Resin)
+	}
+	if state.Resin.ValidatedAt.IsZero() {
+		t.Fatal("local resin config did not record activation time")
+	}
+	settings := plugin.ResinConfig()
+	if !settings.LocalOnly || settings.PlatformID != "" || settings.AdminURL != "" || settings.AdminToken != "" || settings.ProxyToken != "" {
+		t.Fatalf("local resin settings exposed API fields: %#v", settings)
+	}
+	var decoded struct {
+		OK   bool            `json:"ok"`
+		Data resinConfigView `json:"data"`
+	}
+	if errUnmarshal := json.Unmarshal(response.Body, &decoded); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if !decoded.Data.LocalOnly || !decoded.Data.Configured || !decoded.Data.Enabled {
+		t.Fatalf("unexpected local config view: %#v", decoded.Data)
+	}
+	validateResponse := actionManagementForTest(t, plugin, "resin.config.validate", map[string]any{"local_only": true})
+	if validateResponse.StatusCode != http.StatusOK || !strings.Contains(string(validateResponse.Body), `"local_only":true`) {
+		t.Fatalf("local validation failed: status=%d body=%s", validateResponse.StatusCode, validateResponse.Body)
+	}
+}
+
 func TestResinConfigValidateDoesNotPersist(t *testing.T) {
 	adminServer, socksAddr := newResinValidationServers(t, "admin-secret", "proxy-secret", true)
 	defer adminServer.Close()

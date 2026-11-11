@@ -113,6 +113,8 @@ func (p *Plugin) handleAction(ctx context.Context, action actionRequest, callbac
 		return p.actionResinBindUnbound(ctx, action.Params)
 	case "resin.rotate":
 		return p.actionResinRotate(ctx, action.Params)
+	case "resin.clear":
+		return p.actionResinClear(ctx, action.Params)
 	case "resin.config.get":
 		return p.actionResinConfigGet()
 	case "resin.config.validate":
@@ -195,36 +197,60 @@ func (p *Plugin) actionAccountsList(ctx context.Context, params map[string]any) 
 	if pageSize < 1 || pageSize > 200 {
 		pageSize = 50
 	}
-	views := make([]accountView, 0)
+	filtered := make([]Account, 0, len(p.catalogSnapshot()))
 	for _, account := range p.catalogSnapshot() {
+		if filterState != "" && catalogAccountState(account, state) != filterState {
+			continue
+		}
+		if query != "" && !catalogAccountMatches(account, query) {
+			continue
+		}
+		filtered = append(filtered, account)
+	}
+	sort.Slice(filtered, func(i, j int) bool { return filtered[i].ID < filtered[j].ID })
+	start := (page - 1) * pageSize
+	if start > len(filtered) {
+		start = len(filtered)
+	}
+	end := start + pageSize
+	if end > len(filtered) {
+		end = len(filtered)
+	}
+	views := make([]accountView, 0, end-start)
+	for _, account := range filtered[start:end] {
 		view, errView := p.accountView(ctx, account)
 		if errView != nil {
 			continue
 		}
-		if filterState != "" && strings.ToLower(view.State) != filterState {
-			continue
-		}
-		if query != "" && !strings.Contains(strings.ToLower(view.Display+" "+view.AuthID+" "+view.Label+" "+view.Email), query) {
-			continue
-		}
 		views = append(views, view)
 	}
-	sort.Slice(views, func(i, j int) bool { return views[i].AuthID < views[j].AuthID })
-	start := (page - 1) * pageSize
-	if start > len(views) {
-		start = len(views)
-	}
-	end := start + pageSize
-	if end > len(views) {
-		end = len(views)
-	}
 	return map[string]any{
-		"items":        views[start:end],
+		"items":        views,
 		"page":         page,
 		"page_size":    pageSize,
-		"total":        len(views),
+		"total":        len(filtered),
 		"state_counts": stateCounts(state),
 	}, http.StatusOK, nil
+}
+
+func catalogAccountState(account Account, state State) string {
+	if stateAccount := state.Accounts[account.ID]; stateAccount != nil && stateAccount.State != "" {
+		return stateAccount.State
+	}
+	if account.Disabled {
+		return StateExternallyDisabled
+	}
+	return StateUnknown
+}
+
+func catalogAccountMatches(account Account, query string) bool {
+	label := strings.TrimSpace(account.Label)
+	if strings.Contains(label, "@") {
+		label = maskEmail(label)
+	}
+	display := maskEmail(firstNonEmpty(account.Email, account.Label, account.ID))
+	text := strings.ToLower(display + " " + account.ID + " " + label + " " + maskEmail(account.Email))
+	return strings.Contains(text, query)
 }
 
 func (p *Plugin) actionAccountGet(ctx context.Context, params map[string]any) (any, int, error) {
@@ -338,6 +364,38 @@ func (p *Plugin) actionResinBindUnbound(ctx context.Context, params map[string]a
 		return nil, http.StatusBadGateway, errBind
 	}
 	return map[string]any{"items": results, "count": len(results)}, http.StatusOK, nil
+}
+
+func (p *Plugin) actionResinClear(ctx context.Context, params map[string]any) (any, int, error) {
+	if rawIDs, ok := params["auth_ids"].([]any); ok {
+		results := make([]ResinClearResult, 0, len(rawIDs))
+		seen := make(map[string]struct{}, len(rawIDs))
+		for _, rawID := range rawIDs {
+			authID := strings.TrimSpace(asString(rawID))
+			if authID == "" {
+				continue
+			}
+			if _, exists := seen[authID]; exists {
+				continue
+			}
+			seen[authID] = struct{}{}
+			result, errClear := p.ClearResinProxy(ctx, authID)
+			if errClear != nil && result.Error == "" {
+				result.Error = errClear.Error()
+			}
+			results = append(results, result)
+		}
+		return results, http.StatusOK, nil
+	}
+	authID := strings.TrimSpace(asString(params["auth_id"]))
+	if authID == "" {
+		return nil, http.StatusBadRequest, fmt.Errorf("auth_id or auth_ids is required")
+	}
+	result, errClear := p.ClearResinProxy(ctx, authID)
+	if errClear != nil {
+		return result, http.StatusConflict, errClear
+	}
+	return result, http.StatusOK, nil
 }
 
 func (p *Plugin) actionResinRotate(ctx context.Context, params map[string]any) (any, int, error) {

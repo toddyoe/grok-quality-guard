@@ -21,6 +21,7 @@ var resinPlatformIDPattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0
 type ResinSettings struct {
 	Configured                    bool      `json:"configured"`
 	Enabled                       bool      `json:"enabled"`
+	LocalOnly                     bool      `json:"local_only"`
 	Platform                      string    `json:"platform"`
 	PlatformID                    string    `json:"platform_id"`
 	AdminURL                      string    `json:"admin_url"`
@@ -34,6 +35,7 @@ type ResinSettings struct {
 type resinConfigView struct {
 	Configured                    bool      `json:"configured"`
 	Enabled                       bool      `json:"enabled"`
+	LocalOnly                     bool      `json:"local_only"`
 	Platform                      string    `json:"platform"`
 	PlatformID                    string    `json:"platform_id"`
 	AdminURL                      string    `json:"admin_url"`
@@ -45,6 +47,7 @@ type resinConfigView struct {
 }
 
 type resinValidationResult struct {
+	LocalOnly         bool      `json:"local_only"`
 	AdminAPIReachable bool      `json:"admin_api_reachable"`
 	AdminTokenValid   bool      `json:"admin_token_valid"`
 	PlatformValid     bool      `json:"platform_valid"`
@@ -81,12 +84,15 @@ func (p *Plugin) ResinConfig() ResinSettings {
 		if state.Resin.Configured {
 			settings = state.Resin
 			settings.Configured = true
-			if strings.TrimSpace(settings.AdminToken) == "" {
-				settings.AdminToken = strings.TrimSpace(os.Getenv(cfg.AdminTokenEnv))
+			if !settings.LocalOnly {
+				if strings.TrimSpace(settings.AdminToken) == "" {
+					settings.AdminToken = strings.TrimSpace(os.Getenv(cfg.AdminTokenEnv))
+				}
+				if strings.TrimSpace(settings.ProxyToken) == "" {
+					settings.ProxyToken = strings.TrimSpace(os.Getenv(cfg.ProxyTokenEnv))
+				}
 			}
-			if strings.TrimSpace(settings.ProxyToken) == "" {
-				settings.ProxyToken = strings.TrimSpace(os.Getenv(cfg.ProxyTokenEnv))
-			}
+
 		}
 	}
 	return normalizeResinSettingsBestEffort(settings)
@@ -95,6 +101,7 @@ func (p *Plugin) ResinConfig() ResinSettings {
 func resinSettingsFromConfig(cfg ResinConfig) ResinSettings {
 	return normalizeResinSettingsBestEffort(ResinSettings{
 		Enabled:                       cfg.Enabled,
+		LocalOnly:                     cfg.LocalOnly,
 		Platform:                      cfg.Platform,
 		PlatformID:                    cfg.PlatformID,
 		AdminURL:                      cfg.AdminURL,
@@ -118,6 +125,13 @@ func normalizeResinSettingsBestEffort(settings ResinSettings) ResinSettings {
 	}
 	settings.AdminToken = strings.TrimSpace(settings.AdminToken)
 	settings.ProxyToken = strings.TrimSpace(settings.ProxyToken)
+	if settings.LocalOnly {
+		settings.PlatformID = ""
+		settings.AdminURL = ""
+		settings.AdminToken = ""
+		settings.ProxyToken = ""
+	}
+
 	return settings
 }
 
@@ -125,6 +139,7 @@ func (p *Plugin) resinConfigView(settings ResinSettings) resinConfigView {
 	return resinConfigView{
 		Configured:                    settings.Configured,
 		Enabled:                       settings.Enabled,
+		LocalOnly:                     settings.LocalOnly,
 		Platform:                      settings.Platform,
 		PlatformID:                    settings.PlatformID,
 		AdminURL:                      settings.AdminURL,
@@ -167,13 +182,22 @@ func (p *Plugin) actionResinConfigSave(ctx context.Context, params map[string]an
 	if errValidate != nil {
 		return nil, resinErrorStatus(errValidate), errValidate
 	}
-	normalized.Platform = result.Platform
+	if result.Platform != "" {
+		normalized.Platform = result.Platform
+	}
+	normalized.LocalOnly = result.LocalOnly
 	normalized.Configured = true
 	normalized.ValidatedAt = result.ValidatedAt
+	eventResult := "validated"
+	eventDetail := "platform_id=" + normalized.PlatformID
+	if normalized.LocalOnly {
+		eventResult = "local_mode"
+		eventDetail = "local_only"
+	}
 	if errStore := store.Update(func(state *State) error {
 		state.Resin = normalized
 		state.Policy.ResinAutoRotateAfterQualityFail = normalized.AutoRotateAfterQualityFailure
-		p.recordEvent(state, "", "", "resin_config_save", "validated", "platform_id="+normalized.PlatformID)
+		p.recordEvent(state, "", "", "resin_config_save", eventResult, eventDetail)
 		return nil
 	}); errStore != nil {
 		return nil, http.StatusInternalServerError, errStore
@@ -181,6 +205,7 @@ func (p *Plugin) actionResinConfigSave(ctx context.Context, params map[string]an
 	p.mu.Lock()
 	p.policy.ResinAutoRotateAfterQualityFail = normalized.AutoRotateAfterQualityFailure
 	p.cfg.Resin.Enabled = normalized.Enabled
+	p.cfg.Resin.LocalOnly = normalized.LocalOnly
 	p.cfg.Resin.Platform = normalized.Platform
 	p.cfg.Resin.PlatformID = normalized.PlatformID
 	p.cfg.Resin.AdminURL = normalized.AdminURL
@@ -193,6 +218,7 @@ func (p *Plugin) actionResinConfigSave(ctx context.Context, params map[string]an
 func resinSettingsFromParams(params map[string]any, current ResinSettings) ResinSettings {
 	settings := current
 	settings.Enabled = optionalBoolParam(params, "enabled", settings.Enabled)
+	settings.LocalOnly = optionalBoolParam(params, "local_only", settings.LocalOnly)
 	settings.Platform = optionalStringParam(params, "platform", settings.Platform)
 	settings.PlatformID = optionalStringParam(params, "platform_id", settings.PlatformID)
 	settings.AdminURL = optionalStringParam(params, "admin_url", settings.AdminURL)
@@ -207,6 +233,12 @@ func resinSettingsFromParams(params map[string]any, current ResinSettings) Resin
 		if token := strings.TrimSpace(asString(value)); token != "" {
 			settings.ProxyToken = token
 		}
+	}
+	if settings.LocalOnly {
+		settings.PlatformID = ""
+		settings.AdminURL = ""
+		settings.AdminToken = ""
+		settings.ProxyToken = ""
 	}
 	return settings
 }
@@ -238,7 +270,7 @@ func optionalBoolParam(params map[string]any, key string, fallback bool) bool {
 	return fallback
 }
 
-func normalizeResinSettings(settings ResinSettings) (ResinSettings, error) {
+func normalizeResinAdminSettings(settings ResinSettings) (ResinSettings, error) {
 	settings = normalizeResinSettingsBestEffort(settings)
 	if settings.Platform == "" {
 		return ResinSettings{}, resinConfigErrorf(http.StatusBadRequest, "resin platform is required")
@@ -269,6 +301,19 @@ func normalizeResinSettings(settings ResinSettings) (ResinSettings, error) {
 	if len(settings.AdminToken) > 4096 {
 		return ResinSettings{}, resinConfigErrorf(http.StatusBadRequest, "resin admin_token is too long")
 	}
+	return settings, nil
+}
+
+func normalizeResinSettings(settings ResinSettings) (ResinSettings, error) {
+	settings = normalizeResinSettingsBestEffort(settings)
+	if settings.LocalOnly {
+		return settings, nil
+	}
+	normalized, errAdmin := normalizeResinAdminSettings(settings)
+	if errAdmin != nil {
+		return ResinSettings{}, errAdmin
+	}
+	settings = normalized
 	if settings.ProxyToken == "" {
 		return ResinSettings{}, resinConfigErrorf(http.StatusBadRequest, "resin proxy_token is required")
 	}
@@ -305,6 +350,11 @@ func normalizeResinSettings(settings ResinSettings) (ResinSettings, error) {
 
 func validateResinSettings(ctx context.Context, settings ResinSettings) (resinValidationResult, error) {
 	result := resinValidationResult{}
+	if settings.LocalOnly {
+		result.LocalOnly = true
+		result.ValidatedAt = time.Now().UTC()
+		return result, nil
+	}
 	if errAdmin := validateResinAdminAPI(ctx, settings); errAdmin != nil {
 		return result, errAdmin
 	}
@@ -370,10 +420,26 @@ func validateResinPlatform(ctx context.Context, settings ResinSettings) (string,
 	}
 }
 
+func resolveResinAdminForOperation(ctx context.Context, settings ResinSettings) (ResinSettings, error) {
+	normalized, errNormalize := normalizeResinAdminSettings(settings)
+	if errNormalize != nil {
+		return ResinSettings{}, errNormalize
+	}
+	platformName, errPlatform := validateResinPlatform(ctx, normalized)
+	if errPlatform != nil {
+		return ResinSettings{}, errPlatform
+	}
+	normalized.Platform = platformName
+	return normalized, nil
+}
+
 func resolveResinPlatformForOperation(ctx context.Context, settings ResinSettings) (ResinSettings, error) {
 	normalized, errNormalize := normalizeResinSettings(settings)
 	if errNormalize != nil {
 		return ResinSettings{}, errNormalize
+	}
+	if normalized.LocalOnly {
+		return ResinSettings{}, resinConfigErrorf(http.StatusBadRequest, "resin API mode is required for this operation")
 	}
 	platformName, errPlatform := validateResinPlatform(ctx, normalized)
 	if errPlatform != nil {

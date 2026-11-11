@@ -72,10 +72,15 @@ func TestManagementResourceAndActionAccess(t *testing.T) {
 	if response.StatusCode != http.StatusOK || !strings.Contains(string(response.Body), "/plugins/grok-quality-guard/api") {
 		t.Fatalf("unexpected dashboard response: status=%d body=%s", response.StatusCode, response.Body)
 	}
+	for _, removed := range []string{"proxy_url", "代理（脱敏）", "选择全部筛选结果", " 代理", "代理 "} {
+		if strings.Contains(string(response.Body), removed) {
+			t.Fatalf("dashboard still contains legacy label %q", removed)
+		}
+	}
 	if strings.Contains(string(response.Body), "X-Grok-Quality-Guard-UI") {
 		t.Fatal("dashboard still depends on the custom UI header")
 	}
-	for _, expected := range []string{"概览", "账号质量", "Resin 租约", "事件日志", "设置", "24 小时统计", "resin.config.get", `type="password"`} {
+	for _, expected := range []string{"概览", "账号质量", "Resin 租约", "事件日志", "设置", "24 小时统计", "resin.config.get", "resin.clear", "leaseSelectAll", "clearSelectedBtn", "accountsPager", "leasesPager", "eventsPager", "selectFilteredBtn", "selectAllAccountsBtn", "全选当前筛选", "全选所有账号", "选择本页全部账号", "r_local_only", "本地轮换", `type="password"`} {
 		if !strings.Contains(string(response.Body), expected) {
 			t.Fatalf("dashboard is missing %q", expected)
 		}
@@ -120,6 +125,44 @@ func TestAccountsListMasksSecrets(t *testing.T) {
 	}
 	if len(decoded.Data.Items) != 1 || decoded.Data.Items[0].AuthID != "auth-1" {
 		t.Fatalf("unexpected accounts list: %#v", decoded.Data.Items)
+	}
+}
+
+func TestResinClearBatchManagement(t *testing.T) {
+	entries1, auths1 := singleGrokAuth(t, "auth-1", "[EMAIL]", map[string]any{
+		"proxy_url": "socks5h://user:secret-one@example.com:1080",
+	})
+	entries2, auths2 := singleGrokAuth(t, "auth-2", "[EMAIL]", map[string]any{
+		"proxy_url": "socks5h://user:secret-two@example.org:1080",
+	})
+	entries := append(entries1, entries2...)
+	auths := make(map[string]json.RawMessage, len(auths1)+len(auths2))
+	for key, value := range auths1 {
+		auths[key] = value
+	}
+	for key, value := range auths2 {
+		auths[key] = value
+	}
+	host := newMockHostCall(entries, auths)
+	plugin := newTestPlugin(t, host, nil)
+	response := actionManagementForTest(t, plugin, "resin.clear", map[string]any{
+		"auth_ids": []any{"auth-1", "auth-2", "auth-1"},
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.StatusCode, response.Body)
+	}
+	text := string(response.Body)
+	if strings.Contains(text, "secret-one") || strings.Contains(text, "secret-two") {
+		t.Fatalf("batch clear response leaked proxy credentials: %s", text)
+	}
+	for _, authID := range []string{"auth-1", "auth-2"} {
+		saved, errDecode := rawAuthToMap(host.saves[authID])
+		if errDecode != nil {
+			t.Fatal(errDecode)
+		}
+		if authRawString(saved, "proxy_url") != "" {
+			t.Fatalf("proxy_url for %s was not cleared", authID)
+		}
 	}
 }
 
