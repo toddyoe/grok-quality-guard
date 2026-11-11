@@ -15,7 +15,7 @@ Grok Quality Guard 观测 Grok / xAI auth 的真实响应质量，识别 HTTP 20
 - 账号状态机：`unknown`、`healthy`、`suspect`、`degraded`、`cooling`、`disabled_by_guard`、`externally_disabled`
 - 首次确认异常可配置为只观察或临时冷却，冷却到期通过固定 prompt 恢复探测
 - Resin 账号级租约绑定和显式轮换，不使用出口节点聚合状态
-- 内嵌管理页、策略编辑、账号操作和事件日志
+- 内嵌中文化管理页，按概览、账号质量、Resin 租约、事件日志和设置分 Tab
 - auth、proxy URL、Admin Token、xAI token 全程脱敏
 
 ## 质量判定要点
@@ -237,8 +237,9 @@ Action API：
 ```text
 POST /v0/management/plugins/grok-quality-guard/api
 Content-Type: application/json
-X-Grok-Quality-Guard-UI: 1
 ```
+
+API 只使用请求体中的 `action` 和 `params`，不依赖自定义 HTTP Header，管理认证由 CPA management 层完成。
 
 请求示例：
 
@@ -247,7 +248,6 @@ curl -X POST \
   "http://127.0.0.1:8317/v0/management/plugins/grok-quality-guard/api" \
   -H "Authorization: Bearer ${CLIPROXY_MANAGEMENT_KEY}" \
   -H "Content-Type: application/json" \
-  -H "X-Grok-Quality-Guard-UI: 1" \
   -d '{"action":"accounts.list","params":{"page":1,"page_size":50}}'
 ```
 
@@ -273,7 +273,7 @@ curl -X POST \
 | `policy.reset` | 重置为 YAML 初始值 |
 | `events.list` | 查看质量事件日志 |
 
-API 只接受 POST。除 CPA management 认证外，还必须带 `X-Grok-Quality-Guard-UI: 1`。响应中的 email、proxy URL、token 和密码均会脱敏；账号列表同时提供 `auth_id_display` 供展示，操作 API 使用稳定的 `auth_id` 作为标识。
+API 只接受 POST，并由 CPA management 层完成认证。插件不要求自定义 Header 或请求体 UI 标记，避免管理网关剥离 Header 时页面请求失败。响应中的 email、proxy URL、token 和密码均会脱敏；账号列表同时提供 `auth_id_display` 供展示，操作 API 使用稳定的 `auth_id` 作为标识。
 
 ## 状态文件
 

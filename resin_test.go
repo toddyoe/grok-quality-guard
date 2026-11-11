@@ -143,6 +143,21 @@ func TestRotateResinDeletesLeaseAndWritesNewAccount(t *testing.T) {
 	if authRawString(saved, "access_token") != "access-auth-1" || authRawString(saved, "refresh_token") != "refresh-auth-1" {
 		t.Fatal("token fields were not preserved during rotation")
 	}
+	state := plugin.store.Snapshot()
+	rotationIndex := -1
+	for i := range state.Events {
+		if state.Events[i].Action == "resin_rotate" {
+			rotationIndex = i
+			break
+		}
+	}
+	if rotationIndex < 0 {
+		t.Fatal("resin rotation event was not recorded")
+	}
+	wantDetail := "旧租约：grok-alice-old1 → 新租约：" + meta.ResinAccount
+	if state.Events[rotationIndex].Detail != wantDetail {
+		t.Fatalf("rotation event detail = %q, want %q", state.Events[rotationIndex].Detail, wantDetail)
+	}
 }
 
 func TestDeleteResinLeaseStatusHandling(t *testing.T) {

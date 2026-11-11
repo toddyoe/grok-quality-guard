@@ -60,11 +60,11 @@ func actionManagementForTest(t *testing.T, plugin *Plugin, action string, params
 	if errMarshal != nil {
 		t.Fatal(errMarshal)
 	}
-	headers := http.Header{"X-Grok-Quality-Guard-UI": []string{"1"}, "Content-Type": []string{"application/json"}}
+	headers := http.Header{"Content-Type": []string{"application/json"}}
 	return callManagementForTest(t, plugin, http.MethodPost, "/plugins/grok-quality-guard/api", headers, body)
 }
 
-func TestManagementResourceAndHeaderChecks(t *testing.T) {
+func TestManagementResourceAndActionAccess(t *testing.T) {
 	entries, auths := singleGrokAuth(t, "auth-1", "alice@example.com", nil)
 	host := newMockHostCall(entries, auths)
 	plugin := newTestPlugin(t, host, nil)
@@ -72,13 +72,18 @@ func TestManagementResourceAndHeaderChecks(t *testing.T) {
 	if response.StatusCode != http.StatusOK || !strings.Contains(string(response.Body), "/plugins/grok-quality-guard/api") {
 		t.Fatalf("unexpected dashboard response: status=%d body=%s", response.StatusCode, response.Body)
 	}
-	if !strings.Contains(string(response.Body), "resin.config.get") || !strings.Contains(string(response.Body), `type="password"`) {
-		t.Fatalf("dashboard does not contain validated Resin configuration controls: %s", response.Body)
+	if strings.Contains(string(response.Body), "X-Grok-Quality-Guard-UI") {
+		t.Fatal("dashboard still depends on the custom UI header")
+	}
+	for _, expected := range []string{"概览", "账号质量", "Resin 租约", "事件日志", "设置", "24 小时统计", "resin.config.get", `type="password"`} {
+		if !strings.Contains(string(response.Body), expected) {
+			t.Fatalf("dashboard is missing %q", expected)
+		}
 	}
 	body, _ := json.Marshal(actionRequest{Action: "overview"})
 	response = callManagementForTest(t, plugin, http.MethodPost, "/plugins/grok-quality-guard/api", nil, body)
-	if response.StatusCode != http.StatusForbidden {
-		t.Fatalf("missing UI header status = %d, want 403", response.StatusCode)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("action without UI marker status = %d body=%s", response.StatusCode, response.Body)
 	}
 }
 
@@ -200,5 +205,19 @@ func TestManagementUnknownActionReturnsBadRequest(t *testing.T) {
 	response := actionManagementForTest(t, plugin, "does.not.exist", nil)
 	if response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("unknown action status = %d body=%s", response.StatusCode, response.Body)
+	}
+}
+
+func TestManagementActionDoesNotRequireUIHeader(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "alice@example.com", nil)
+	host := newMockHostCall(entries, auths)
+	plugin := newTestPlugin(t, host, nil)
+	body, errMarshal := json.Marshal(actionRequest{Action: "overview"})
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	response := callManagementForTest(t, plugin, http.MethodPost, "/plugins/grok-quality-guard/api", http.Header{"Content-Type": []string{"application/json"}}, body)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("unmarked request status = %d body=%s", response.StatusCode, response.Body)
 	}
 }

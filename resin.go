@@ -145,6 +145,7 @@ func (p *Plugin) RotateResin(ctx context.Context, authID string) error {
 	if !meta.Managed || strings.TrimSpace(meta.ResinAccount) == "" {
 		return fmt.Errorf("auth is not managed by resin")
 	}
+	previousAccount := meta.ResinAccount
 	operationCfg, errResolvePlatform := resolveResinPlatformForOperation(ctx, cfg)
 	if errResolvePlatform != nil {
 		return errResolvePlatform
@@ -185,7 +186,7 @@ func (p *Plugin) RotateResin(ctx context.Context, authID string) error {
 		return errUpdate
 	}
 	_ = p.stateStore().Update(func(state *State) error {
-		p.recordEvent(state, authID, "", "resin_rotate", "rotated", "account="+newAccount)
+		p.recordEvent(state, authID, "", "resin_rotate", "rotated", fmt.Sprintf("旧租约：%s → 新租约：%s", previousAccount, newAccount))
 		return nil
 	})
 	return nil

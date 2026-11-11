@@ -1138,23 +1138,25 @@ Action API 注册路径：
 
 ### 10.2 管理页
 
-页面功能：
+页面采用与 CPA Management Center 一致的中性色视觉体系，自动跟随宿主页面的明暗主题，所有界面文字使用中文，并按任务频率拆分 Tab：
 
-- 概览卡片：总 Grok auth 数、healthy/suspect/degraded/cooling/disabled_by_guard、Resin 已绑定/未绑定/冲突、最近 24h 质量异常数
-- 账号表格：脱敏 email 或 label、auth ID、状态、最近分类、Resin account 和 generation、proxy 状态、TPS、TTFT、output tokens、reasoning tokens、encrypted bytes、冷却到期时间、最近探测时间
-- 操作：手动探测、绑定 Resin、轮换 Resin、冷却、禁用、恢复、重置探测退避
-- Resin 配置：Admin URL、platform、platform ID、Admin Token、Proxy Token、proxy template、启用开关、自动轮换开关；支持“仅验证”和“验证并保存”
-- 策略编辑：passive_guard、transparent_guard、auto_action、质量阈值、冷却时长、probe 调度、Resin 自动轮换
-- 事件日志：时间、auth ID、分类、动作、结果，不包含 prompt、响应正文、proxy URL、token
+- `概览`：守护状态、检测模式、账号总数、需关注账号、最近 24h 自动检测统计、质量分布、最近事件、当前策略摘要和 Resin 摘要
+- `账号质量`：搜索和状态筛选、脱敏账号信息、真实思考证据、TPS/TTFT/output/reasoning/encrypted 指标、Resin 绑定、冷却和探测退避；详情抽屉提供主动探测、冷却、恢复、禁用、绑定和轮换
+- `Resin 租约`：租约绑定/冲突统计、租约账号和代数、搜索与状态筛选、单账号绑定/轮换、批量绑定未绑定账号；连接凭据不在此页修改
+- `事件日志`：按关键词和事件类型筛选时间、auth ID、分类、动作、结果和脱敏详情
+- `设置`：低频配置集中在此 Tab，内部再分为 `守护策略` 与 `Resin 连接`；策略保存后热更新，Resin 连接必须先验证成功再保存
 
 页面技术要求：
 
-- 内嵌于 Go 动态库
-- 不依赖外部 CDN
-- 支持窄屏
+- 内嵌于 Go 动态库，不依赖外部 CDN
+- 使用与 CPA Dashboard 一致的紧凑布局、中性色背景、细边框和黑色主按钮；从同源父页面读取主题状态，支持明暗主题
+- 支持桌面、窄屏和移动端，表格允许横向滚动；账号详情使用抽屉，避免在主表格堆叠大量操作
 - 所有动态文本做 HTML escape
-- 所有 fetch 使用同源 management API
-- 不显示 secret 原值
+- 所有 fetch 使用同源 management API；API 只使用 `action` 和 `params`，不依赖请求体 UI 标记或自定义 Header
+- 不显示 Secret 原值
+- Tab 使用可键盘访问的按钮和 `aria-selected` 状态，并支持左右方向键切换
+- 图标使用内嵌 SVG，不使用 emoji
+- 遵守 `prefers-reduced-motion`
 
 ### 10.3 JSON API 协议
 
@@ -1163,7 +1165,6 @@ Action API 注册路径：
 ```http
 POST /v0/management/plugins/grok-quality-guard/api
 Content-Type: application/json
-X-Grok-Quality-Guard-UI: 1
 ```
 
 请求体：
@@ -1174,6 +1175,8 @@ X-Grok-Quality-Guard-UI: 1
   "params": {}
 }
 ```
+
+插件 API 不要求请求体 UI 标记，也不要求 `X-Grok-Quality-Guard-UI` 等自定义 Header。管理 API 的安全性由 CPA management 认证层负责，避免网关剥离自定义 Header 时管理页无法加载。
 
 成功响应：
 
@@ -1196,7 +1199,7 @@ X-Grok-Quality-Guard-UI: 1
 }
 ```
 
-状态码：200 成功、400 参数错误或 Resin 验证失败、403 缺少 UI header 或动作不允许、404 auth/事件不存在、409 状态冲突、429 操作过于频繁、500 插件内部错误、502 Resin Admin API/代理不可达、503 CPA host 回调或上游不可用。
+状态码：200 成功、400 参数错误或 Resin 验证失败、403 动作不允许、404 auth/事件不存在、409 状态冲突、429 操作过于频繁、500 插件内部错误、502 Resin Admin API/代理不可达、503 CPA host 回调或上游不可用。
 
 ### 10.4 Action 列表
 
@@ -1222,10 +1225,10 @@ X-Grok-Quality-Guard-UI: 1
 
 ### 10.5 管理页与 host 认证
 
-管理 API 由 CPA management 层认证。插件额外要求：
+管理 API 由 CPA management 层认证。插件额外约束：
 
 - 仅接受 POST
-- 必须带 `X-Grok-Quality-Guard-UI: 1`
+- 不要求自定义 Header 或请求体 UI 标记
 - 不信任客户端传入的 auth ID 之外的代理或 token 字段
 - 不返回任何 secret 原值
 - 对 destructive action 返回明确结果

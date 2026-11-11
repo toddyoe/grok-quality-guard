@@ -105,7 +105,7 @@ func (p *Plugin) ManagementRegistration() managementRegistrationResponse {
 		Resources: []pluginapi.ResourceRoute{{
 			Path:        "/dashboard",
 			Menu:        pluginName,
-			Description: "Grok account quality, Resin leases, probes, and policy controls.",
+			Description: "管理 Grok 账号质量、Resin 租约、主动探测与守护策略。",
 		}},
 	}
 }

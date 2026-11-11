@@ -70,15 +70,13 @@ func (p *Plugin) HandleManagement(request []byte) ([]byte, error) {
 	if !strings.EqualFold(req.Method, http.MethodPost) {
 		return okEnvelope(managementResponse{StatusCode: http.StatusMethodNotAllowed, Headers: jsonHeaders(), Body: jsonError("method_not_allowed", "only POST is accepted")})
 	}
-	if !headerHas(req.Headers, "X-Grok-Quality-Guard-UI", "1") {
-		return okEnvelope(managementResponse{StatusCode: http.StatusForbidden, Headers: jsonHeaders(), Body: jsonError("ui_header_required", "missing X-Grok-Quality-Guard-UI header")})
-	}
 	var action actionRequest
 	if len(req.Body) > 0 {
 		if errUnmarshal := json.Unmarshal(req.Body, &action); errUnmarshal != nil {
 			return okEnvelope(managementResponse{StatusCode: http.StatusBadRequest, Headers: jsonHeaders(), Body: jsonError("invalid_json", "action body must be valid JSON")})
 		}
 	}
+
 	if action.Params == nil {
 		action.Params = map[string]any{}
 	}
@@ -170,9 +168,12 @@ func (p *Plugin) actionOverview(ctx context.Context) (any, int, error) {
 		}
 	}
 	p.mu.RLock()
+	enabled := p.cfg.Enabled
 	policy := p.policy
 	p.mu.RUnlock()
 	return map[string]any{
+		"enabled":              enabled,
+		"updated_at":           state.UpdatedAt,
 		"auth_count":           len(p.catalogSnapshot()),
 		"states":               counts,
 		"resin":                map[string]int{"bound": resinBound, "unbound": resinUnbound, "conflict": resinConflicts},
