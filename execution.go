@@ -261,6 +261,7 @@ func (p *Plugin) transparentExecuteBufferedStream(ctx context.Context, req rpcEx
 
 func (p *Plugin) executeTransparentOnce(ctx context.Context, execution pluginapi.HostModelExecutionRequest, callbackID string, requestBody []byte, cfg QualityConfig) (transparentResult, string, error) {
 	execution.Stream = false
+	startedAt := time.Now()
 	response, errExecute := p.executeModel(ctx, execution, callbackID)
 	if errExecute != nil {
 		return transparentResult{}, classifyTransportError(errExecute), errExecute
@@ -268,11 +269,15 @@ func (p *Plugin) executeTransparentOnce(ctx context.Context, execution pluginapi
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return transparentResult{}, ClassProbeError, fmt.Errorf("upstream status %d", response.StatusCode)
 	}
-	analyzer := NewStreamAnalyzer()
+	analyzer := NewStreamAnalyzerWithProtocol(execution.ExitProtocol)
 	analyzer.SetStreaming(false)
+	analyzer.SetEncryptedConfig(cfg.MinEncryptedBytes, cfg.EncryptedBytesPerReasoningToken)
 	analyzer.ObserveJSON(response.Body)
 	sig := analyzer.Finalize(true)
-	verdict := classifyFinal(sig, cfg, reasoningRequired(requestBody), cfg.MinPassiveOutputTokens, false)
+	sig.DurationMS = time.Since(startedAt).Milliseconds()
+	sig.GenerationMS = generationWindowMS(sig.DurationMS, sig.FirstTokenMS, sig.ReasoningTokens)
+	sig.TPS = tps(sig.OutputTokens, sig.GenerationMS)
+	verdict := classifyNonStreamResult(sig, cfg, reasoningRequired(requestBody), cfg.MinPassiveOutputTokens)
 	result := transparentResult{Payload: response.Body, Headers: response.Headers, Available: true}
 	if verdict.Class == ClassNone {
 		_ = p.ApplyVerdict(ctx, execution.AuthID, verdict, "transparent", callbackID)
@@ -440,7 +445,8 @@ func (p *Plugin) executeTransparentStreamAttempt(ctx context.Context, execution 
 	if stream.StatusCode < 200 || stream.StatusCode >= 300 {
 		return transparentStreamAttempt{Class: ClassProbeError, Err: fmt.Errorf("upstream status %d", stream.StatusCode)}
 	}
-	analyzer := NewStreamAnalyzer()
+	analyzer := NewStreamAnalyzerWithProtocol(execution.ExitProtocol)
+	analyzer.SetEncryptedConfig(cfg.MinEncryptedBytes, cfg.EncryptedBytesPerReasoningToken)
 	readEvents := make(chan streamReadEvent, 1)
 	go func() {
 		defer close(readEvents)
@@ -480,22 +486,39 @@ func (p *Plugin) executeTransparentStreamAttempt(ctx context.Context, execution 
 			return transparentStreamAttempt{Class: ClassProbeError, Err: ctx.Err(), Emitted: emitted}
 		case <-timerC:
 			holdExpired = true
-			if !emitted && len(buffer) > 0 {
+			preview := analyzer.Preview()
+			preview.HoldExpired = true
+			verdict := ClassifyQualityHold(preview, cfg.MinHoldOutputTokens)
+			if verdict.Action == QualityActionWithhold {
+				_ = p.ApplyVerdict(ctx, execution.AuthID, verdict, "transparent", callbackID)
+				return transparentStreamAttempt{Class: verdict.Class, Err: fmt.Errorf("quality gate rejected stream: %s", verdict.Class), Buffered: buffer, Available: true}
+			}
+			if verdict.Action == QualityActionDeliver {
 				if errEmit := p.emitPluginChunks(streamID, buffer); errEmit != nil {
-					return transparentStreamAttempt{Class: ClassProbeError, Err: errEmit, Emitted: emitted}
+					return transparentStreamAttempt{Class: ClassProbeError, Err: errEmit, Available: true}
 				}
 				emitted = true
 				buffer = nil
 				bufferBytes = 0
-				_ = p.recordAttemptError(execution.AuthID, "", fmt.Errorf("stream hold timeout released buffered output"))
 			}
 		case event, ok := <-readEvents:
 			if !ok {
-				errTerminal := fmt.Errorf("upstream stream ended without terminal event")
+				sig := analyzer.Finalize(true)
+				sig.HoldExpired = holdExpired
+				verdict := classifyFinal(sig, cfg, reasoningNeeded, cfg.MinHoldOutputTokens, true)
 				if emitted {
-					return transparentStreamAttempt{Class: ClassProbeError, Err: errTerminal, Emitted: true}
+					_ = p.ApplyVerdict(ctx, execution.AuthID, verdict, "transparent", callbackID)
+					return transparentStreamAttempt{Class: verdict.Class, Emitted: true}
 				}
-				return transparentStreamAttempt{Class: ClassProbeError, Err: errTerminal, Buffered: buffer, Available: true}
+				if verdict.Class == ClassNone {
+					if errEmit := p.emitPluginChunks(streamID, buffer); errEmit != nil {
+						return transparentStreamAttempt{Class: ClassProbeError, Err: errEmit, Available: true}
+					}
+					_ = p.ApplyVerdict(ctx, execution.AuthID, verdict, "transparent", callbackID)
+					return transparentStreamAttempt{Emitted: true}
+				}
+				_ = p.ApplyVerdict(ctx, execution.AuthID, verdict, "transparent", callbackID)
+				return transparentStreamAttempt{Class: verdict.Class, Err: fmt.Errorf("quality gate rejected stream: %s", verdict.Class), Buffered: buffer, Available: true}
 			}
 			if event.Err != nil {
 				if emitted {
@@ -545,13 +568,12 @@ func (p *Plugin) executeTransparentStreamAttempt(ctx context.Context, execution 
 			}
 			preview := analyzer.Preview()
 			preview.HoldExpired = holdExpired
-			verdict := classifyFinal(preview, cfg, reasoningNeeded, cfg.MinHoldOutputTokens, true)
-			if isImmediateWithholdClass(verdict.Class) {
-				_ = p.ApplyVerdict(ctx, execution.AuthID, verdict, "transparent", callbackID)
-				return transparentStreamAttempt{Class: verdict.Class, Err: fmt.Errorf("quality gate rejected stream: %s", verdict.Class), Buffered: buffer, Available: true}
+			holdVerdict := ClassifyQualityHold(preview, cfg.MinHoldOutputTokens)
+			if holdVerdict.Action == QualityActionWithhold {
+				_ = p.ApplyVerdict(ctx, execution.AuthID, holdVerdict, "transparent", callbackID)
+				return transparentStreamAttempt{Class: holdVerdict.Class, Err: fmt.Errorf("quality gate rejected stream: %s", holdVerdict.Class), Buffered: buffer, Available: true}
 			}
-			if bufferBytes > cfg.HoldMaxBufferBytes {
-				_ = p.recordAttemptError(execution.AuthID, "", fmt.Errorf("hold buffer overflow"))
+			if holdVerdict.Action == QualityActionDeliver {
 				if errEmit := p.emitPluginChunks(streamID, buffer); errEmit != nil {
 					return transparentStreamAttempt{Class: ClassProbeError, Err: errEmit, Available: true}
 				}
@@ -560,7 +582,8 @@ func (p *Plugin) executeTransparentStreamAttempt(ctx context.Context, execution 
 				bufferBytes = 0
 				continue
 			}
-			if holdExpired || shouldReleaseBeforeTerminal(verdict.Signals, verdict, reasoningNeeded, cfg.MinHoldOutputTokens) {
+			if bufferBytes > cfg.HoldMaxBufferBytes {
+				_ = p.recordAttemptError(execution.AuthID, "", fmt.Errorf("hold buffer overflow"))
 				if errEmit := p.emitPluginChunks(streamID, buffer); errEmit != nil {
 					return transparentStreamAttempt{Class: ClassProbeError, Err: errEmit, Available: true}
 				}

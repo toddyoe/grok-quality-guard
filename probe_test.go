@@ -20,7 +20,12 @@ func TestProbeFailureAfterStrikePermanentlyDisablesWithoutDeadlock(t *testing.T)
 		},
 	})
 	host := newMockHostCall(entries, auths)
-	host.scriptStream("auth-1", badStreamScript()...)
+	visible := strings.Repeat("degraded probe answer. ", 8) + "\\nQUALITY_OK"
+	host.scriptStream("auth-1", []pluginapi.HostModelStreamReadResponse{
+		streamData("data: {\"choices\":[{\"delta\":{\"content\":\"" + visible + "\"}}]}\n\n"),
+		streamData("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":100,\"completion_tokens_details\":{\"reasoning_tokens\":0}}}\n\n"),
+		{Done: true},
+	}...)
 	plugin := newTestPlugin(t, host, func(cfg *Config) { cfg.AutoAction = "cooldown_then_disable" })
 	done := make(chan error, 1)
 	go func() {
@@ -58,7 +63,7 @@ func TestProbeSuccessReenablesCooldownAndClearsStrikes(t *testing.T) {
 		},
 	})
 	host := newMockHostCall(entries, auths)
-	visible := strings.Repeat("reliable systems need careful design. ", 10) + "QUALITY_OK"
+	visible := strings.Repeat("reliable systems need careful design. ", 10) + "\\nQUALITY_OK"
 	host.scriptStream("auth-1", []pluginapi.HostModelStreamReadResponse{
 		streamData("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"plan carefully\"}}]}\n\n"),
 		streamData("data: {\"choices\":[{\"delta\":{\"content\":\"" + visible + "\"}}]}\n\n"),

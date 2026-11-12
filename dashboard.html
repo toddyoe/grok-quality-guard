@@ -1880,6 +1880,8 @@
                           class="check-desc">连续缺少思考达到阈值后先异步主动探测，再决定是否处置</span></span></label>
                     <div class="field"><label for="p_min_generation_ms">最小生成窗口</label><input id="p_min_generation_ms"
                         type="number" min="1"><span class="hint">单位：毫秒</span></div>
+                    <label class="check-card"><input id="p_fail_closed" type="checkbox"><span
+                        class="check-copy"><span class="check-title">短生成窗口严格判定</span><span class="check-desc">开启后，生成窗口过短且 TPS 达到软阈值时直接判为短窗口突发</span></span></label>
                     <div class="field"><label for="p_min_passive_output">被动审计最小输出 Token</label><input
                         id="p_min_passive_output" type="number" min="1"></div>
                     <div class="field"><label for="p_min_encrypted_bytes">加密思考最小字节</label><input
@@ -2091,7 +2093,9 @@
       missing_thinking: '缺少真实思考', buffered_burst: '短窗口突发', cipher_drool: '密文倾倒',
       fake_encrypted_dump: '伪造加密思考', fast_reasoning_ratio_dump: '异常推理占比',
       soft_tps: '软 TPS 超限', hard_tps: '硬 TPS 超限', empty_stream: '空流',
-      probe_error: '探测错误', proxy_error: '代理错误', ignored: '非质量错误', manual: '手动操作'
+      insufficient_output_tokens: '输出不足', insufficient_generation_window: '生成窗口不足',
+      expected_marker_missing: '探测标记缺失', probe_error: '探测错误', proxy_error: '代理错误',
+      ignored: '非质量错误', manual: '手动操作'
     };
     const ACTION_LABELS = {
       observe: '被动观测', probe: '主动探测', guard_disable: '自动处置', external_disable: '外部禁用',
@@ -2111,6 +2115,18 @@
     const stateLabel = (value) => STATE_LABELS[value] || value || '待检测';
     const stateTone = (value) => STATE_TONES[value] || '';
     const reasonLabel = (value) => REASON_LABELS[value] || value || '暂无判定';
+    const SOURCE_LABELS = { passive: '被动观测', probe: '主动探测', transparent: '透明保护', response: '响应观测', stream: '流式观测' };
+    const QUALITY_ACTION_LABELS = { wait: '等待更多证据', deliver: '放行', withhold: '扣留' };
+    const PROTOCOL_LABELS = { chat: 'Chat Completions', responses: 'Responses', anthropic: 'Anthropic Messages' };
+    const sourceLabel = (value) => SOURCE_LABELS[value] || value || '系统';
+    const attemptLabel = (attempt) => {
+      if (!attempt) return '暂无尝试';
+      const prefix = attempt.source ? sourceLabel(attempt.source) + ' · ' : '';
+      const verdict = attempt.class ? reasonLabel(attempt.class) : '通过';
+      const detail = attempt.reason && attempt.reason !== attempt.class ? ' · ' + attempt.reason : '';
+      const at = attempt.at ? ' · ' + formatFullTime(attempt.at) : '';
+      return prefix + verdict + detail + at;
+    };
     const actionLabel = (value) => ACTION_LABELS[value] || value || '系统记录';
     const resultLabel = (value) => RESULT_LABELS[value] || value || '-';
     const badge = (text, tone) => '<span class="badge ' + esc(tone || '') + '">' + esc(text) + '</span>';
@@ -2139,6 +2155,37 @@
       if (bytes < 1024) return num(bytes) + ' B';
       if (bytes < 1024 * 1024) return num(bytes / 1024, 1) + ' KiB';
       return num(bytes / 1024 / 1024, 1) + ' MiB';
+    };
+    const yesNo = (value) => value ? '是' : '否';
+    const evidenceCell = (label, value) => '<div class="detail-cell"><div class="detail-label">' + esc(label) + '</div><div class="detail-value">' + esc(value) + '</div></div>';
+    const evidenceSection = (evidence) => {
+      if (!evidence) return '';
+      const classText = evidence.class ? reasonLabel(evidence.class) : '通过';
+      const actionText = QUALITY_ACTION_LABELS[evidence.action] || evidence.action || '未记录';
+      const protocolText = PROTOCOL_LABELS[evidence.protocol] || evidence.protocol || '自动识别';
+      const flags = [
+        '真实思考 ' + yesNo(evidence.has_thinking),
+        '明文推理 ' + yesNo(evidence.has_reasoning_delta),
+        '推理开始 ' + yesNo(evidence.reasoning_started),
+        '语义输出 ' + yesNo(evidence.semantic_output),
+        '用量上报 ' + yesNo(evidence.usage_reported)
+      ].join(' · ');
+      return [
+        '<div class="drawer-section"><h3>质量判定依据</h3><div class="detail-grid">',
+        evidenceCell('判定来源', sourceLabel(evidence.source) + ' · ' + formatFullTime(evidence.at)),
+        evidenceCell('判定结果', classText + ' · ' + actionText),
+        evidenceCell('判定说明', evidence.reason || '-'),
+        evidenceCell('协议 / 模式', protocolText + ' · ' + (evidence.streaming ? '流式' : '非流式')),
+        evidenceCell('终止 / Hold', '终止 ' + yesNo(evidence.terminal) + ' · 超时 ' + yesNo(evidence.hold_expired)),
+        evidenceCell('可见 / 输出 / 推理', num(evidence.visible_tokens) + ' / ' + num(evidence.output_tokens) + ' / ' + num(evidence.reasoning_tokens)),
+        evidenceCell('密文 / 下限', formatBytes(evidence.encrypted_bytes) + ' / ' + formatBytes(evidence.encrypted_floor)),
+        evidenceCell('TTFT / 总时长', num(evidence.first_token_ms) + ' / ' + num(evidence.duration_ms) + ' 毫秒'),
+        evidenceCell('生成窗口 / 可见 Flush', num(evidence.generation_ms) + ' / ' + num(evidence.visible_flush_ms) + ' 毫秒'),
+        evidenceCell('输出速度', num(evidence.tps, 1) + ' TPS'),
+        evidenceCell('思考证据状态', flags),
+        evidenceCell('解析统计', '块 ' + num(evidence.chunk_count) + ' · 字节 ' + formatBytes(evidence.byte_count) + ' · 事件 ' + num(evidence.event_count) + ' · 未知 ' + num(evidence.unknown_events) + ' · 解析失败 ' + num(evidence.parse_failures)),
+        '</div><p class="hint" style="margin-top:9px">仅展示脱敏后的判定统计，不包含 prompt、响应正文或任何凭据</p></div>'
+      ].join('');
     };
     function toast(message, type) {
       const el = document.getElementById('toast');
@@ -2437,7 +2484,8 @@
       if (account.error_strikes) strikes.push('错 ' + account.error_strikes);
       if (account.thinking_strikes) strikes.push('思 ' + account.thinking_strikes);
       const strikeBadge = strikes.length ? badge('连续 ' + strikes.join(' / '), 'warn') : '';
-      return '<tr><td><div class="account-name" title="' + esc(account.display_full || account.display || account.label || '未命名账号') + '">' + esc(account.display || account.label || '未命名账号') + '</div><div class="subline" title="' + esc(account.auth_id) + '">' + esc(account.auth_id_display || account.auth_id) + '</div></td><td><div>' + badge(stateLabel(account.state), stateTone(account.state)) + ' ' + strike + ' ' + strikeBadge + '</div><div class="subtle-line">' + esc(account.state === 'externally_disabled' ? '外部禁用' : '') + '</div></td><td><div>' + esc(reasonLabel(account.last_reason)) + '</div><div class="subline">' + esc(formatTime(account.last_observed_at)) + '</div></td><td><div class="metric-inline"><strong>' + esc(num(account.tps, 1)) + '</strong><span class="muted">TPS</span></div><div class="subline">输出 ' + esc(num(account.output_tokens)) + ' · 推理 ' + esc(num(account.reasoning_tokens)) + ' · 密文 ' + esc(formatBytes(account.encrypted_bytes)) + '</div></td><td>' + resin + resinDetail + '</td><td><div>' + cooldown + '</div><div class="subline">' + probe + '</div></td><td><div class="actions"><button class="btn btn-xs" type="button" data-account-action="accounts.probe" data-auth="' + authID + '">' + icon('play') + '检测</button><button class="btn btn-xs" type="button" data-open-account="' + authID + '">' + icon('eye') + '详情</button></div></td></tr>';
+      const attemptDetail = account.last_attempt ? '最近尝试 ' + attemptLabel(account.last_attempt) : '最近观测 ' + formatTime(account.last_observed_at);
+      return '<tr><td><div class="account-name" title="' + esc(account.display_full || account.display || account.label || '未命名账号') + '">' + esc(account.display || account.label || '未命名账号') + '</div><div class="subline" title="' + esc(account.auth_id) + '">' + esc(account.auth_id_display || account.auth_id) + '</div></td><td><div>' + badge(stateLabel(account.state), stateTone(account.state)) + ' ' + strike + ' ' + strikeBadge + '</div><div class="subtle-line">' + esc(account.state === 'externally_disabled' ? '外部禁用' : '') + '</div></td><td><div>' + esc(reasonLabel(account.last_reason)) + '</div><div class="subline">' + esc(attemptDetail) + '</div></td><td><div class="metric-inline"><strong>' + esc(num(account.tps, 1)) + '</strong><span class="muted">TPS</span></div><div class="subline">输出 ' + esc(num(account.output_tokens)) + ' · 推理 ' + esc(num(account.reasoning_tokens)) + ' · 密文 ' + esc(formatBytes(account.encrypted_bytes)) + '</div></td><td>' + resin + resinDetail + '</td><td><div>' + cooldown + '</div><div class="subline">' + probe + '</div></td><td><div class="actions"><button class="btn btn-xs" type="button" data-account-action="accounts.probe" data-auth="' + authID + '">' + icon('play') + '检测</button><button class="btn btn-xs" type="button" data-open-account="' + authID + '">' + icon('eye') + '详情</button></div></td></tr>';
     }
     function leaseStatus(account) {
       if (account.resin_managed || account.proxy_status === 'bound') return 'bound';
@@ -2600,6 +2648,7 @@
       setChecked('p_soft_cross_verify', quality.soft_cross_verify === true);
       setChecked('p_thinking_cross_verify', quality.thinking_cross_verify === true);
       setValue('p_min_generation_ms', quality.min_generation_ms || 1000);
+      setChecked('p_fail_closed', quality.fail_closed === true);
       setValue('p_min_passive_output', quality.min_passive_output_tokens || 32);
       setValue('p_min_hold_output', quality.min_hold_output_tokens || 8);
       setValue('p_hold_timeout', quality.hold_timeout || '30s');
@@ -2637,6 +2686,7 @@
       policy.quality.soft_cross_verify = document.getElementById('p_soft_cross_verify').checked;
       policy.quality.thinking_cross_verify = document.getElementById('p_thinking_cross_verify').checked;
       policy.quality.min_generation_ms = numberValue('p_min_generation_ms', 1000);
+      policy.quality.fail_closed = document.getElementById('p_fail_closed').checked;
       policy.quality.min_passive_output_tokens = numberValue('p_min_passive_output', 32);
       policy.quality.min_hold_output_tokens = numberValue('p_min_hold_output', 8);
       policy.quality.hold_timeout = valueOf('p_hold_timeout');
@@ -2795,15 +2845,18 @@
         '<button class="btn btn-danger" type="button" data-account-action="accounts.disable" data-auth="' + esc(account.auth_id) + '">' + icon('power') + '永久禁用</button>'
       ];
       const resin = state.resin || {};
+      const evidence = account.evidence;
+      const ignoredAttempt = account.last_attempt && account.last_attempt.class === 'ignored' ? badge('最近尝试未计入质量', 'warn') : '';
       const canBind = Boolean(resin.configured && resin.enabled && !resin.local_only);
       if (account.resin_managed) actionButtons.push('<button class="btn" type="button" data-resin-action="resin.rotate" data-auth="' + esc(account.auth_id) + '">' + icon('rotate') + (resin.local_only && resin.enabled ? '本地轮换' : '轮换租约') + '</button>');
       else if (account.proxy_status !== 'conflict' && canBind) actionButtons.push('<button class="btn" type="button" data-resin-action="resin.bind" data-auth="' + esc(account.auth_id) + '">' + icon('link') + '绑定 Resin</button>');
       else if (resin.local_only && resin.enabled && account.proxy) actionButtons.push('<button class="btn" type="button" data-resin-action="resin.rotate" data-auth="' + esc(account.auth_id) + '">' + icon('rotate') + '本地轮换</button>');
       if (account.proxy) actionButtons.push('<button class="btn btn-danger" type="button" data-resin-action="resin.clear" data-auth="' + esc(account.auth_id) + '">' + icon('x') + '清除代理</button>');
       document.getElementById('drawerBody').innerHTML = [
-        '<div style="display:flex;gap:6px;flex-wrap:wrap">' + badge(stateLabel(account.state), stateTone(account.state)) + resinStatus + (account.strike_missing_thinking ? badge('思考命中', 'warn') : '') + '</div>',
+                '<div style="display:flex;gap:6px;flex-wrap:wrap">' + badge(stateLabel(account.state), stateTone(account.state)) + resinStatus + (account.strike_missing_thinking ? badge('思考命中', 'warn') : '') + ignoredAttempt + '</div>',
         '<div class="drawer-section"><div class="detail-grid">',
-        '<div class="detail-cell"><div class="detail-label">最近判定</div><div class="detail-value">' + esc(reasonLabel(account.last_reason)) + '</div></div>',
+        '<div class="detail-cell"><div class="detail-label">最近尝试</div><div class="detail-value">' + esc(attemptLabel(account.last_attempt)) + '</div></div>',
+        '<div class="detail-cell"><div class="detail-label">最近质量判定</div><div class="detail-value">' + esc(reasonLabel(account.last_reason)) + '</div></div>',
         '<div class="detail-cell"><div class="detail-label">输出速度</div><div class="detail-value">' + esc(num(account.tps, 1)) + ' TPS</div></div>',
         '<div class="detail-cell"><div class="detail-label">首 Token</div><div class="detail-value">' + esc(num(account.ttft_ms)) + ' 毫秒</div></div>',
         '<div class="detail-cell"><div class="detail-label">输出 / 推理</div><div class="detail-value">' + esc(num(account.output_tokens)) + ' / ' + esc(num(account.reasoning_tokens)) + '</div></div>',
@@ -2811,6 +2864,7 @@
         '<div class="detail-cell"><div class="detail-label">加密思考</div><div class="detail-value">' + esc(formatBytes(account.encrypted_bytes)) + '</div></div>',
         '<div class="detail-cell"><div class="detail-label">连续计数</div><div class="detail-value">软 ' + esc(num(account.soft_strikes || 0)) + ' / 错 ' + esc(num(account.error_strikes || 0)) + ' / 思 ' + esc(num(account.thinking_strikes || 0)) + '</div></div>',
         '</div></div>',
+        evidenceSection(evidence),
         '<div class="drawer-section"><h3>账号信息</h3><div class="detail-grid">',
         '<div class="detail-cell"><div class="detail-label">认证 ID</div><div class="detail-value mono">' + esc(account.auth_id_display || account.auth_id) + '</div></div>',
         '<div class="detail-cell"><div class="detail-label">轮换代数</div><div class="detail-value">第 ' + esc(account.resin_generation || 0) + ' 代</div></div>',

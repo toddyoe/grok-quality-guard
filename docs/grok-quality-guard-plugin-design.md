@@ -122,6 +122,7 @@ TPS = outputTokens * 1000 / generationWindow
 | `empty_stream_cooldown` | 15m | 空流/空闲流冷却 |
 | `min_encrypted_bytes` | 256 | encrypted thinking 字节下限 |
 | `encrypted_bytes_per_reasoning_token` | 4 | 每 reasoning token 的密文下限 |
+| `fail_closed` | false | 短生成窗口和高 TPS 是否直接判为 burst，以及窗口不足是否单独分类 |
 
 ### 2.4 异常分类
 
@@ -510,6 +511,40 @@ type QualityVerdict struct {
 ```
 
 `Class` 为空表示未发现异常，不等于完成主动健康探测。
+
+### 4.9 与参考实现对齐的判定路径
+
+本插件的流式分析器按 grok2api 的 `ClassifyQualityHold`、`quality_retry_scan.go` 和 egress-quality-guard 的 `classify_result` / `classify_audit` 对齐，不做额外的“启发式猜测”：
+
+1. 先解析协议内容，再按 `buffered_burst`、`cipher_drool`、`fake_encrypted_dump`、`fast_reasoning_ratio_dump` 的顺序执行 dump 判定。
+2. dump 判定必须先于 thinking 放行，避免伪造 reasoning 账单绕过。
+3. 明文 reasoning delta 是思考证据；仅有 `usage.reasoning_tokens`、空 reasoning item、timing stub 或未达下限的密文都不是。
+4. `hold_expired` 后的短 visible 文本只有在 `reasoning_tokens >= 80` 时按 burst 处理；密文达到下限本身不满足该分支。
+5. `: grok2api-reasoning-evidence <bytes>` 只提供密文字节长度，仍需经过 `max(min_encrypted_bytes, reasoning_tokens * encrypted_bytes_per_reasoning_token)` 下限校验。
+6. 聚合 message 文本会计入 visible token，但不会伪造流式首个可见块的 flush 时间。
+7. Chat、Responses、Anthropic Messages 的流式与非流式响应共享内容、thinking、密文下限、TPS 和空流规则。
+
+判定路径存在明确差异：
+
+| 路径 | 判定范围 | 不会推断的内容 |
+| --- | --- | --- |
+| 被动审计 | 仅 streaming、已有 TTFT、输出 >= 32、生成窗口有效的样本 | 不推断 missing-thinking |
+| 主动探测 | marker、输出下限、thinking 要求、生成窗口、TPS | 不把传输错误或上游非 2xx 当成质量降智 |
+| 非流式质量门 | 空响应、缺少真实思考、密文下限、可用的 TPS | 不做流式 burst/dump 推断 |
+
+`ignored` 表示本次样本不是质量信号。它只更新最近尝试，不增加质量 strike，也不覆盖上一次真实质量指标。`probe_error` / `proxy_error` 会更新最近尝试和探测退避，但同样保留上一次质量证据。
+
+### 4.10 账号详情证据
+
+账号详情抽屉只展示脱敏后的判定统计，不展示 prompt、响应正文、access token、refresh token 或代理凭据。证据包括：
+
+- 判定来源、结果、说明、协议、流式/非流式、终止和 hold 超时状态
+- visible/output/reasoning token、密文字节与密文下限
+- TTFT、总时长、生成窗口、visible flush 和 TPS
+- has thinking、明文 reasoning delta、reasoning started、semantic output、usage reported
+- chunk、byte、event、unknown event 和 parse failure 计数
+
+“最近尝试”与“最近质量判定”分开保存。这样即使最近一次是 `ignored` 或探测错误，也能看到上一次真实质量结论及其指标，而不是把所有指标误显示为 0。
 
 ## 5. 状态机与惩罚策略
 
@@ -1212,7 +1247,7 @@ Action API 注册路径：
 页面采用与 CPA Management Center 一致的中性色视觉体系，自动跟随宿主页面的明暗主题，所有界面文字使用中文，并按任务频率拆分 Tab：
 
 - `概览`：守护状态、检测模式、账号总数、需关注账号、最近 24h 自动检测统计、质量分布、最近事件、当前策略摘要和 Resin 摘要
-- `账号质量`：搜索、状态筛选和分页、脱敏账号信息、真实思考证据、TPS/TTFT/output/reasoning/encrypted 指标、Resin 绑定、冷却和探测退避；详情抽屉提供主动探测、冷却、恢复、禁用、绑定和轮换
+- `账号质量`：搜索、状态筛选和分页、脱敏账号信息、最近尝试、真实思考证据、TPS/TTFT/output/reasoning/encrypted 指标、Resin 绑定、冷却和探测退避；详情抽屉提供脱敏判定依据，以及主动探测、冷却、恢复、禁用、绑定和轮换
 - `Resin 租约`：每个 Grok 账号、脱敏代理、代理账号和轮换代数、搜索、状态筛选和分页、单账号绑定/轮换/清除，绑定仅 API 模式可用；表头复选框全选当前页，工具栏可全选当前筛选或全部账号，再批量绑定或清除代理；连接凭据不在此页修改
 - `事件日志`：按关键词和事件类型筛选并分页展示时间、auth ID、分类、动作、结果和脱敏详情
 - `设置`：低频配置集中在此 Tab，内部再分为 `守护策略` 与 `Resin 连接`；策略保存后热更新，API 模式的 Resin 连接必须先验证成功再保存，仅本地轮换无需 API 验证
@@ -1338,6 +1373,7 @@ plugins:
         soft_cross_verify: false
         thinking_cross_verify: false
         min_generation_ms: 1000
+        fail_closed: false
         min_passive_output_tokens: 32
         min_hold_output_tokens: 8
         hold_timeout: "30s"

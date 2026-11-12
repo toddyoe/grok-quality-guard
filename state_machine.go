@@ -81,17 +81,23 @@ func (p *Plugin) applyVerdictLocked(
 			}
 		}
 		account.LastObservedAt = now
-		account.Metrics = Metrics{
-			FirstTokenMS:    sig.FirstTokenMS,
-			DurationMS:      sig.DurationMS,
-			GenerationMS:    sig.GenerationMS,
-			OutputTokens:    sig.OutputTokens,
-			ReasoningTokens: sig.ReasoningTokens,
-			VisibleTokens:   sig.VisibleTokens,
-			EncryptedBytes:  sig.EncryptedBytes,
-			TPS:             sig.TPS,
+		account.LastAttempt = &AttemptEvidence{
+			At: now, Source: source, Class: verdict.Class, Reason: verdict.Reason,
 		}
-		account.LastReason = verdict.Class
+		if verdict.Class != ClassIgnored && !isProbeErrorClass(verdict.Class) {
+			account.Metrics = Metrics{
+				FirstTokenMS:    sig.FirstTokenMS,
+				DurationMS:      sig.DurationMS,
+				GenerationMS:    sig.GenerationMS,
+				OutputTokens:    sig.OutputTokens,
+				ReasoningTokens: sig.ReasoningTokens,
+				VisibleTokens:   sig.VisibleTokens,
+				EncryptedBytes:  sig.EncryptedBytes,
+				TPS:             sig.TPS,
+			}
+			account.LastReason = verdict.Class
+			account.LastEvidence = qualityEvidenceFromVerdict(verdict, source, now)
+		}
 		if source == "probe" {
 			account.LastProbeAt = now
 			if isProbeErrorClass(verdict.Class) || verdict.Class == ClassIgnored {
@@ -110,6 +116,9 @@ func (p *Plugin) applyVerdictLocked(
 		eventAction := "observe"
 		eventResult := "recorded"
 		eventDetail := source
+		if verdict.Reason != "" {
+			eventDetail += " · " + verdict.Reason
+		}
 		eventClass := verdict.Class
 
 		switch verdict.Class {
@@ -123,7 +132,7 @@ func (p *Plugin) applyVerdictLocked(
 			}
 			return nil
 
-		case ClassSoftTPS:
+		case ClassSoftTPS, ClassInsufficientOutput, ClassInsufficientGeneration:
 			account.ThinkingStrikes = 0
 			account.SoftStrikes++
 			threshold := positiveInt(policy.Quality.ConsecutiveSoft, 2)

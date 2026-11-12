@@ -57,7 +57,7 @@ func isGrokModel(model string, prefixes []string) bool {
 
 func isConfirmedClass(class string) bool {
 	switch class {
-	case ClassMissingThinking, ClassBufferedBurst, ClassCipherDrool, ClassFakeEncryptedDump, ClassFastReasoningRatio, ClassHardTPS, ClassEmptyStream:
+	case ClassMissingThinking, ClassBufferedBurst, ClassCipherDrool, ClassFakeEncryptedDump, ClassFastReasoningRatio, ClassHardTPS, ClassEmptyStream, ClassExpectedMarkerMissing:
 		return true
 	default:
 		return false

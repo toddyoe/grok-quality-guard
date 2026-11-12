@@ -31,36 +31,38 @@ type actionRequest struct {
 }
 
 type accountView struct {
-	AuthID                string    `json:"auth_id"`
-	AuthIDDisplay         string    `json:"auth_id_display"`
-	Display               string    `json:"display"`
-	DisplayFull           string    `json:"display_full"`
-	Email                 string    `json:"email,omitempty"`
-	Label                 string    `json:"label,omitempty"`
-	State                 string    `json:"state"`
-	LastReason            string    `json:"last_reason,omitempty"`
-	LastObservedAt        time.Time `json:"last_observed_at,omitempty"`
-	LastProbeAt           time.Time `json:"last_probe_at,omitempty"`
-	CooldownUntil         time.Time `json:"cooldown_until,omitempty"`
-	ProbeBackoffUntil     time.Time `json:"probe_backoff_until,omitempty"`
-	DisableKind           string    `json:"disable_kind,omitempty"`
-	StrikeMissingThinking bool      `json:"strike_missing_thinking"`
-	SoftStrikes           int       `json:"soft_strikes"`
-	ErrorStrikes          int       `json:"error_strikes"`
-	ThinkingStrikes       int       `json:"thinking_strikes"`
-	ResinManaged          bool      `json:"resin_managed"`
-	ResinAccount          string    `json:"resin_account,omitempty"`
-	ResinGeneration       int64     `json:"resin_generation"`
-	ProxyStatus           string    `json:"proxy_status"`
-	Proxy                 string    `json:"proxy,omitempty"`
-	TPS                   float64   `json:"tps"`
-	TTFTMS                int64     `json:"ttft_ms"`
-	OutputTokens          int64     `json:"output_tokens"`
-	ReasoningTokens       int64     `json:"reasoning_tokens"`
-	VisibleTokens         int64     `json:"visible_tokens"`
-	EncryptedBytes        int64     `json:"encrypted_bytes"`
-	HasAccessToken        bool      `json:"has_access_token"`
-	HasRefreshToken       bool      `json:"has_refresh_token"`
+	AuthID                string           `json:"auth_id"`
+	AuthIDDisplay         string           `json:"auth_id_display"`
+	Display               string           `json:"display"`
+	DisplayFull           string           `json:"display_full"`
+	Email                 string           `json:"email,omitempty"`
+	Label                 string           `json:"label,omitempty"`
+	State                 string           `json:"state"`
+	LastReason            string           `json:"last_reason,omitempty"`
+	LastAttempt           *AttemptEvidence `json:"last_attempt,omitempty"`
+	Evidence              *QualityEvidence `json:"evidence,omitempty"`
+	LastObservedAt        time.Time        `json:"last_observed_at,omitempty"`
+	LastProbeAt           time.Time        `json:"last_probe_at,omitempty"`
+	CooldownUntil         time.Time        `json:"cooldown_until,omitempty"`
+	ProbeBackoffUntil     time.Time        `json:"probe_backoff_until,omitempty"`
+	DisableKind           string           `json:"disable_kind,omitempty"`
+	StrikeMissingThinking bool             `json:"strike_missing_thinking"`
+	SoftStrikes           int              `json:"soft_strikes"`
+	ErrorStrikes          int              `json:"error_strikes"`
+	ThinkingStrikes       int              `json:"thinking_strikes"`
+	ResinManaged          bool             `json:"resin_managed"`
+	ResinAccount          string           `json:"resin_account,omitempty"`
+	ResinGeneration       int64            `json:"resin_generation"`
+	ProxyStatus           string           `json:"proxy_status"`
+	Proxy                 string           `json:"proxy,omitempty"`
+	TPS                   float64          `json:"tps"`
+	TTFTMS                int64            `json:"ttft_ms"`
+	OutputTokens          int64            `json:"output_tokens"`
+	ReasoningTokens       int64            `json:"reasoning_tokens"`
+	VisibleTokens         int64            `json:"visible_tokens"`
+	EncryptedBytes        int64            `json:"encrypted_bytes"`
+	HasAccessToken        bool             `json:"has_access_token"`
+	HasRefreshToken       bool             `json:"has_refresh_token"`
 }
 
 func (p *Plugin) HandleManagement(request []byte) ([]byte, error) {
@@ -598,6 +600,8 @@ func (p *Plugin) accountView(ctx context.Context, account Account) (accountView,
 		Label:                 displayLabel,
 		State:                 stateAccount.State,
 		LastReason:            stateAccount.LastReason,
+		LastAttempt:           stateAccount.LastAttempt,
+		Evidence:              stateAccount.LastEvidence,
 		LastObservedAt:        stateAccount.LastObservedAt,
 		LastProbeAt:           stateAccount.LastProbeAt,
 		CooldownUntil:         stateAccount.CooldownUntil,

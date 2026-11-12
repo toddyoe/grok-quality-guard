@@ -28,7 +28,7 @@ func twoGrokAuths(t *testing.T) ([]pluginapi.HostAuthFileEntry, map[string]json.
 
 func badStreamScript() []pluginapi.HostModelStreamReadResponse {
 	return []pluginapi.HostModelStreamReadResponse{
-		streamData("data: {\"choices\":[{\"delta\":{\"content\":\"bad answer\"}}]}\n\n"),
+		streamData("data: {\"choices\":[{\"delta\":{\"content\":\"bad answer bad answer bad answer bad answer bad answer bad answer bad answer bad answer bad answer bad answer bad answer bad answer \"}}]}\n\n"),
 		streamData("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":100}}\n\n"),
 		{Done: true},
 	}
@@ -78,7 +78,7 @@ func TestTransparentStreamFailsOverBeforeEmit(t *testing.T) {
 	for _, payload := range emitted {
 		joined.Write(payload)
 	}
-	if strings.Contains(joined.String(), "bad answer") {
+	if strings.Contains(joined.String(), "bad answer bad answer bad answer bad answer bad answer bad answer bad answer bad answer bad answer bad answer bad answer bad answer ") {
 		t.Fatalf("bad content leaked to client: %s", joined.String())
 	}
 	if !strings.Contains(joined.String(), "good answer") {
@@ -127,7 +127,7 @@ func TestTransparentStreamFailOpenEmitsLastBufferedResponse(t *testing.T) {
 	for _, payload := range emitted {
 		joined.Write(payload)
 	}
-	if !strings.Contains(joined.String(), "bad answer") {
+	if !strings.Contains(joined.String(), "bad answer bad answer bad answer bad answer bad answer bad answer bad answer bad answer bad answer bad answer bad answer bad answer ") {
 		t.Fatalf("fail_open did not emit buffered response: %s", joined.String())
 	}
 	if detail := host.closes["plugin-stream-3"]; detail != nil {

@@ -98,7 +98,7 @@ func TestRecoveryProbeMissingThinkingAfterStrikeBecomesPermanent(t *testing.T) {
 	}
 	lock := plugin.accountLock("auth-1")
 	lock.Lock()
-	errFailure := plugin.handleProbeFailure("auth-1", raw, response, true, ClassMissingThinking, nil)
+	errFailure := plugin.handleProbeFailure("auth-1", raw, response, true, QualityVerdict{Class: ClassMissingThinking}, nil)
 	lock.Unlock()
 	if errFailure != nil {
 		t.Fatal(errFailure)
@@ -242,7 +242,7 @@ func TestCooldownOnlyRecoveryFailureKeepsCooling(t *testing.T) {
 	}
 	lock := plugin.accountLock("auth-1")
 	lock.Lock()
-	errFailure := plugin.handleProbeFailure("auth-1", raw, response, true, ClassMissingThinking, nil)
+	errFailure := plugin.handleProbeFailure("auth-1", raw, response, true, QualityVerdict{Class: ClassMissingThinking}, nil)
 	lock.Unlock()
 	if errFailure != nil {
 		t.Fatal(errFailure)

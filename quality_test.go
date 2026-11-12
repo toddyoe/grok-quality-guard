@@ -8,7 +8,7 @@ import (
 func TestReasoningStubAndUsageTokensAreNotThinking(t *testing.T) {
 	analyzer := NewStreamAnalyzer()
 	analyzer.ObserveChunk([]byte(": grok2api-reasoning-start\n\n"))
-	analyzer.ObserveChunk([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n"))
+	analyzer.ObserveChunk([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"answer answer answer answer answer answer answer answer answer answer answer answer answer answer answer answer answer answer answer answer \"}}]}\n\n"))
 	analyzer.ObserveChunk([]byte("data: {\"usage\":{\"completion_tokens\":80,\"completion_tokens_details\":{\"reasoning_tokens\":79}}}\n\n"))
 	sig := analyzer.Finalize(true)
 	if sig.HasThinking {
@@ -78,6 +78,12 @@ func TestTPSAndBurstClassification(t *testing.T) {
 		DurationMS:      600,
 		OutputTokens:    1000,
 		ReasoningTokens: 100,
+		VisibleTokens:   20,
+		EncryptedBytes:  400,
+		EncryptedFloor:  400,
+		HasThinking:     true,
+		FirstVisible:    true,
+		VisibleFlushMS:  100,
 	}
 	verdict := classifyFinal(sig, config, false, 8, true)
 	if verdict.Class != ClassBufferedBurst {

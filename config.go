@@ -82,6 +82,7 @@ type QualityConfig struct {
 	SoftCrossVerify                 bool     `yaml:"soft_cross_verify" json:"soft_cross_verify"`
 	ThinkingCrossVerify             bool     `yaml:"thinking_cross_verify" json:"thinking_cross_verify"`
 	MinGenerationMS                 int64    `yaml:"min_generation_ms" json:"min_generation_ms"`
+	FailClosed                      bool     `yaml:"fail_closed" json:"fail_closed"`
 	MinPassiveOutputTokens          int64    `yaml:"min_passive_output_tokens" json:"min_passive_output_tokens"`
 	MinHoldOutputTokens             int64    `yaml:"min_hold_output_tokens" json:"min_hold_output_tokens"`
 	HoldTimeout                     Duration `yaml:"hold_timeout" json:"hold_timeout"`
@@ -156,6 +157,7 @@ func DefaultQualityConfig() QualityConfig {
 		SoftCrossVerify:                 false,
 		ThinkingCrossVerify:             false,
 		MinGenerationMS:                 1000,
+		FailClosed:                      false,
 		MinPassiveOutputTokens:          32,
 		MinHoldOutputTokens:             8,
 		HoldTimeout:                     NewDuration(30 * time.Second),

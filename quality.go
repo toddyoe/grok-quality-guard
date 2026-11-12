@@ -12,21 +12,43 @@ import (
 )
 
 const (
-	ClassBufferedBurst      = "buffered_burst"
-	ClassCipherDrool        = "cipher_drool"
-	ClassFakeEncryptedDump  = "fake_encrypted_dump"
-	ClassFastReasoningRatio = "fast_reasoning_ratio_dump"
-	ClassMissingThinking    = "missing_thinking"
-	ClassHardTPS            = "hard_tps"
-	ClassSoftTPS            = "soft_tps"
-	ClassEmptyStream        = "empty_stream"
-	ClassProbeError         = "probe_error"
-	ClassProxyError         = "proxy_error"
-	ClassIgnored            = "ignored"
-	ClassNone               = ""
+	ClassBufferedBurst             = "buffered_burst"
+	ClassCipherDrool               = "cipher_drool"
+	ClassFakeEncryptedDump         = "fake_encrypted_dump"
+	ClassFastReasoningRatio        = "fast_reasoning_ratio_dump"
+	ClassMissingThinking           = "missing_thinking"
+	ClassHardTPS                   = "hard_tps"
+	ClassSoftTPS                   = "soft_tps"
+	ClassEmptyStream               = "empty_stream"
+	ClassProbeError                = "probe_error"
+	ClassProxyError                = "proxy_error"
+	ClassIgnored                   = "ignored"
+	ClassInsufficientOutput        = "insufficient_output_tokens"
+	ClassInsufficientGeneration    = "insufficient_generation_window"
+	ClassExpectedMarkerMissing     = "expected_marker_missing"
+	ClassNone                      = ""
+	QualityActionWait              = "wait"
+	QualityActionDeliver           = "deliver"
+	QualityActionWithhold          = "withhold"
+	qualityProtocolChat            = "chat"
+	qualityProtocolResponses       = "responses"
+	qualityProtocolAnthropic       = "anthropic"
+	qualityReasoningSSEComment     = ": grok2api-reasoning-start"
+	qualityReasoningEvidencePrefix = ": grok2api-reasoning-evidence"
+	defaultQualityMinOutput        = int64(8)
+	defaultQualityMinGenerationMS  = int64(1000)
+	defaultQualityMaxVisible       = int64(32)
+	defaultQualityMinReasoning     = int64(80)
+	defaultQualityFastFlushMS      = int64(1000)
+	defaultQualityFakeFlushMS      = int64(2000)
+	defaultQualityCipherVisible    = int64(1024)
+	defaultEncryptedBytes          = int64(256)
+	defaultEncryptedBytesPerToken  = int64(4)
+	thinkingGuardMinOutputTokens   = int64(64)
 )
 
 type Signals struct {
+	Protocol          string
 	HasThinking       bool
 	HasReasoningDelta bool
 	ReasoningStarted  bool
@@ -44,13 +66,20 @@ type Signals struct {
 	SemanticOutput    bool
 	Streaming         bool
 	FirstTokenMS      int64
+	FirstTokenKnown   bool
 	DurationMS        int64
 	GenerationMS      int64
 	TPS               float64
 	VisibleText       string
+	ChunkCount        int
+	ByteCount         int64
+	EventCount        int
+	UnknownEvents     int
+	ParseFailures     int
 }
 
 type QualityVerdict struct {
+	Action  string
 	Class   string
 	Reason  string
 	Signals Signals
@@ -150,24 +179,52 @@ func (p *SSEParser) dispatch() (SSEEvent, bool) {
 
 type StreamAnalyzer struct {
 	parser         SSEParser
+	protocol       string
 	streaming      bool
-	signals        Signals
 	startedAt      time.Time
-	firstChunkAt   time.Time
+	firstTokenAt   time.Time
 	firstVisibleAt time.Time
 	lastVisibleAt  time.Time
 	terminalAt     time.Time
 	visibleText    strings.Builder
+	visibleRunes   int64
+	aggregateRunes int64
 	visibleDelta   bool
 	reasoningDelta bool
-	seenEncrypted  map[string]struct{}
+	hasThinking    bool
+	reasoningStart bool
+	encryptedBytes int64
+	minEncrypted   int64
+	bytesPerToken  int64
+	signals        Signals
 }
 
 func NewStreamAnalyzer() *StreamAnalyzer {
 	return &StreamAnalyzer{
-		startedAt:     time.Now(),
 		streaming:     true,
-		seenEncrypted: make(map[string]struct{}),
+		startedAt:     time.Now(),
+		minEncrypted:  defaultEncryptedBytes,
+		bytesPerToken: defaultEncryptedBytesPerToken,
+	}
+}
+
+func NewStreamAnalyzerWithProtocol(protocol string) *StreamAnalyzer {
+	analyzer := NewStreamAnalyzer()
+	analyzer.protocol = normalizeQualityProtocol(protocol)
+	return analyzer
+}
+
+func normalizeQualityProtocol(value string) string {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	switch {
+	case strings.Contains(normalized, "chat"):
+		return qualityProtocolChat
+	case strings.Contains(normalized, "message"), strings.Contains(normalized, "anthropic"):
+		return qualityProtocolAnthropic
+	case strings.Contains(normalized, "response"), strings.Contains(normalized, "codex"):
+		return qualityProtocolResponses
+	default:
+		return normalized
 	}
 }
 
@@ -179,36 +236,45 @@ func (a *StreamAnalyzer) SetStreaming(value bool) {
 	a.signals.Streaming = value
 }
 
-// Preview returns an immutable analysis snapshot without flushing a partial SSE
-// line before terminal delivery
+func (a *StreamAnalyzer) SetProtocol(value string) {
+	if a == nil {
+		return
+	}
+	a.protocol = normalizeQualityProtocol(value)
+}
+
+func (a *StreamAnalyzer) SetEncryptedConfig(minBytes, bytesPerToken int64) {
+	if a == nil {
+		return
+	}
+	if minBytes > 0 {
+		a.minEncrypted = minBytes
+	}
+	if bytesPerToken > 0 {
+		a.bytesPerToken = bytesPerToken
+	}
+}
+
+func (a *StreamAnalyzer) Text() string {
+	if a == nil {
+		return ""
+	}
+	return a.visibleText.String()
+}
+
 func (a *StreamAnalyzer) Preview() Signals {
 	if a == nil {
 		return Signals{}
 	}
-	sig := a.signals
-	sig.Streaming = a.streaming
-	sig.HasThinking = a.reasoningDelta || sig.HasReasoningDelta || a.encryptedMeetsFloor()
-	sig.EncryptedFloor = encryptedFloor(sig.ReasoningTokens, QualityConfig{})
-	now := time.Now()
-	if a.terminalAt.IsZero() {
-		sig.VisibleFlushMS = durationMS(a.firstVisibleAt, now)
-	} else {
-		sig.VisibleFlushMS = durationMS(a.firstVisibleAt, a.terminalAt)
-	}
-	if !a.firstVisibleAt.IsZero() && a.terminalAt.IsZero() {
-		sig.VisibleFlushMS = durationMS(a.firstVisibleAt, now)
-	}
-	sig.FirstTokenMS = durationMS(a.startedAt, a.firstChunkAt)
-	sig.DurationMS = durationMS(a.startedAt, now)
-	sig.GenerationMS = generationWindowMS(sig.DurationMS, sig.FirstTokenMS, sig.ReasoningTokens)
-	sig.TPS = tps(sig.OutputTokens, sig.GenerationMS)
-	return sig
+	return a.snapshot(false)
 }
 
 func (a *StreamAnalyzer) ObserveChunk(chunk []byte) {
 	if a == nil || len(chunk) == 0 {
 		return
 	}
+	a.signals.ChunkCount++
+	a.signals.ByteCount += int64(len(chunk))
 	for _, ev := range a.parser.Feed(chunk) {
 		a.observeEvent(ev, time.Now())
 	}
@@ -218,103 +284,162 @@ func (a *StreamAnalyzer) ObserveJSON(raw []byte) {
 	if a == nil || len(raw) == 0 {
 		return
 	}
-	a.observeJSON(raw, time.Now())
+	a.observePayload(raw, time.Now())
 }
 
 func (a *StreamAnalyzer) observeEvent(ev SSEEvent, now time.Time) {
-	if strings.TrimSpace(ev.Comment) != "" && strings.Contains(strings.ToLower(ev.Comment), "grok2api-reasoning-start") {
-		a.signals.ReasoningStarted = true
-		a.markChunk(now)
+	comment := strings.TrimSpace(strings.ToLower(ev.Comment))
+	if comment != "" {
+		a.signals.EventCount++
+		switch {
+		case strings.HasPrefix(comment, strings.TrimPrefix(qualityReasoningSSEComment, ": ")):
+			a.reasoningStart = true
+			a.signals.ReasoningStarted = true
+			a.markFirstToken(now)
+		case strings.HasPrefix(comment, strings.TrimPrefix(qualityReasoningEvidencePrefix, ": ")):
+			value := strings.TrimSpace(strings.TrimPrefix(ev.Comment, strings.TrimPrefix(qualityReasoningEvidencePrefix, ": ")))
+			if count, err := strconv.ParseInt(value, 10, 64); err == nil && count > a.encryptedBytes {
+				a.encryptedBytes = count
+			}
+			a.reasoningStart = true
+			a.signals.ReasoningStarted = true
+		}
 	}
 	data := strings.TrimSpace(ev.Data)
 	if data == "" {
 		return
 	}
+	a.signals.EventCount++
 	if data == "[DONE]" {
 		a.signals.Terminal = true
 		a.terminalAt = now
 		return
 	}
-	a.markChunk(now)
-	a.observeJSON([]byte(data), now)
-	if strings.EqualFold(ev.Event, "response.completed") || strings.EqualFold(ev.Event, "message_stop") {
+	a.observePayload([]byte(data), now)
+	if strings.EqualFold(ev.Event, "response.completed") || strings.EqualFold(ev.Event, "response.done") || strings.EqualFold(ev.Event, "message_stop") {
 		a.signals.Terminal = true
 		a.terminalAt = now
 	}
 }
 
-func (a *StreamAnalyzer) markChunk(now time.Time) {
-	if now.IsZero() {
-		now = time.Now()
+func (a *StreamAnalyzer) observePayload(raw []byte, now time.Time) {
+	var payload map[string]any
+	if errUnmarshal := json.Unmarshal(raw, &payload); errUnmarshal != nil {
+		a.signals.ParseFailures++
+		return
 	}
-	if a.firstChunkAt.IsZero() {
-		a.firstChunkAt = now
+	protocol := a.protocol
+	if protocol == "" {
+		protocol = detectQualityProtocol(payload)
+	} else if !qualityPayloadMatchesProtocol(payload, protocol) {
+		if detected := detectQualityProtocol(payload); detected != "" {
+			protocol = detected
+		}
 	}
-	if a.startedAt.IsZero() {
-		a.startedAt = now
+	if protocol == "" {
+		a.signals.UnknownEvents++
+		return
+	}
+	switch protocol {
+	case qualityProtocolChat:
+		a.observeChat(payload, now)
+	case qualityProtocolAnthropic:
+		a.observeAnthropic(payload, now)
+	default:
+		a.observeResponses(payload, now)
 	}
 }
 
-func (a *StreamAnalyzer) observeJSON(raw []byte, now time.Time) {
-	var payload map[string]any
-	if errUnmarshal := json.Unmarshal(raw, &payload); errUnmarshal != nil {
-		return
+func detectQualityProtocol(payload map[string]any) string {
+	if payload == nil {
+		return ""
+	}
+	if _, ok := payload["choices"]; ok {
+		return qualityProtocolChat
 	}
 	eventName := strings.ToLower(strings.TrimSpace(asString(payload["type"])))
-	if eventName == "" {
-		eventName = strings.ToLower(strings.TrimSpace(asString(payload["event"])))
+	if _, ok := payload["response"]; ok {
+		return qualityProtocolResponses
 	}
-	a.observeUsage(payload)
+	if _, ok := payload["output"]; ok {
+		return qualityProtocolResponses
+	}
+	if eventName == "response" || strings.HasPrefix(eventName, "response.") {
+		return qualityProtocolResponses
+	}
+	if eventName == "message" || strings.HasPrefix(eventName, "content_block_") || strings.HasPrefix(eventName, "message_") {
+		return qualityProtocolAnthropic
+	}
+	if _, ok := payload["content_block"]; ok {
+		return qualityProtocolAnthropic
+	}
+	if _, ok := payload["delta"]; ok {
+		return qualityProtocolAnthropic
+	}
+	if _, ok := payload["content"]; ok {
+		if _, hasStop := payload["stop_reason"]; hasStop {
+			return qualityProtocolAnthropic
+		}
+	}
+	return ""
+}
 
+func qualityPayloadMatchesProtocol(payload map[string]any, protocol string) bool {
+	if payload == nil {
+		return true
+	}
+	switch protocol {
+	case qualityProtocolChat:
+		_, ok := payload["choices"]
+		return ok
+	case qualityProtocolAnthropic:
+		eventName := strings.ToLower(strings.TrimSpace(asString(payload["type"])))
+		if eventName == "message" || strings.HasPrefix(eventName, "content_block_") || strings.HasPrefix(eventName, "message_") {
+			return true
+		}
+		if _, ok := payload["content_block"]; ok {
+			return true
+		}
+		if _, ok := payload["delta"]; ok {
+			return true
+		}
+		if _, ok := payload["content"]; ok {
+			_, hasStop := payload["stop_reason"]
+			return hasStop
+		}
+		return false
+	case qualityProtocolResponses:
+		eventName := strings.ToLower(strings.TrimSpace(asString(payload["type"])))
+		if eventName == "response" || strings.HasPrefix(eventName, "response.") {
+			return true
+		}
+		if _, ok := payload["response"]; ok {
+			return true
+		}
+		_, ok := payload["output"]
+		return ok
+	default:
+		return true
+	}
+}
+func (a *StreamAnalyzer) observeChat(payload map[string]any, now time.Time) {
+	a.observeUsage(payload)
 	if choices, ok := payload["choices"].([]any); ok {
 		for _, rawChoice := range choices {
 			choice, _ := rawChoice.(map[string]any)
 			if choice == nil {
 				continue
 			}
-			if finish := strings.TrimSpace(asString(choice["finish_reason"])); finish != "" {
-				a.signals.Terminal = true
-				a.terminalAt = now
+			if message, okMessage := choice["message"].(map[string]any); okMessage {
+				a.observeChatMessage(message, now)
 			}
 			if delta, okDelta := choice["delta"].(map[string]any); okDelta {
 				a.observeChatDelta(delta, now)
 			}
-			if message, okMessage := choice["message"].(map[string]any); okMessage && !a.visibleDelta {
-				a.observeChatMessage(message, now)
+			if finish := strings.TrimSpace(asString(choice["finish_reason"])); finish != "" {
+				a.signals.Terminal = true
+				a.terminalAt = now
 			}
-		}
-	}
-
-	switch eventName {
-	case "response.output_item.added", "response.output_item.done":
-		a.observeResponseItem(payload, now, eventName == "response.output_item.done")
-	case "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
-		a.addReasoningText(asString(payload["delta"]))
-	case "response.output_text.delta":
-		a.addVisibleText(asString(payload["delta"]), now)
-	case "response.output_text.done":
-		if !a.visibleDelta {
-			a.addVisibleText(asString(payload["text"]), now)
-		}
-	case "response.completed", "response.done":
-		a.signals.Terminal = true
-		a.terminalAt = now
-	case "content_block_start":
-		a.observeAnthropicBlockStart(payload, now)
-	case "content_block_delta":
-		a.observeAnthropicDelta(payload, now)
-	case "content_block_stop":
-		// Nothing to do; message_stop is the terminal marker
-	case "message_delta":
-		a.observeUsage(payload)
-	case "message_stop":
-		a.signals.Terminal = true
-		a.terminalAt = now
-	}
-
-	if eventName == "response.completed" {
-		if response, ok := payload["response"].(map[string]any); ok {
-			a.observeUsage(response)
 		}
 	}
 }
@@ -323,12 +448,16 @@ func (a *StreamAnalyzer) observeChatDelta(delta map[string]any, now time.Time) {
 	if text := firstString(delta, "reasoning", "reasoning_content", "thinking_content"); strings.TrimSpace(text) != "" {
 		a.addReasoningText(text)
 	}
-	a.addContentParts(delta["content"], now)
-	if _, ok := delta["tool_calls"]; ok {
-		a.signals.SemanticOutput = true
+	if content, ok := delta["content"]; ok {
+		a.addContentParts(content, now)
 	}
-	if _, ok := delta["function_call"]; ok {
+	if toolCalls, ok := delta["tool_calls"].([]any); ok && len(toolCalls) > 0 {
 		a.signals.SemanticOutput = true
+		a.markFirstToken(now)
+	}
+	if functionCall := delta["function_call"]; functionCall != nil {
+		a.signals.SemanticOutput = true
+		a.markFirstToken(now)
 	}
 }
 
@@ -336,89 +465,241 @@ func (a *StreamAnalyzer) observeChatMessage(message map[string]any, now time.Tim
 	if text := firstString(message, "reasoning", "reasoning_content", "thinking_content"); strings.TrimSpace(text) != "" {
 		a.addReasoningText(text)
 	}
-	a.addContentParts(message["content"], now)
-	if _, ok := message["tool_calls"]; ok {
+	if content, ok := message["content"]; ok {
+		if a.streaming {
+			a.observeResponsesMessageContent(content, now)
+		} else {
+			a.addContentParts(content, now)
+		}
+	}
+	if toolCalls, ok := message["tool_calls"].([]any); ok && len(toolCalls) > 0 {
 		a.signals.SemanticOutput = true
+		a.markFirstToken(now)
 	}
 }
 
-func (a *StreamAnalyzer) observeResponseItem(payload map[string]any, now time.Time, done bool) {
+func (a *StreamAnalyzer) observeResponses(payload map[string]any, now time.Time) {
+	eventName := strings.ToLower(strings.TrimSpace(asString(payload["type"])))
+	if eventName == "" {
+		if _, ok := payload["output"]; ok {
+			eventName = "response.completed"
+		}
+	}
+	a.observeUsage(payload)
+	switch eventName {
+	case "response.completed", "response.incomplete", "response.failed", "response.done":
+		a.signals.Terminal = true
+		a.terminalAt = now
+	case "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
+		a.addReasoningText(asString(payload["delta"]))
+	case "response.output_text.delta":
+		a.addVisibleText(asString(payload["delta"]), now)
+	case "response.output_text.done":
+		if !a.visibleDelta {
+			a.addVisibleText(asString(payload["text"]), now)
+		}
+	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta", "response.mcp_call_arguments.delta":
+		if strings.TrimSpace(asString(payload["delta"])) != "" {
+			a.signals.SemanticOutput = true
+			a.markFirstToken(now)
+		}
+	case "response.output_item.added", "response.output_item.done":
+		a.observeResponsesItem(payload, now)
+	}
+	if response, ok := payload["response"].(map[string]any); ok {
+		if output, okOutput := response["output"].([]any); okOutput {
+			var aggregateRunes int64
+			for _, rawItem := range output {
+				item, _ := rawItem.(map[string]any)
+				if item != nil {
+					aggregateRunes += a.observeResponsesItemMap(item, now)
+				}
+			}
+			a.aggregateRunes = maxInt64(a.aggregateRunes, aggregateRunes)
+		}
+		a.observeUsage(response)
+	}
+}
+
+func (a *StreamAnalyzer) observeResponsesItem(payload map[string]any, now time.Time) {
 	item, _ := payload["item"].(map[string]any)
 	if item == nil {
 		return
 	}
+	runes := a.observeResponsesItemMap(item, now)
+	a.aggregateRunes = maxInt64(a.aggregateRunes, runes)
+}
+
+func (a *StreamAnalyzer) observeResponsesItemMap(item map[string]any, now time.Time) int64 {
 	itemType := strings.ToLower(strings.TrimSpace(asString(item["type"])))
 	switch itemType {
 	case "reasoning":
-		if !done {
+		if strings.TrimSpace(asString(item["id"])) != "" {
+			a.reasoningStart = true
 			a.signals.ReasoningStarted = true
 		}
 		if enc := asString(item["encrypted_content"]); strings.TrimSpace(enc) != "" {
 			a.addEncrypted(enc)
 		}
-		if summaries, ok := item["summary"].([]any); ok {
-			for _, rawSummary := range summaries {
-				summary, _ := rawSummary.(map[string]any)
-				if summary != nil {
-					a.addReasoningText(asString(summary["text"]))
-				}
-			}
-		}
-		if content, ok := item["content"].([]any); ok {
-			for _, rawPart := range content {
-				part, _ := rawPart.(map[string]any)
-				if part != nil {
-					a.addReasoningText(asString(part["text"]))
-				}
-			}
-		}
+		a.observeResponsesReasoningContent(item["summary"])
+		a.observeResponsesReasoningContent(item["content"])
+		return 0
 	case "message":
-		if !a.visibleDelta {
-			a.addContentParts(item["content"], now)
-		}
-	case "function_call", "custom_tool_call", "tool_call", "local_shell_call", "apply_patch_call":
+		return a.observeResponsesMessageContent(item["content"], now)
+	case "":
+		return 0
+	default:
 		a.signals.SemanticOutput = true
+		a.markFirstToken(now)
+		return 0
 	}
 }
 
-func (a *StreamAnalyzer) observeAnthropicBlockStart(payload map[string]any, now time.Time) {
-	block, _ := payload["content_block"].(map[string]any)
-	if block == nil {
+func (a *StreamAnalyzer) observeResponsesReasoningContent(value any) {
+	parts, ok := value.([]any)
+	if !ok {
 		return
 	}
-	switch strings.ToLower(asString(block["type"])) {
-	case "thinking", "redacted_thinking":
-		if text := asString(block["thinking"]); strings.TrimSpace(text) != "" {
-			a.addReasoningText(text)
+	for _, rawPart := range parts {
+		part, _ := rawPart.(map[string]any)
+		if part == nil {
+			continue
 		}
-		if data := asString(block["data"]); strings.TrimSpace(data) != "" {
-			a.addEncrypted(data)
-		}
-		if text := asString(block["text"]); strings.TrimSpace(text) != "" {
-			a.addReasoningText(text)
-		}
-		a.signals.ReasoningStarted = true
-	case "text":
-		a.addVisibleText(asString(block["text"]), now)
-	case "tool_use":
-		a.signals.SemanticOutput = true
+		a.addReasoningText(asString(part["text"]))
 	}
 }
 
-func (a *StreamAnalyzer) observeAnthropicDelta(payload map[string]any, now time.Time) {
-	delta, _ := payload["delta"].(map[string]any)
-	if delta == nil {
+func (a *StreamAnalyzer) observeResponsesMessageContent(value any, now time.Time) int64 {
+	parts, ok := value.([]any)
+	if !ok {
+		if text := asString(value); strings.TrimSpace(text) != "" {
+			return a.noteAggregateVisibleText(text, now, "")
+		}
+		return 0
+	}
+	var runes int64
+	for _, rawPart := range parts {
+		part, _ := rawPart.(map[string]any)
+		if part == nil {
+			continue
+		}
+		kind := strings.ToLower(strings.TrimSpace(asString(part["type"])))
+		switch kind {
+		case "output_text", "text", "refusal":
+			runes += a.noteAggregateVisibleText(asString(part["text"]), now, kind)
+		case "reasoning_text", "summary_text":
+			a.addReasoningText(asString(part["text"]))
+		case "tool_call", "function_call":
+			a.signals.SemanticOutput = true
+			a.markFirstToken(now)
+		default:
+			if kind != "" {
+				a.signals.SemanticOutput = true
+			}
+		}
+	}
+	return runes
+}
+
+func (a *StreamAnalyzer) noteAggregateVisibleText(text string, now time.Time, kind string) int64 {
+	_ = now
+	_ = kind
+	if text == "" {
+		return 0
+	}
+	a.signals.SemanticOutput = true
+	if !a.visibleDelta {
+		a.visibleText.WriteString(text)
+	}
+	return int64(utf8.RuneCountInString(text))
+}
+
+func (a *StreamAnalyzer) observeAnthropic(payload map[string]any, now time.Time) {
+	eventName := strings.ToLower(strings.TrimSpace(asString(payload["type"])))
+	a.observeUsage(payload)
+	switch eventName {
+	case "message_stop":
+		a.signals.Terminal = true
+		a.terminalAt = now
+	case "message":
+		if content, ok := payload["content"]; ok {
+			a.observeAnthropicContent(content, now)
+		}
+		if stopReason := strings.TrimSpace(asString(payload["stop_reason"])); stopReason != "" {
+			a.signals.Terminal = true
+			a.terminalAt = now
+		}
+	case "content_block_start":
+		block, _ := payload["content_block"].(map[string]any)
+		if block == nil {
+			return
+		}
+		switch strings.ToLower(asString(block["type"])) {
+		case "thinking":
+			a.reasoningStart = true
+			a.signals.ReasoningStarted = true
+			if text := asString(block["thinking"]); strings.TrimSpace(text) != "" {
+				a.addReasoningText(text)
+			}
+		case "redacted_thinking":
+			a.reasoningStart = true
+			a.signals.ReasoningStarted = true
+			a.addEncrypted(asString(block["data"]))
+		case "text":
+			a.addVisibleText(asString(block["text"]), now)
+			a.signals.SemanticOutput = true
+		case "tool_use", "server_tool_use":
+			a.signals.SemanticOutput = true
+			a.markFirstToken(now)
+		}
+	case "content_block_delta":
+		delta, _ := payload["delta"].(map[string]any)
+		if delta == nil {
+			return
+		}
+		switch strings.ToLower(asString(delta["type"])) {
+		case "thinking_delta":
+			a.addReasoningText(firstString(delta, "thinking", "text"))
+		case "signature_delta":
+			a.reasoningStart = true
+			a.signals.ReasoningStarted = true
+			a.addEncrypted(asString(delta["signature"]))
+		case "text_delta":
+			a.addVisibleText(asString(delta["text"]), now)
+		case "input_json_delta":
+			if strings.TrimSpace(asString(delta["partial_json"])) != "" {
+				a.signals.SemanticOutput = true
+				a.markFirstToken(now)
+			}
+		}
+	}
+}
+func (a *StreamAnalyzer) observeAnthropicContent(value any, now time.Time) {
+	parts, ok := value.([]any)
+	if !ok {
 		return
 	}
-	switch strings.ToLower(asString(delta["type"])) {
-	case "thinking_delta":
-		a.addReasoningText(firstString(delta, "thinking", "text"))
-	case "signature_delta":
-		a.addEncrypted(asString(delta["signature"]))
-	case "text_delta":
-		a.addVisibleText(asString(delta["text"]), now)
-	case "input_json_delta":
-		a.signals.SemanticOutput = true
+	for _, rawPart := range parts {
+		part, _ := rawPart.(map[string]any)
+		if part == nil {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(asString(part["type"]))) {
+		case "thinking":
+			a.reasoningStart = true
+			a.signals.ReasoningStarted = true
+			a.addReasoningText(firstString(part, "thinking", "text"))
+		case "redacted_thinking":
+			a.reasoningStart = true
+			a.signals.ReasoningStarted = true
+			a.addEncrypted(asString(part["data"]))
+		case "text":
+			a.addVisibleText(asString(part["text"]), now)
+			a.signals.SemanticOutput = true
+		case "tool_use", "server_tool_use":
+			a.signals.SemanticOutput = true
+			a.markFirstToken(now)
+		}
 	}
 }
 
@@ -433,13 +714,16 @@ func (a *StreamAnalyzer) addContentParts(value any, now time.Time) {
 				continue
 			}
 			kind := strings.ToLower(asString(part["type"]))
-			if kind == "output_text" || kind == "text" {
+			switch kind {
+			case "output_text", "text":
 				a.addVisibleText(asString(part["text"]), now)
-			}
-			if kind == "reasoning_text" || kind == "summary_text" {
+			case "reasoning_text", "summary_text":
 				a.addReasoningText(asString(part["text"]))
-			}
-			if kind == "tool_call" || kind == "function_call" {
+			case "tool_call", "function_call":
+				a.signals.SemanticOutput = true
+				a.markFirstToken(now)
+			case "refusal":
+				a.addVisibleText(asString(part["text"]), now)
 				a.signals.SemanticOutput = true
 			}
 		}
@@ -450,8 +734,11 @@ func (a *StreamAnalyzer) addReasoningText(text string) {
 	if strings.TrimSpace(text) == "" {
 		return
 	}
-	a.signals.HasReasoningDelta = true
+	a.hasThinking = true
 	a.reasoningDelta = true
+	a.signals.HasReasoningDelta = true
+	a.signals.ReasoningStarted = true
+	a.markFirstToken(time.Now())
 }
 
 func (a *StreamAnalyzer) addVisibleText(text string, now time.Time) {
@@ -465,13 +752,10 @@ func (a *StreamAnalyzer) addVisibleText(text string, now time.Time) {
 	}
 	a.lastVisibleAt = now
 	a.visibleText.WriteString(text)
-	if a.visibleText.Len() > 1024*1024 {
-		current := a.visibleText.String()
-		a.visibleText.Reset()
-		a.visibleText.WriteString(current[len(current)-512*1024:])
-	}
-	a.signals.VisibleRunes += int64(utf8.RuneCountInString(text))
-	a.signals.VisibleTokens = int64(math.Ceil(float64(a.signals.VisibleRunes) / 4.0))
+	a.visibleRunes += int64(utf8.RuneCountInString(text))
+	a.signals.VisibleRunes = maxInt64(a.signals.VisibleRunes, a.visibleRunes)
+	a.signals.VisibleTokens = (a.signals.VisibleRunes + 3) / 4
+	a.markFirstToken(now)
 }
 
 func (a *StreamAnalyzer) addEncrypted(value string) {
@@ -479,14 +763,16 @@ func (a *StreamAnalyzer) addEncrypted(value string) {
 	if value == "" {
 		return
 	}
-	if a.seenEncrypted == nil {
-		a.seenEncrypted = make(map[string]struct{})
+	if size := int64(len([]byte(value))); size > a.encryptedBytes {
+		a.encryptedBytes = size
 	}
-	if _, ok := a.seenEncrypted[value]; ok {
-		return
+	a.signals.EncryptedBytes = a.encryptedBytes
+}
+
+func (a *StreamAnalyzer) markFirstToken(now time.Time) {
+	if a.firstTokenAt.IsZero() {
+		a.firstTokenAt = now
 	}
-	a.seenEncrypted[value] = struct{}{}
-	a.signals.EncryptedBytes += int64(len([]byte(value)))
 }
 
 func (a *StreamAnalyzer) observeUsage(payload map[string]any) {
@@ -503,21 +789,66 @@ func (a *StreamAnalyzer) observeUsage(payload map[string]any) {
 		return
 	}
 	a.signals.UsageReported = true
-	if value := firstInt(usage, "completion_tokens", "output_tokens"); value > 0 {
+	if value := firstInt(usage, "completion_tokens", "output_tokens"); value > a.signals.OutputTokens {
 		a.signals.OutputTokens = value
-	}
-	if value := firstInt(usage, "reasoning_tokens", "thinking_tokens"); value >= 0 {
-		if value > 0 || usage["reasoning_tokens"] != nil || usage["thinking_tokens"] != nil {
-			a.signals.ReasoningTokens = value
-		}
 	}
 	for _, key := range []string{"completion_tokens_details", "output_tokens_details"} {
 		if detail, ok := usage[key].(map[string]any); ok {
-			if value := firstInt(detail, "reasoning_tokens", "thinking_tokens"); value >= 0 {
+			if value := firstInt(detail, "reasoning_tokens", "thinking_tokens"); value > a.signals.ReasoningTokens {
 				a.signals.ReasoningTokens = value
 			}
 		}
 	}
+	if value := firstInt(usage, "reasoning_tokens", "thinking_tokens"); value > a.signals.ReasoningTokens {
+		a.signals.ReasoningTokens = value
+	}
+}
+
+func (a *StreamAnalyzer) snapshot(final bool) Signals {
+	if a == nil {
+		return Signals{}
+	}
+	sig := a.signals
+	sig.Protocol = a.protocol
+	sig.Streaming = a.streaming
+	sig.EncryptedBytes = a.encryptedBytes
+	sig.ReasoningStarted = a.reasoningStart || sig.ReasoningStarted || sig.HasThinking
+	floor := encryptedFloorWithConfig(sig.ReasoningTokens, a.minEncrypted, a.bytesPerToken)
+	sig.EncryptedFloor = floor
+	sig.HasThinking = a.reasoningDelta || sig.HasReasoningDelta || (sig.EncryptedBytes > 0 && sig.EncryptedBytes >= floor)
+	sig.VisibleRunes = maxInt64(sig.VisibleRunes, a.aggregateRunes)
+	sig.VisibleTokens = (sig.VisibleRunes + 3) / 4
+	if sig.OutputTokens <= 0 && final {
+		sig.OutputTokens = sig.VisibleTokens
+	}
+	if a.firstTokenAt.IsZero() {
+		sig.FirstTokenMS = 0
+		sig.FirstTokenKnown = false
+	} else {
+		sig.FirstTokenMS = durationMS(a.startedAt, a.firstTokenAt)
+		sig.FirstTokenKnown = true
+	}
+	end := a.terminalAt
+	if end.IsZero() {
+		end = time.Now()
+	}
+	if !a.firstVisibleAt.IsZero() {
+		sig.FirstVisible = true
+		sig.VisibleFlushMS = durationMS(a.firstVisibleAt, end)
+		if sig.VisibleFlushMS < 0 {
+			sig.VisibleFlushMS = 0
+		}
+	}
+	sig.DurationMS = durationMS(a.startedAt, end)
+	sig.GenerationMS = generationWindowMS(sig.DurationMS, sig.FirstTokenMS, sig.ReasoningTokens)
+	sig.TPS = tps(sig.OutputTokens, sig.GenerationMS)
+	sig.VisibleText = a.visibleText.String()
+	sig.ChunkCount = a.signals.ChunkCount
+	sig.ByteCount = a.signals.ByteCount
+	sig.EventCount = a.signals.EventCount
+	sig.UnknownEvents = a.signals.UnknownEvents
+	sig.ParseFailures = a.signals.ParseFailures
+	return sig
 }
 
 func (a *StreamAnalyzer) Finalize(ended bool) Signals {
@@ -533,65 +864,25 @@ func (a *StreamAnalyzer) Finalize(ended bool) Signals {
 			a.terminalAt = time.Now()
 		}
 	}
-	now := time.Now()
-	if a.terminalAt.IsZero() {
-		a.terminalAt = now
-	}
-	a.signals.Streaming = a.streaming
-	a.signals.HasThinking = a.reasoningDelta || a.signals.HasReasoningDelta || a.encryptedMeetsFloor()
-	if a.signals.OutputTokens <= 0 {
-		a.signals.OutputTokens = a.signals.VisibleTokens + a.signals.ReasoningTokens
-	}
-	a.signals.EncryptedFloor = encryptedFloor(a.signals.ReasoningTokens, QualityConfig{})
-	if a.signals.EncryptedFloor < 0 {
-		a.signals.EncryptedFloor = 0
-	}
-	if a.signals.EncryptedBytes > 0 && a.signals.EncryptedBytes >= a.signals.EncryptedFloor {
-		a.signals.HasThinking = true
-	}
-	if a.firstVisibleAt.IsZero() && a.signals.FirstVisible {
-		a.firstVisibleAt = a.firstChunkAt
-	}
-	if !a.firstVisibleAt.IsZero() {
-		end := a.terminalAt
-		if end.IsZero() {
-			end = a.lastVisibleAt
-		}
-		a.signals.VisibleFlushMS = end.Sub(a.firstVisibleAt).Milliseconds()
-		if a.signals.VisibleFlushMS < 0 {
-			a.signals.VisibleFlushMS = 0
-		}
-	}
-	a.signals.FirstTokenMS = durationMS(a.startedAt, a.firstChunkAt)
-	a.signals.DurationMS = durationMS(a.startedAt, a.terminalAt)
-	a.signals.GenerationMS = a.signals.DurationMS - a.signals.FirstTokenMS
-	a.signals.TPS = tps(a.signals.OutputTokens, a.signals.GenerationMS)
-	a.signals.VisibleText = a.visibleText.String()
-	return a.signals
+	return a.snapshot(true)
 }
-
-func (a *StreamAnalyzer) encryptedMeetsFloor() bool {
-	if a.signals.EncryptedBytes <= 0 {
-		return false
-	}
-	floor := encryptedFloor(a.signals.ReasoningTokens, QualityConfig{})
-	return a.signals.EncryptedBytes >= floor
-}
-
 func encryptedFloor(reasoningTokens int64, cfg QualityConfig) int64 {
-	if cfg.MinEncryptedBytes <= 0 {
-		cfg.MinEncryptedBytes = 256
+	return encryptedFloorWithConfig(reasoningTokens, cfg.MinEncryptedBytes, cfg.EncryptedBytesPerReasoningToken)
+}
+
+func encryptedFloorWithConfig(reasoningTokens, minBytes, bytesPerToken int64) int64 {
+	if minBytes <= 0 {
+		minBytes = defaultEncryptedBytes
 	}
-	if cfg.EncryptedBytesPerReasoningToken <= 0 {
-		cfg.EncryptedBytesPerReasoningToken = 4
+	if bytesPerToken <= 0 {
+		bytesPerToken = defaultEncryptedBytesPerToken
 	}
-	floor := cfg.MinEncryptedBytes
+	floor := minBytes
 	if reasoningTokens > 0 {
-		if reasoningTokens > math.MaxInt64/cfg.EncryptedBytesPerReasoningToken {
+		if reasoningTokens > math.MaxInt64/bytesPerToken {
 			return math.MaxInt64
 		}
-		need := reasoningTokens * cfg.EncryptedBytesPerReasoningToken
-		if need > floor {
+		if need := reasoningTokens * bytesPerToken; need > floor {
 			floor = need
 		}
 	}
@@ -613,91 +904,83 @@ func tps(outputTokens, generationMS int64) float64 {
 }
 
 func generationWindowMS(durationMS, firstTokenMS, reasoningTokens int64) int64 {
-	window := durationMS - firstTokenMS
-	if reasoningTokens > 0 && window < firstTokenMS && window < 1000 {
+	if durationMS <= 0 {
+		return 0
+	}
+	if firstTokenMS < 0 {
+		firstTokenMS = 0
+	}
+	if firstTokenMS >= durationMS {
+		return 0
+	}
+	generationMS := durationMS - firstTokenMS
+	if reasoningTokens > 0 && generationMS < firstTokenMS && generationMS < defaultQualityMinGenerationMS {
 		return durationMS
 	}
-	return window
+	return generationMS
 }
 
-func classifyFinal(sig Signals, cfg QualityConfig, reasoningRequired bool, minOutput int64, streaming bool) QualityVerdict {
-	sig.EncryptedFloor = encryptedFloor(sig.ReasoningTokens, cfg)
-	sig.HasThinking = sig.HasReasoningDelta || (sig.EncryptedBytes > 0 && sig.EncryptedBytes >= sig.EncryptedFloor)
-	if sig.OutputTokens <= 0 {
-		sig.OutputTokens = sig.VisibleTokens + sig.ReasoningTokens
+func qualityMeetsEncryptedFloor(sig Signals) bool {
+	if sig.EncryptedBytes <= 0 {
+		return false
 	}
-	sig.GenerationMS = generationWindowMS(sig.DurationMS, sig.FirstTokenMS, sig.ReasoningTokens)
-	sig.TPS = tps(sig.OutputTokens, sig.GenerationMS)
-	sig.Streaming = streaming
-
-	if streaming && qualityIsBurstDump(sig, cfg) {
-		return QualityVerdict{Class: ClassBufferedBurst, Reason: "short generation window dumped output", Signals: sig}
+	floor := sig.EncryptedFloor
+	if floor <= 0 {
+		floor = encryptedFloorWithConfig(sig.ReasoningTokens, defaultEncryptedBytes, defaultEncryptedBytesPerToken)
 	}
-	if streaming && qualityIsCipherDrool(sig, minOutput) {
-		return QualityVerdict{Class: ClassCipherDrool, Reason: "cipher-only stream is dumping visible text", Signals: sig}
-	}
-	if streaming && qualityIsFakeEncryptedDump(sig) {
-		return QualityVerdict{Class: ClassFakeEncryptedDump, Reason: "encrypted or billed reasoning preceded a fast visible dump", Signals: sig}
-	}
-	if streaming && qualityIsFastReasoningRatioDump(sig) {
-		return QualityVerdict{Class: ClassFastReasoningRatio, Reason: "reasoning tokens dominate a fast visible dump", Signals: sig}
-	}
-	if isEmptyStream(sig) {
-		return QualityVerdict{Class: ClassEmptyStream, Reason: "upstream stream completed without content", Signals: sig}
-	}
-	if reasoningRequired && !sig.HasThinking && !isSemanticOnly(sig) {
-		return QualityVerdict{Class: ClassMissingThinking, Reason: "no real reasoning evidence", Signals: sig}
-	}
-	if sig.Terminal && sig.OutputTokens >= minOutput && sig.GenerationMS > 0 {
-		if sig.TPS >= cfg.HardTPS {
-			return QualityVerdict{Class: ClassHardTPS, Reason: "output tokens per second exceeded hard threshold", Signals: sig}
-		}
-		if sig.TPS >= cfg.SoftTPS {
-			return QualityVerdict{Class: ClassSoftTPS, Reason: "output tokens per second exceeded soft threshold", Signals: sig}
-		}
-	}
-	return QualityVerdict{Class: ClassNone, Signals: sig}
+	return sig.EncryptedBytes >= floor
 }
 
-func qualityIsBurstDump(sig Signals, cfg QualityConfig) bool {
+func qualityHasDumpBill(sig Signals) bool {
+	return qualityMeetsEncryptedFloor(sig) || sig.ReasoningTokens >= defaultQualityMinReasoning
+}
+
+func qualityFastFlush(sig Signals, limitMS int64) bool {
+	return sig.FirstVisible && sig.VisibleFlushMS >= 0 && sig.VisibleFlushMS < limitMS
+}
+
+func qualityIsBurstDump(sig Signals, minOutput int64) bool {
+	_ = minOutput
 	if sig.HasReasoningDelta {
 		return false
 	}
-	heavy := sig.ReasoningTokens >= 80 || (sig.EncryptedBytes > 0 && sig.EncryptedBytes >= sig.EncryptedFloor)
-	if !heavy {
-		return false
-	}
-	if sig.HoldExpired && sig.VisibleTokens > 0 && sig.VisibleTokens < 32 {
+	shortVisible := sig.VisibleTokens > 0 && sig.VisibleTokens < defaultQualityMaxVisible
+	heavyReasoning := sig.ReasoningTokens >= defaultQualityMinReasoning
+	if sig.HoldExpired && shortVisible && heavyReasoning {
 		return true
 	}
-	if sig.FirstVisible && sig.VisibleFlushMS >= 0 && sig.VisibleFlushMS < 1000 {
-		return true
-	}
-	return sig.GenerationMS > 0 && sig.GenerationMS < cfg.MinGenerationMS && sig.TPS >= cfg.SoftTPS
+	return qualityFastFlush(sig, defaultQualityFastFlushMS) && qualityHasDumpBill(sig)
 }
 
 func qualityIsCipherDrool(sig Signals, minOutput int64) bool {
-	if sig.HasReasoningDelta || sig.ReasoningTokens > 0 || sig.EncryptedBytes <= 0 || (sig.EncryptedFloor > 0 && sig.EncryptedBytes < sig.EncryptedFloor) {
+	if minOutput <= 0 {
+		minOutput = defaultQualityMinOutput
+	}
+	if sig.HasReasoningDelta || sig.ReasoningTokens > 0 || sig.EncryptedBytes <= 0 {
 		return false
 	}
-	if minOutput <= 0 {
-		minOutput = 8
+	if sig.VisibleTokens >= defaultQualityCipherVisible {
+		return true
 	}
-	return sig.VisibleTokens >= 1024 || (sig.Terminal && sig.VisibleTokens >= minOutput)
+	return sig.Terminal && sig.VisibleTokens >= minOutput
 }
 
-func qualityIsFakeEncryptedDump(sig Signals) bool {
-	if sig.HasReasoningDelta || (sig.EncryptedBytes <= 0 && sig.ReasoningTokens < 80) {
+func qualityIsFakeEncryptedDump(sig Signals, minOutput int64) bool {
+	_ = minOutput
+	if sig.HasReasoningDelta {
 		return false
 	}
-	if !sig.FirstVisible || sig.VisibleFlushMS >= 2000 {
+	if !qualityFastFlush(sig, defaultQualityFakeFlushMS) {
 		return false
 	}
-	return sig.ReasoningTokens >= 80 || (sig.EncryptedBytes > 0 && sig.EncryptedBytes >= sig.EncryptedFloor)
+	return qualityHasDumpBill(sig)
 }
 
 func qualityIsFastReasoningRatioDump(sig Signals) bool {
-	if !sig.HasReasoningDelta || !sig.FirstVisible || sig.VisibleFlushMS >= 2000 {
+	if !sig.HasReasoningDelta {
+		return false
+	}
+	if !qualityFastFlush(sig, defaultQualityFakeFlushMS) {
 		return false
 	}
 	output := sig.OutputTokens
@@ -710,14 +993,243 @@ func qualityIsFastReasoningRatioDump(sig Signals) bool {
 	return sig.ReasoningTokens*5 >= output*4
 }
 
-func isEmptyStream(sig Signals) bool {
-	return sig.Terminal && !sig.HasThinking && sig.ReasoningTokens <= 0 && sig.OutputTokens <= 0 && sig.VisibleTokens <= 0 && !sig.SemanticOutput
+func ClassifyQualityHold(sig Signals, minOutput int64) QualityVerdict {
+	if minOutput <= 0 {
+		minOutput = defaultQualityMinOutput
+	}
+	if sig.EncryptedFloor <= 0 {
+		sig.EncryptedFloor = encryptedFloorWithConfig(sig.ReasoningTokens, defaultEncryptedBytes, defaultEncryptedBytesPerToken)
+	}
+	if sig.EncryptedBytes > 0 && sig.EncryptedBytes >= sig.EncryptedFloor {
+		sig.HasThinking = true
+	}
+	switch {
+	case qualityIsBurstDump(sig, minOutput):
+		return QualityVerdict{Action: QualityActionWithhold, Class: ClassBufferedBurst, Reason: "short generation window dumped output", Signals: sig}
+	case qualityIsCipherDrool(sig, minOutput):
+		return QualityVerdict{Action: QualityActionWithhold, Class: ClassCipherDrool, Reason: "cipher-only stream is dumping visible text", Signals: sig}
+	case qualityIsFakeEncryptedDump(sig, minOutput):
+		return QualityVerdict{Action: QualityActionWithhold, Class: ClassFakeEncryptedDump, Reason: "encrypted or billed reasoning preceded a fast visible dump", Signals: sig}
+	case qualityIsFastReasoningRatioDump(sig):
+		return QualityVerdict{Action: QualityActionWithhold, Class: ClassFastReasoningRatio, Reason: "reasoning tokens dominate a fast visible dump", Signals: sig}
+	}
+	if sig.HasThinking {
+		if sig.HasReasoningDelta {
+			return QualityVerdict{Action: QualityActionDeliver, Class: ClassNone, Reason: "real reasoning delta observed", Signals: sig}
+		}
+		if sig.Terminal {
+			return QualityVerdict{Action: QualityActionDeliver, Class: ClassNone, Reason: "encrypted reasoning met the floor", Signals: sig}
+		}
+		if sig.VisibleTokens >= minOutput && sig.FirstVisible && sig.VisibleFlushMS >= defaultQualityFakeFlushMS {
+			return QualityVerdict{Action: QualityActionDeliver, Class: ClassNone, Reason: "encrypted reasoning with sustained visible output", Signals: sig}
+		}
+		return QualityVerdict{Action: QualityActionWait, Class: ClassNone, Reason: "waiting for encrypted reasoning evidence", Signals: sig}
+	}
+	output := sig.VisibleTokens
+	if output <= 0 {
+		output = sig.OutputTokens
+	}
+	enough := output >= minOutput
+	if sig.ReasoningStarted && !sig.Terminal && !sig.HoldExpired {
+		return QualityVerdict{Action: QualityActionWait, Class: ClassNone, Reason: "waiting for reasoning evidence", Signals: sig}
+	}
+	if sig.Terminal {
+		if output <= 0 {
+			return QualityVerdict{Action: QualityActionWait, Class: ClassNone, Reason: "empty terminal stream", Signals: sig}
+		}
+		if enough {
+			return QualityVerdict{Action: QualityActionWithhold, Class: ClassMissingThinking, Reason: "no real reasoning evidence", Signals: sig}
+		}
+		return QualityVerdict{Action: QualityActionDeliver, Class: ClassNone, Reason: "short response below thinking threshold", Signals: sig}
+	}
+	if enough {
+		return QualityVerdict{Action: QualityActionWithhold, Class: ClassMissingThinking, Reason: "no real reasoning evidence", Signals: sig}
+	}
+	if sig.HoldExpired {
+		if output <= 0 {
+			return QualityVerdict{Action: QualityActionWait, Class: ClassNone, Reason: "hold expired without output", Signals: sig}
+		}
+		if enough {
+			return QualityVerdict{Action: QualityActionWithhold, Class: ClassMissingThinking, Reason: "no real reasoning evidence", Signals: sig}
+		}
+		return QualityVerdict{Action: QualityActionDeliver, Class: ClassNone, Reason: "short response below thinking threshold", Signals: sig}
+	}
+	return QualityVerdict{Action: QualityActionWait, Class: ClassNone, Reason: "waiting for enough output", Signals: sig}
 }
-
 func isSemanticOnly(sig Signals) bool {
 	return sig.SemanticOutput && !sig.HasThinking && sig.VisibleTokens == 0
 }
 
+func isEmptyStream(sig Signals) bool {
+	return sig.Terminal && !sig.HasThinking && sig.ReasoningTokens <= 0 && sig.OutputTokens <= 0 && sig.VisibleTokens <= 0 && !sig.SemanticOutput
+}
+
+func classifyOutputSpeed(sig Signals, cfg QualityConfig, failClosed bool) (string, float64, int64) {
+	genMS := generationWindowMS(sig.DurationMS, sig.FirstTokenMS, sig.ReasoningTokens)
+	if genMS <= 0 || sig.OutputTokens <= 0 {
+		return ClassNone, 0, genMS
+	}
+	speed := tps(sig.OutputTokens, genMS)
+	if failClosed && cfg.MinGenerationMS > 0 && genMS < cfg.MinGenerationMS && speed >= cfg.SoftTPS {
+		return ClassBufferedBurst, speed, genMS
+	}
+	if speed >= cfg.HardTPS {
+		return ClassHardTPS, speed, genMS
+	}
+	if speed >= cfg.SoftTPS {
+		return ClassSoftTPS, speed, genMS
+	}
+	return ClassNone, speed, genMS
+}
+
+func classifyFinal(sig Signals, cfg QualityConfig, reasoningRequired bool, minOutput int64, streaming bool) QualityVerdict {
+	sig.EncryptedFloor = encryptedFloor(sig.ReasoningTokens, cfg)
+	if sig.EncryptedBytes > 0 && sig.EncryptedBytes >= sig.EncryptedFloor {
+		sig.HasThinking = true
+	}
+	if sig.OutputTokens <= 0 {
+		sig.OutputTokens = sig.VisibleTokens
+	}
+	sig.GenerationMS = generationWindowMS(sig.DurationMS, sig.FirstTokenMS, sig.ReasoningTokens)
+	sig.TPS = tps(sig.OutputTokens, sig.GenerationMS)
+	sig.Streaming = streaming
+	if isEmptyStream(sig) {
+		return QualityVerdict{Action: QualityActionWithhold, Class: ClassEmptyStream, Reason: "upstream stream completed without content", Signals: sig}
+	}
+	if streaming {
+		hold := ClassifyQualityHold(sig, minOutput)
+		if hold.Action == QualityActionWithhold {
+			if hold.Class == ClassMissingThinking && !reasoningRequired {
+				hold.Action = QualityActionDeliver
+				hold.Class = ClassNone
+				hold.Reason = "reasoning was disabled for this request"
+			} else {
+				return hold
+			}
+		}
+		sig = hold.Signals
+		if hold.Action == QualityActionWait {
+			if sig.SemanticOutput {
+				hold.Action = QualityActionDeliver
+				hold.Class = ClassNone
+			} else {
+				return QualityVerdict{Action: QualityActionWithhold, Class: ClassEmptyStream, Reason: "upstream stream completed without content", Signals: sig}
+			}
+		}
+	}
+	if reasoningRequired && !sig.HasThinking && !isSemanticOnly(sig) {
+		output := sig.VisibleTokens
+		if output <= 0 {
+			output = sig.OutputTokens
+		}
+		if output >= minOutput {
+			return QualityVerdict{Action: QualityActionWithhold, Class: ClassMissingThinking, Reason: "no real reasoning evidence", Signals: sig}
+		}
+	}
+	class, speed, gen := classifyOutputSpeed(sig, cfg, cfg.FailClosed)
+	sig.GenerationMS = gen
+	sig.TPS = speed
+	if class != ClassNone {
+		return QualityVerdict{Action: QualityActionWithhold, Class: class, Reason: outputSpeedReason(class), Signals: sig}
+	}
+	return QualityVerdict{Action: QualityActionDeliver, Class: ClassNone, Reason: "within_threshold", Signals: sig}
+}
+
+func classifyProbeResult(sig Signals, cfg QualityConfig, expectedMatched, thinkingRequired bool) QualityVerdict {
+	if !expectedMatched {
+		return QualityVerdict{Action: QualityActionWithhold, Class: ClassExpectedMarkerMissing, Reason: "expected marker missing", Signals: sig}
+	}
+	output := sig.OutputTokens
+	if output <= 0 {
+		output = sig.VisibleTokens
+	}
+	if output < cfg.MinPassiveOutputTokens {
+		return QualityVerdict{Action: QualityActionWithhold, Class: ClassInsufficientOutput, Reason: "insufficient output tokens", Signals: sig}
+	}
+	if thinkingRequired && output >= thinkingGuardMinOutputTokens && sig.ReasoningTokens <= 0 {
+		return QualityVerdict{Action: QualityActionWithhold, Class: ClassMissingThinking, Reason: "missing thinking", Signals: sig}
+	}
+	class, speed, gen := classifyOutputSpeed(sig, cfg, cfg.FailClosed)
+	sig.GenerationMS = gen
+	sig.TPS = speed
+	if class == ClassNone && cfg.FailClosed && gen < cfg.MinGenerationMS {
+		return QualityVerdict{Action: QualityActionWithhold, Class: ClassInsufficientGeneration, Reason: "insufficient generation window", Signals: sig}
+	}
+	if class != ClassNone {
+		return QualityVerdict{Action: QualityActionWithhold, Class: class, Reason: outputSpeedReason(class), Signals: sig}
+	}
+	return QualityVerdict{Action: QualityActionDeliver, Class: ClassNone, Reason: "within_threshold", Signals: sig}
+}
+
+func classifyPassiveAudit(sig Signals, cfg QualityConfig) QualityVerdict {
+	if !sig.Streaming {
+		return QualityVerdict{Action: QualityActionDeliver, Class: ClassIgnored, Reason: "not_build_stream", Signals: sig}
+	}
+	if !sig.Terminal || !sig.FirstTokenKnown {
+		return QualityVerdict{Action: QualityActionDeliver, Class: ClassIgnored, Reason: "missing_first_token", Signals: sig}
+	}
+	sig.GenerationMS = generationWindowMS(sig.DurationMS, sig.FirstTokenMS, sig.ReasoningTokens)
+	sig.TPS = tps(sig.OutputTokens, sig.GenerationMS)
+	if sig.GenerationMS <= 0 || sig.OutputTokens < cfg.MinPassiveOutputTokens {
+		return QualityVerdict{Action: QualityActionDeliver, Class: ClassIgnored, Reason: "insufficient_output_tokens", Signals: sig}
+	}
+	class, speed, gen := classifyOutputSpeed(sig, cfg, cfg.FailClosed)
+	sig.GenerationMS = gen
+	sig.TPS = speed
+	if class == ClassNone {
+		return QualityVerdict{Action: QualityActionDeliver, Class: ClassNone, Reason: "within_threshold", Signals: sig}
+	}
+	return QualityVerdict{Action: QualityActionWithhold, Class: class, Reason: outputSpeedReason(class), Signals: sig}
+}
+
+func classifyNonStreamResult(sig Signals, cfg QualityConfig, reasoningRequired bool, minOutput int64) QualityVerdict {
+	sig.Streaming = false
+	sig.Terminal = true
+	sig.EncryptedFloor = encryptedFloor(sig.ReasoningTokens, cfg)
+	if sig.EncryptedBytes > 0 && sig.EncryptedBytes >= sig.EncryptedFloor {
+		sig.HasThinking = true
+	}
+	if sig.OutputTokens <= 0 {
+		sig.OutputTokens = sig.VisibleTokens
+	}
+	sig.GenerationMS = generationWindowMS(sig.DurationMS, sig.FirstTokenMS, sig.ReasoningTokens)
+	sig.TPS = tps(sig.OutputTokens, sig.GenerationMS)
+	if isEmptyStream(sig) {
+		return QualityVerdict{Action: QualityActionWithhold, Class: ClassEmptyStream, Reason: "upstream response completed without content", Signals: sig}
+	}
+	if reasoningRequired && !sig.HasThinking && !isSemanticOnly(sig) {
+		output := sig.VisibleTokens
+		if output <= 0 {
+			output = sig.OutputTokens
+		}
+		if output >= minOutput {
+			return QualityVerdict{Action: QualityActionWithhold, Class: ClassMissingThinking, Reason: "no real reasoning evidence", Signals: sig}
+		}
+	}
+	class, speed, gen := classifyOutputSpeed(sig, cfg, false)
+	sig.GenerationMS = gen
+	sig.TPS = speed
+	if class != ClassNone {
+		return QualityVerdict{Action: QualityActionWithhold, Class: class, Reason: outputSpeedReason(class), Signals: sig}
+	}
+	if cfg.FailClosed && gen <= 0 && sig.OutputTokens >= minOutput {
+		return QualityVerdict{Action: QualityActionWithhold, Class: ClassInsufficientGeneration, Reason: "insufficient generation window", Signals: sig}
+	}
+	return QualityVerdict{Action: QualityActionDeliver, Class: ClassNone, Reason: "within_threshold", Signals: sig}
+}
+
+func outputSpeedReason(class string) string {
+	switch class {
+	case ClassBufferedBurst:
+		return "short generation window dumped output"
+	case ClassHardTPS:
+		return "output tokens per second exceeded hard threshold"
+	case ClassSoftTPS:
+		return "output tokens per second exceeded soft threshold"
+	default:
+		return ""
+	}
+}
 func reasoningRequired(body []byte) bool {
 	if len(body) == 0 {
 		return true
@@ -730,10 +1242,8 @@ func reasoningRequired(body []byte) bool {
 		return false
 	}
 	for _, key := range []string{"reasoning", "output_config", "thinking"} {
-		if raw, ok := payload[key]; ok {
-			if disabledReasoningValue(raw) {
-				return false
-			}
+		if raw, ok := payload[key]; ok && disabledReasoningValue(raw) {
+			return false
 		}
 	}
 	return true
@@ -764,6 +1274,7 @@ func disabledReasoningValue(value any) bool {
 	}
 	return false
 }
+
 func asString(value any) string {
 	switch typed := value.(type) {
 	case string:
@@ -835,4 +1346,11 @@ func numeric(value any) (int64, bool) {
 
 func strconvFormatInt(value int64) string {
 	return fmt.Sprintf("%d", value)
+}
+
+func maxInt64(left, right int64) int64 {
+	if left > right {
+		return left
+	}
+	return right
 }

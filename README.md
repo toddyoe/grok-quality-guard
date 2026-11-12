@@ -16,6 +16,7 @@ Grok Quality Guard 观测 Grok / xAI auth 的真实响应质量，识别 HTTP 20
 - 首次确认异常可配置为只观察或临时冷却，冷却到期通过固定 prompt 恢复探测
 - Resin 账号级租约绑定、显式轮换、批量绑定和代理清除；无 API 时可仅本地改写已有代理用户名
 - 内嵌中文化管理页，按概览、账号质量、Resin 租约、事件日志和设置分 Tab，账号、租约与事件列表支持分页
+- 账号详情展示最近尝试与脱敏质量判定依据，明确区分非质量错误和上一次真实质量结论
 - auth、proxy URL、Admin Token、xAI token 全程脱敏
 
 ## 质量判定要点
@@ -47,6 +48,27 @@ TPS = outputTokens * 1000 / generationWindow
 ```
 
 当 `reasoningTokens > 0`、`generationWindow < firstToken` 且 `generationWindow < 1000ms` 时，使用完整 `duration` 修正生成窗口。
+
+### 与参考实现的对齐
+
+流式判定按 `references/grok2api` 的 `ClassifyQualityHold` 与 `egress-quality-guard` 的审计逻辑实现：
+
+- dump 检测优先于“已有 thinking 就放行”，顺序为 `buffered_burst`、`cipher_drool`、`fake_encrypted_dump`、`fast_reasoning_ratio_dump`
+- `hold_expired` 后的短 visible 文本只有在 `reasoning_tokens >= 80` 时按 burst 处理
+- `fake_encrypted_dump` 与 `fast_reasoning_ratio_dump` 只在首个可见块后 2 秒内触发
+- 聚合 message 文本计入 visible token，但不伪造流式首个可见块的 flush 时间
+- `: grok2api-reasoning-evidence <bytes>` 作为密文字节数证据，仍必须满足密文下限
+- Chat、Responses 和 Anthropic Messages 的流式与非流式响应都使用同一套内容、thinking、密文下限、TPS 和空流规则
+
+被动审计只做可确认的样本速度审计：非流式、缺少 TTFT、输出不足 32 token 或生成窗口无效的样本记录为 `ignored`，不推断 `missing_thinking`。主动探测使用固定 marker，并在输出达到 64 token 且要求思考时检查 thinking 账单。非流式响应不做流式 burst/dump 推断，但仍检查空响应、缺少真实思考和可用的 TPS 证据。
+
+### 非质量错误与证据保留
+
+`ignored` 表示本次尝试不是质量信号，例如上游失败、非 Grok 请求、非流式被动样本、缺少 TTFT、输出不足或传输错误。它不会增加质量 strike，也不会覆盖上一次真实质量判定。
+
+`probe_error` / `proxy_error` 会记录为最近一次尝试并参与错误退避，但不会把上一次质量指标清空。管理页的“最近尝试”和“最近质量判定”分开显示，因此可以直接看出某次 `ignored` 或探测错误是否只是噪声。
+
+空流表示上游已经终止，但没有可见内容、真实思考证据、usage 输出或语义输出。空流使用独立的 15 分钟冷却，不会自动升级成 missing-thinking 永久禁用。
 
 ## 环境要求
 
@@ -154,6 +176,7 @@ plugins:
         soft_cross_verify: false
         thinking_cross_verify: false
         min_generation_ms: 1000
+        fail_closed: false
         min_passive_output_tokens: 32
         min_hold_output_tokens: 8
         hold_timeout: "30s"
@@ -203,6 +226,8 @@ plugins:
 - `consecutive_errors`：连续传输/代理错误达到次数后才进入处置；401/403、额度、限流和上游 5xx 等非质量错误只记录为 `ignored`，不计入 strike；默认 `2`
 - `consecutive_missing_thinking`：连续缺少真实思考达到次数后才进入处置；默认 `1`
 - `thinking_guard=false`：跳过缺少思考判定，只保留 TPS、空流等其他质量检查
+- `fail_closed=true`：生成窗口小于 `min_generation_ms` 且速度达到 `soft_tps` 时判定为 `buffered_burst`；窗口不足但速度不高时判定为 `insufficient_generation_window`
+- `ignored`、`probe_error`、`proxy_error` 不覆盖上一次真实质量指标；详情页会分别展示最近尝试和最近质量证据
 - `soft_cross_verify=true` 或 `thinking_cross_verify=true`：被动样本达到阈值后先启动后台主动探测，由探测结果确认后再处置；默认关闭
 - 任一健康样本会清零 `soft_strikes`、`error_strikes`、`thinking_strikes`，与旧插件的连续计数语义一致
 

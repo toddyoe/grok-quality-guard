@@ -23,6 +23,61 @@ type Metrics struct {
 	TPS             float64 `json:"tps"`
 }
 
+type QualityEvidence struct {
+	At                time.Time `json:"at,omitempty"`
+	Source            string    `json:"source,omitempty"`
+	Action            string    `json:"action,omitempty"`
+	Class             string    `json:"class,omitempty"`
+	Reason            string    `json:"reason,omitempty"`
+	Protocol          string    `json:"protocol,omitempty"`
+	Streaming         bool      `json:"streaming"`
+	Terminal          bool      `json:"terminal"`
+	HoldExpired       bool      `json:"hold_expired"`
+	HasThinking       bool      `json:"has_thinking"`
+	HasReasoningDelta bool      `json:"has_reasoning_delta"`
+	ReasoningStarted  bool      `json:"reasoning_started"`
+	SemanticOutput    bool      `json:"semantic_output"`
+	UsageReported     bool      `json:"usage_reported"`
+	VisibleRunes      int64     `json:"visible_runes"`
+	VisibleTokens     int64     `json:"visible_tokens"`
+	OutputTokens      int64     `json:"output_tokens"`
+	ReasoningTokens   int64     `json:"reasoning_tokens"`
+	EncryptedBytes    int64     `json:"encrypted_bytes"`
+	EncryptedFloor    int64     `json:"encrypted_floor"`
+	FirstTokenMS      int64     `json:"first_token_ms"`
+	DurationMS        int64     `json:"duration_ms"`
+	GenerationMS      int64     `json:"generation_ms"`
+	VisibleFlushMS    int64     `json:"visible_flush_ms"`
+	TPS               float64   `json:"tps"`
+	ChunkCount        int       `json:"chunk_count"`
+	ByteCount         int64     `json:"byte_count"`
+	EventCount        int       `json:"event_count"`
+	UnknownEvents     int       `json:"unknown_events"`
+	ParseFailures     int       `json:"parse_failures"`
+}
+
+func qualityEvidenceFromVerdict(verdict QualityVerdict, source string, at time.Time) *QualityEvidence {
+	sig := verdict.Signals
+	return &QualityEvidence{
+		At: at, Source: source, Action: verdict.Action, Class: verdict.Class, Reason: verdict.Reason,
+		Protocol: sig.Protocol, Streaming: sig.Streaming, Terminal: sig.Terminal, HoldExpired: sig.HoldExpired,
+		HasThinking: sig.HasThinking, HasReasoningDelta: sig.HasReasoningDelta, ReasoningStarted: sig.ReasoningStarted,
+		SemanticOutput: sig.SemanticOutput, UsageReported: sig.UsageReported,
+		VisibleRunes: sig.VisibleRunes, VisibleTokens: sig.VisibleTokens, OutputTokens: sig.OutputTokens,
+		ReasoningTokens: sig.ReasoningTokens, EncryptedBytes: sig.EncryptedBytes, EncryptedFloor: sig.EncryptedFloor,
+		FirstTokenMS: sig.FirstTokenMS, DurationMS: sig.DurationMS, GenerationMS: sig.GenerationMS,
+		VisibleFlushMS: sig.VisibleFlushMS, TPS: sig.TPS,
+		ChunkCount: sig.ChunkCount, ByteCount: sig.ByteCount, EventCount: sig.EventCount,
+		UnknownEvents: sig.UnknownEvents, ParseFailures: sig.ParseFailures,
+	}
+}
+
+type AttemptEvidence struct {
+	At     time.Time `json:"at,omitempty"`
+	Source string    `json:"source,omitempty"`
+	Class  string    `json:"class,omitempty"`
+	Reason string    `json:"reason,omitempty"`
+}
 type ResinState struct {
 	Managed    bool   `json:"managed"`
 	Account    string `json:"account"`
@@ -30,24 +85,26 @@ type ResinState struct {
 }
 
 type AccountState struct {
-	AuthID                       string     `json:"auth_id"`
-	Email                        string     `json:"email,omitempty"`
-	Label                        string     `json:"label,omitempty"`
-	State                        string     `json:"state"`
-	LastReason                   string     `json:"last_reason,omitempty"`
-	FirstSeenAt                  time.Time  `json:"first_seen_at,omitempty"`
-	LastObservedAt               time.Time  `json:"last_observed_at,omitempty"`
-	LastProbeAt                  time.Time  `json:"last_probe_at,omitempty"`
-	CooldownUntil                time.Time  `json:"cooldown_until,omitempty"`
-	QualityStrikeMissingThinking bool       `json:"quality_strike_missing_thinking"`
-	SoftStrikes                  int        `json:"soft_strikes,omitempty"`
-	ErrorStrikes                 int        `json:"error_strikes,omitempty"`
-	ThinkingStrikes              int        `json:"thinking_strikes,omitempty"`
-	ProbeBackoffUntil            time.Time  `json:"probe_backoff_until,omitempty"`
-	DisableKind                  string     `json:"disable_kind,omitempty"`
-	PreviousDisabled             bool       `json:"previous_disabled,omitempty"`
-	Resin                        ResinState `json:"resin"`
-	Metrics                      Metrics    `json:"metrics"`
+	AuthID                       string           `json:"auth_id"`
+	Email                        string           `json:"email,omitempty"`
+	Label                        string           `json:"label,omitempty"`
+	State                        string           `json:"state"`
+	LastReason                   string           `json:"last_reason,omitempty"`
+	LastAttempt                  *AttemptEvidence `json:"last_attempt,omitempty"`
+	LastEvidence                 *QualityEvidence `json:"last_evidence,omitempty"`
+	FirstSeenAt                  time.Time        `json:"first_seen_at,omitempty"`
+	LastObservedAt               time.Time        `json:"last_observed_at,omitempty"`
+	LastProbeAt                  time.Time        `json:"last_probe_at,omitempty"`
+	CooldownUntil                time.Time        `json:"cooldown_until,omitempty"`
+	QualityStrikeMissingThinking bool             `json:"quality_strike_missing_thinking"`
+	SoftStrikes                  int              `json:"soft_strikes,omitempty"`
+	ErrorStrikes                 int              `json:"error_strikes,omitempty"`
+	ThinkingStrikes              int              `json:"thinking_strikes,omitempty"`
+	ProbeBackoffUntil            time.Time        `json:"probe_backoff_until,omitempty"`
+	DisableKind                  string           `json:"disable_kind,omitempty"`
+	PreviousDisabled             bool             `json:"previous_disabled,omitempty"`
+	Resin                        ResinState       `json:"resin"`
+	Metrics                      Metrics          `json:"metrics"`
 }
 
 type Event struct {
@@ -395,6 +452,14 @@ func cloneState(state State) State {
 			continue
 		}
 		copied := *account
+		if account.LastAttempt != nil {
+			attempt := *account.LastAttempt
+			copied.LastAttempt = &attempt
+		}
+		if account.LastEvidence != nil {
+			evidence := *account.LastEvidence
+			copied.LastEvidence = &evidence
+		}
 		clone.Accounts[key] = &copied
 	}
 	if state.Events != nil {

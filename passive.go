@@ -113,9 +113,6 @@ func (p *Plugin) HandleUsage(request []byte) {
 	if record.AuthID == "" || p.isProbeAuth(record.AuthID) {
 		return
 	}
-	if record.Failed {
-		return
-	}
 	p.mu.RLock()
 	policy := p.policy
 	p.mu.RUnlock()
@@ -130,43 +127,40 @@ func (p *Plugin) HandleUsage(request []byte) {
 	pending := p.pending[record.RequestID]
 	delete(p.pending, record.RequestID)
 	p.pendingMu.Unlock()
+	if record.Failed {
+		_ = p.ApplyVerdict(context.Background(), record.AuthID, QualityVerdict{Class: ClassIgnored, Reason: "unsuccessful"}, "passive", "")
+		return
+	}
 
 	sig := Signals{
 		Terminal:        true,
 		Streaming:       record.Stream,
 		FirstTokenMS:    record.TTFT.Milliseconds(),
+		FirstTokenKnown: record.TTFT > 0,
 		DurationMS:      record.Latency.Milliseconds(),
 		OutputTokens:    record.Detail.OutputTokens,
 		ReasoningTokens: record.Detail.ReasoningTokens,
 		UsageReported:   true,
 	}
-	body := []byte(nil)
 	if pending != nil {
-		body = pending.Body
 		sig = pending.Analyzer.Finalize(true)
 		sig.Streaming = record.Stream
+		sig.Terminal = true
 		sig.UsageReported = true
 		if record.TTFT > 0 {
 			sig.FirstTokenMS = record.TTFT.Milliseconds()
+			sig.FirstTokenKnown = true
 		}
 		if record.Latency > 0 {
 			sig.DurationMS = record.Latency.Milliseconds()
 		}
-		if record.Detail.OutputTokens > 0 {
-			sig.OutputTokens = record.Detail.OutputTokens
-		}
-		if record.Detail.ReasoningTokens >= 0 {
-			sig.ReasoningTokens = record.Detail.ReasoningTokens
-		}
+		sig.OutputTokens = record.Detail.OutputTokens
+		sig.ReasoningTokens = maxInt64(0, record.Detail.ReasoningTokens)
 		sig.GenerationMS = generationWindowMS(sig.DurationMS, sig.FirstTokenMS, sig.ReasoningTokens)
 		sig.TPS = tps(sig.OutputTokens, sig.GenerationMS)
 	}
-	required := policy.Quality.ThinkingGuard && reasoningRequired(body)
-	if pending == nil {
-		required = false
-	}
-	minOutput := policy.Quality.MinPassiveOutputTokens
-	verdict := classifyFinal(sig, policy.Quality, required, minOutput, record.Stream)
+	verdict := classifyPassiveAudit(sig, policy.Quality)
+
 	if errApply := p.ApplyVerdict(context.Background(), record.AuthID, verdict, "passive", ""); errApply != nil {
 		_ = p.recordInternalError(record.AuthID, errApply)
 	}

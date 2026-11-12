@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
@@ -139,6 +140,7 @@ func (p *Plugin) ProbeAccount(ctx context.Context, authID string, force bool, ca
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	body := probeBody(probeCfg)
+	probeStartedAt := time.Now()
 	stream, errStream := p.executeModelStream(probeCtx, pluginapi.HostModelExecutionRequest{
 		EntryProtocol:  probeCfg.EntryProtocol,
 		ExitProtocol:   probeCfg.ExitProtocol,
@@ -151,35 +153,36 @@ func (p *Plugin) ProbeAccount(ctx context.Context, authID string, force bool, ca
 		ProxyURL:       strings.TrimSpace(authRawString(raw, "proxy_url")),
 	}, callbackID)
 	if errStream != nil {
-		return p.handleProbeFailure(authID, raw, response, reEnabled, classifyTransportError(errStream), errStream)
+		return p.handleProbeFailure(authID, raw, response, reEnabled, QualityVerdict{Class: classifyTransportError(errStream), Reason: "probe transport error"}, errStream)
 	}
 	defer p.closeModelStream(stream.StreamID)
 	if stream.StatusCode < 200 || stream.StatusCode >= 300 {
-		return p.handleProbeFailure(authID, raw, response, reEnabled, classifyProbeStatus(stream.StatusCode), fmt.Errorf("probe upstream status %d", stream.StatusCode))
+		return p.handleProbeFailure(authID, raw, response, reEnabled, QualityVerdict{Class: classifyProbeStatus(stream.StatusCode), Reason: fmt.Sprintf("upstream status %d", stream.StatusCode)}, fmt.Errorf("probe upstream status %d", stream.StatusCode))
 	}
-	analyzer := NewStreamAnalyzer()
+	analyzer := NewStreamAnalyzerWithProtocol(probeCfg.ExitProtocol)
+	analyzer.SetEncryptedConfig(qualityCfg.MinEncryptedBytes, qualityCfg.EncryptedBytesPerReasoningToken)
 	var bufferBytes int64
 	var terminal bool
 	for {
 		select {
 		case <-probeCtx.Done():
-			return p.handleProbeFailure(authID, raw, response, reEnabled, ClassProbeError, probeCtx.Err())
+			return p.handleProbeFailure(authID, raw, response, reEnabled, QualityVerdict{Class: ClassProbeError, Reason: "probe context ended"}, probeCtx.Err())
 		default:
 		}
 		read, errRead := p.readModelStreamContext(probeCtx, stream.StreamID)
 		if errRead != nil {
-			return p.handleProbeFailure(authID, raw, response, reEnabled, classifyTransportError(errRead), errRead)
+			return p.handleProbeFailure(authID, raw, response, reEnabled, QualityVerdict{Class: classifyTransportError(errRead), Reason: "probe stream read error"}, errRead)
 		}
 		if len(read.Payload) > 0 {
 			bufferBytes += int64(len(read.Payload))
 			if bufferBytes > qualityCfg.HoldMaxBufferBytes {
-				return p.handleProbeFailure(authID, raw, response, reEnabled, ClassProbeError, fmt.Errorf("probe response exceeded buffer limit"))
+				return p.handleProbeFailure(authID, raw, response, reEnabled, QualityVerdict{Class: ClassProbeError, Reason: "probe response exceeded buffer limit"}, fmt.Errorf("probe response exceeded buffer limit"))
 			}
 			analyzer.ObserveChunk(read.Payload)
 		}
 		if read.Error != "" {
 			readErr := fmt.Errorf("%s", read.Error)
-			return p.handleProbeFailure(authID, raw, response, reEnabled, classifyTransportError(readErr), readErr)
+			return p.handleProbeFailure(authID, raw, response, reEnabled, QualityVerdict{Class: classifyTransportError(readErr), Reason: "probe stream error"}, readErr)
 		}
 		if read.Done {
 			terminal = true
@@ -187,10 +190,12 @@ func (p *Plugin) ProbeAccount(ctx context.Context, authID string, force bool, ca
 		}
 	}
 	sig := analyzer.Finalize(terminal)
-	sig.FirstTokenMS = 0
-	verdict := classifyFinal(sig, qualityCfg, qualityCfg.ThinkingGuard, qualityCfg.MinPassiveOutputTokens, true)
-	markerOK := strings.Contains(sig.VisibleText, probeMarker)
-	if verdict.Class == ClassNone && markerOK && sig.VisibleTokens >= qualityCfg.MinPassiveOutputTokens {
+	sig.DurationMS = time.Since(probeStartedAt).Milliseconds()
+	sig.GenerationMS = generationWindowMS(sig.DurationMS, sig.FirstTokenMS, sig.ReasoningTokens)
+	sig.TPS = tps(sig.OutputTokens, sig.GenerationMS)
+	markerOK := matchProbeMarker(sig.VisibleText, probeMarker)
+	verdict := classifyProbeResult(sig, qualityCfg, markerOK, qualityCfg.ThinkingGuard)
+	if verdict.Class == ClassNone {
 		if errSuccess := p.markProbeSuccess(authID, raw, response, sig); errSuccess != nil {
 			return errSuccess
 		}
@@ -201,7 +206,7 @@ func (p *Plugin) ProbeAccount(ctx context.Context, authID string, force bool, ca
 	if class == ClassNone {
 		class = ClassProbeError
 	}
-	return p.handleProbeFailure(authID, raw, response, reEnabled, class, fmt.Errorf("probe did not satisfy quality marker"))
+	return p.handleProbeFailure(authID, raw, response, reEnabled, verdict, fmt.Errorf("probe quality check failed: %s", verdict.Reason))
 }
 
 func (p *Plugin) markProbeSuccess(authID string, raw map[string]json.RawMessage, response pluginapi.HostAuthGetResponse, sig Signals) error {
@@ -222,11 +227,16 @@ func (p *Plugin) markProbeSuccess(authID string, raw map[string]json.RawMessage,
 			return errSave
 		}
 	}
+	now := time.Now().UTC()
+	verdict := QualityVerdict{Class: ClassNone, Reason: "probe passed", Signals: sig}
 	return p.stateStore().Update(func(state *State) error {
 		account := p.ensureStateAccount(state, authID, "", "")
 		account.State = StateHealthy
-		account.LastProbeAt = time.Now().UTC()
+		account.LastProbeAt = now
+		account.LastObservedAt = now
 		account.LastReason = ""
+		account.LastAttempt = &AttemptEvidence{At: now, Source: "probe", Class: ClassNone, Reason: "probe passed"}
+		account.LastEvidence = qualityEvidenceFromVerdict(verdict, "probe", now)
 		account.CooldownUntil = time.Time{}
 		account.ProbeBackoffUntil = time.Time{}
 		account.DisableKind = ""
@@ -249,14 +259,14 @@ func (p *Plugin) markProbeSuccess(authID string, raw map[string]json.RawMessage,
 	})
 }
 
-func (p *Plugin) handleProbeFailure(authID string, raw map[string]json.RawMessage, response pluginapi.HostAuthGetResponse, reEnabled bool, class string, errProbe error) error {
+func (p *Plugin) handleProbeFailure(authID string, raw map[string]json.RawMessage, response pluginapi.HostAuthGetResponse, reEnabled bool, verdict QualityVerdict, errProbe error) error {
 	if errProbe != nil {
 		_ = p.recordInternalError(authID, errProbe)
 	}
 	_, errApply := p.applyVerdictLocked(
 		context.Background(),
 		authID,
-		QualityVerdict{Class: class},
+		verdict,
 		"probe",
 		"",
 		raw,
@@ -275,6 +285,22 @@ func (p *Plugin) saveAuthDisabled(name string, raw map[string]json.RawMessage, d
 	return errSave
 }
 
+func matchProbeMarker(text, expected string) bool {
+	expected = strings.TrimSpace(expected)
+	if expected == "" {
+		return true
+	}
+	text = strings.TrimRightFunc(text, unicode.IsSpace)
+	lines := strings.Split(text, "\n")
+	for index := len(lines) - 1; index >= 0; index-- {
+		line := strings.TrimSpace(lines[index])
+		if line == "" {
+			continue
+		}
+		return strings.EqualFold(line, expected)
+	}
+	return false
+}
 func probeBody(cfg ProbeConfig) []byte {
 	model := strings.TrimSpace(cfg.Model)
 	if model == "" {
