@@ -95,11 +95,11 @@ func TestAnthropicNonStreamMessage(t *testing.T) {
 
 func TestProbeThinkingGuardRequiresMinimumOutput(t *testing.T) {
 	config := DefaultQualityConfig()
-	below := classifyProbeResult(Signals{OutputTokens: 63, FirstTokenMS: 100, DurationMS: 1100}, config, true, true)
+	below := classifyProbeResult(Signals{Terminal: true, OutputTokens: 63, FirstTokenMS: 100, DurationMS: 1100}, config, true, true)
 	if below.Class != ClassNone {
 		t.Fatalf("probe below thinking guard threshold class = %q", below.Class)
 	}
-	atThreshold := classifyProbeResult(Signals{OutputTokens: 64, FirstTokenMS: 100, DurationMS: 1100}, config, true, true)
+	atThreshold := classifyProbeResult(Signals{Terminal: true, OutputTokens: 64, FirstTokenMS: 100, DurationMS: 1100}, config, true, true)
 	if atThreshold.Class != ClassMissingThinking {
 		t.Fatalf("probe at thinking guard threshold class = %q", atThreshold.Class)
 	}
@@ -117,11 +117,11 @@ func TestProbeMarkerUsesLastNonEmptyLine(t *testing.T) {
 func TestFailClosedProbeClassification(t *testing.T) {
 	config := DefaultQualityConfig()
 	config.FailClosed = true
-	burst := classifyProbeResult(Signals{OutputTokens: 400, FirstTokenMS: 100, DurationMS: 600}, config, true, false)
+	burst := classifyProbeResult(Signals{Terminal: true, OutputTokens: 400, FirstTokenMS: 100, DurationMS: 600}, config, true, false)
 	if burst.Class != ClassBufferedBurst {
 		t.Fatalf("fail-closed burst class = %q", burst.Class)
 	}
-	insufficient := classifyProbeResult(Signals{OutputTokens: 128, FirstTokenMS: 100, DurationMS: 600}, config, true, false)
+	insufficient := classifyProbeResult(Signals{Terminal: true, OutputTokens: 128, FirstTokenMS: 100, DurationMS: 600}, config, true, false)
 	if insufficient.Class != ClassInsufficientGeneration {
 		t.Fatalf("fail-closed generation class = %q", insufficient.Class)
 	}

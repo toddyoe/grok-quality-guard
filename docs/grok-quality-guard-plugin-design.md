@@ -912,7 +912,7 @@ passive 发现 confirmed anomaly 时：
 ### 8.1 固定 prompt
 
 ```text
-Write exactly 16 numbered lines about reliable distributed systems. Each line must be one complete English sentence, with no markdown heading. The final line must end with the exact marker QUALITY_OK.
+先用三点总结为什么天空呈蓝色，最后一行只输出 QUALITY_OK。
 ```
 
 期望 marker：
@@ -944,7 +944,7 @@ QUALITY_OK
 2. 无质量异常分类
 3. 包含真实 thinking 证据
 4. visible output >= 32 tokens
-5. 最终文本包含 `QUALITY_OK`
+5. 最后一个非空行等于 `QUALITY_OK`
 
 ### 8.3 调度
 

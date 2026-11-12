@@ -13,7 +13,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
-const probePrompt = "Write exactly 16 numbered lines about reliable distributed systems. Each line must be one complete English sentence, with no markdown heading. The final line must end with the exact marker QUALITY_OK."
+const probePrompt = "先用三点总结为什么天空呈蓝色，最后一行只输出 QUALITY_OK。"
 const probeMarker = "QUALITY_OK"
 
 func (p *Plugin) probeLoop(ctx context.Context) {

@@ -98,6 +98,95 @@ func TestProbeSuccessReenablesCooldownAndClearsStrikes(t *testing.T) {
 		t.Fatal("probe success did not clear the missing-thinking strike")
 	}
 }
+func TestReconcileReleasesLegacyMarkerParseCooldown(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	plugin := newTestPlugin(t, host, func(cfg *Config) { cfg.AutoAction = "cooldown_only" })
+	verdict := QualityVerdict{Class: ClassExpectedMarkerMissing, Signals: Signals{
+		Streaming:  true,
+		ByteCount:  62000,
+		EventCount: 1,
+	}}
+	if errApply := plugin.ApplyVerdict(context.Background(), "auth-1", verdict, "probe", ""); errApply != nil {
+		t.Fatal(errApply)
+	}
+	before, _ := plugin.stateAccount("auth-1")
+	if before.State != StateCooling || before.LastEvidence == nil {
+		t.Fatalf("legacy cooldown was not established: %#v", before)
+	}
+	if errReconcile := plugin.Reconcile(context.Background()); errReconcile != nil {
+		t.Fatal(errReconcile)
+	}
+	after, _ := plugin.stateAccount("auth-1")
+	if after.State != StateSuspect || !after.CooldownUntil.IsZero() || after.DisableKind != "" {
+		t.Fatalf("legacy cooldown was not released: %#v", after)
+	}
+	saved, errDecode := rawAuthToMap(host.auths["auth-1"])
+	if errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if authDisabled(saved) || guardMeta(saved).DisableKind != "" || guardMeta(saved).CooldownUntil != "" {
+		t.Fatalf("legacy cooldown metadata was not cleared: %#v", saved)
+	}
+	released := false
+	for _, event := range plugin.store.Snapshot().Events {
+		if event.AuthID == "auth-1" && event.Action == "probe" && event.Result == "released" {
+			released = true
+			break
+		}
+	}
+	if !released {
+		t.Fatal("legacy cooldown release was not recorded")
+	}
+}
+
+func TestProbeParsesHostLineChunksWithoutNewlines(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	host.scriptStream("auth-1", []pluginapi.HostModelStreamReadResponse{
+		streamData(": grok2api-reasoning-start"),
+		streamData("event: response.reasoning_summary_text.delta"),
+		streamData(`data: {"type":"response.reasoning_summary_text.delta","delta":"plan carefully"}`),
+		streamData("event: response.output_text.delta"),
+		streamData(`data: {"type":"response.output_text.delta","delta":"QUALITY_OK"}`),
+		streamData("event: response.completed"),
+		streamData(`data: {"response":{"usage":{"output_tokens":64,"output_tokens_details":{"reasoning_tokens":8}}}}`),
+		{Done: true},
+	}...)
+	plugin := newTestPlugin(t, host, func(cfg *Config) {
+		cfg.Quality.SoftTPS = 1e9
+		cfg.Quality.HardTPS = 2e9
+	})
+	if errProbe := plugin.ProbeAccount(context.Background(), "auth-1", true, ""); errProbe != nil {
+		t.Fatal(errProbe)
+	}
+	account, _ := plugin.stateAccount("auth-1")
+	if account.State != StateHealthy {
+		t.Fatalf("newline-less host chunks were not treated as healthy: %#v", account)
+	}
+}
+
+func TestProbeBodyUsesQualityMarkerProfilePrompt(t *testing.T) {
+	body := probeBody(DefaultProbeConfig())
+	var payload struct {
+		Input []struct {
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"input"`
+	}
+	if errUnmarshal := json.Unmarshal(body, &payload); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if len(payload.Input) != 1 || len(payload.Input[0].Content) != 1 {
+		t.Fatalf("unexpected probe body: %s", body)
+	}
+	want := "先用三点总结为什么天空呈蓝色，最后一行只输出 QUALITY_OK。"
+	if payload.Input[0].Content[0].Text != want {
+		t.Fatalf("probe prompt = %q, want %q", payload.Input[0].Content[0].Text, want)
+	}
+}
+
 func TestProbeBackoffGrowsAndCaps(t *testing.T) {
 	cfg := DefaultProbeConfig()
 	now := time.Now().UTC()
@@ -149,6 +238,7 @@ func TestProbeMarkerMissingRecordsQualityEventOnly(t *testing.T) {
 	host := newMockHostCall(entries, auths)
 	host.scriptStream("auth-1", []pluginapi.HostModelStreamReadResponse{
 		streamData("data: {\"choices\":[{\"delta\":{\"content\":\"wrong answer\"}}]}\n\n"),
+		streamData("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":4}}\n\n"),
 		{Done: true},
 	}...)
 	plugin := newTestPlugin(t, host, func(cfg *Config) { cfg.AutoAction = "observe" })
@@ -174,6 +264,36 @@ func TestProbeMarkerMissingRecordsQualityEventOnly(t *testing.T) {
 	}
 	if qualityEvents != 1 {
 		t.Fatalf("marker missing quality events = %d, events=%#v", qualityEvents, state.Events)
+	}
+}
+
+func TestProbeUnparsedStreamRecordsProbeErrorNotQualityMiss(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	host.scriptStream("auth-1", []pluginapi.HostModelStreamReadResponse{
+		streamData("not-an-sse-frame"),
+		{Done: true},
+	}...)
+	plugin := newTestPlugin(t, host, func(cfg *Config) {
+		cfg.AutoAction = "cooldown_then_disable"
+		cfg.Quality.ConsecutiveErrors = 2
+	})
+	if errProbe := plugin.ProbeAccount(context.Background(), "auth-1", true, ""); errProbe != nil {
+		t.Fatal(errProbe)
+	}
+	account, _ := plugin.stateAccount("auth-1")
+	if account.ErrorStrikes != 1 || account.LastAttempt == nil || account.LastAttempt.Class != ClassProbeError {
+		t.Fatalf("unparseable probe was not recorded as probe_error: %#v", account)
+	}
+	if account.State == StateCooling || account.State == StateDisabledByGuard {
+		t.Fatalf("unparseable probe cooled account: %#v", account)
+	}
+	saved, errDecode := rawAuthToMap(host.auths["auth-1"])
+	if errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if authDisabled(saved) {
+		t.Fatal("unparseable probe disabled auth")
 	}
 }
 

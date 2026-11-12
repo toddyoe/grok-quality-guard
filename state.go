@@ -52,6 +52,7 @@ type QualityEvidence struct {
 	ChunkCount        int       `json:"chunk_count"`
 	ByteCount         int64     `json:"byte_count"`
 	EventCount        int       `json:"event_count"`
+	ParsedEvents      int       `json:"parsed_events"`
 	UnknownEvents     int       `json:"unknown_events"`
 	ParseFailures     int       `json:"parse_failures"`
 }
@@ -68,7 +69,7 @@ func qualityEvidenceFromVerdict(verdict QualityVerdict, source string, at time.T
 		FirstTokenMS: sig.FirstTokenMS, DurationMS: sig.DurationMS, GenerationMS: sig.GenerationMS,
 		VisibleFlushMS: sig.VisibleFlushMS, TPS: sig.TPS,
 		ChunkCount: sig.ChunkCount, ByteCount: sig.ByteCount, EventCount: sig.EventCount,
-		UnknownEvents: sig.UnknownEvents, ParseFailures: sig.ParseFailures,
+		ParsedEvents: sig.ParsedEvents, UnknownEvents: sig.UnknownEvents, ParseFailures: sig.ParseFailures,
 	}
 }
 

@@ -74,6 +74,7 @@ type Signals struct {
 	ChunkCount        int
 	ByteCount         int64
 	EventCount        int
+	ParsedEvents      int
 	UnknownEvents     int
 	ParseFailures     int
 }
@@ -92,12 +93,13 @@ type SSEEvent struct {
 }
 
 type SSEParser struct {
-	buffer  []byte
-	event   string
-	data    []string
-	comment string
+	buffer []byte
+	event  string
 }
 
+// Feed consumes host model stream chunks. CPA forwards each executor SSE line
+// without its trailing newline, so complete field lines must be handled as soon
+// as they arrive instead of waiting for a newline that never comes.
 func (p *SSEParser) Feed(chunk []byte) []SSEEvent {
 	if p == nil || len(chunk) == 0 {
 		return nil
@@ -109,12 +111,15 @@ func (p *SSEParser) Feed(chunk []byte) []SSEEvent {
 		if idx < 0 {
 			break
 		}
-		line := p.buffer[:idx]
+		line := strings.TrimSuffix(string(p.buffer[:idx]), "\r")
 		p.buffer = p.buffer[idx+1:]
-		if len(line) > 0 && line[len(line)-1] == '\r' {
-			line = line[:len(line)-1]
+		if ev, ok := p.processLine(line); ok {
+			events = append(events, ev)
 		}
-		if ev, ok := p.processLine(string(line)); ok {
+	}
+	if remainder := strings.TrimSuffix(string(p.buffer), "\r"); remainder != "" && sseLineComplete(remainder) {
+		p.buffer = nil
+		if ev, ok := p.processLine(remainder); ok {
 			events = append(events, ev)
 		}
 	}
@@ -133,47 +138,64 @@ func (p *SSEParser) Flush() []SSEEvent {
 			events = append(events, ev)
 		}
 	}
-	if ev, ok := p.dispatch(); ok {
-		events = append(events, ev)
-	}
+	p.event = ""
 	return events
+}
+
+// sseLineComplete reports whether an unterminated chunk is already a complete
+// SSE field line. JSON is accepted only when it parses, so a payload split
+// across chunks stays buffered.
+func sseLineComplete(line string) bool {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return false
+	}
+	if strings.HasPrefix(line, "event:") || strings.HasPrefix(line, ":") {
+		return true
+	}
+	if data, ok := strings.CutPrefix(line, "data:"); ok {
+		data = strings.TrimSpace(data)
+		return data == "" || data == "[DONE]" || json.Valid([]byte(data))
+	}
+	if line == "[DONE]" {
+		return true
+	}
+	if line[0] == '{' || line[0] == '[' {
+		return json.Valid([]byte(line))
+	}
+	return false
 }
 
 func (p *SSEParser) processLine(line string) (SSEEvent, bool) {
 	if line == "" {
-		return p.dispatch()
+		// A blank line terminates an SSE frame without carrying data.
+		p.event = ""
+		return SSEEvent{}, false
 	}
 	if strings.HasPrefix(line, ":") {
-		p.comment = strings.TrimSpace(strings.TrimPrefix(line, ":"))
-		return SSEEvent{}, false
+		return SSEEvent{Comment: strings.TrimSpace(strings.TrimPrefix(line, ":"))}, true
 	}
-	field, value, ok := strings.Cut(line, ":")
-	if !ok {
-		field = line
-		value = ""
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "[DONE]" || ((strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[")) && json.Valid([]byte(trimmed))) {
+		ev := SSEEvent{Event: p.event, Data: trimmed}
+		p.event = ""
+		return ev, true
 	}
+	field, value, _ := strings.Cut(line, ":")
 	value = strings.TrimPrefix(value, " ")
-	switch field {
-	case "event":
+	if field == "event" {
 		p.event = value
-	case "data":
-		p.data = append(p.data, value)
-	}
-	return SSEEvent{}, false
-}
-
-func (p *SSEParser) dispatch() (SSEEvent, bool) {
-	if p.event == "" && len(p.data) == 0 && p.comment == "" {
 		return SSEEvent{}, false
 	}
-	ev := SSEEvent{
-		Event:   p.event,
-		Data:    strings.Join(p.data, "\n"),
-		Comment: p.comment,
+	if field != "data" {
+		return SSEEvent{}, false
 	}
+	data := strings.TrimSpace(value)
+	if data == "" {
+		return SSEEvent{}, false
+	}
+	ev := SSEEvent{Event: p.event, Data: data}
 	p.event = ""
-	p.data = nil
-	p.comment = ""
 	return ev, true
 }
 
@@ -284,7 +306,7 @@ func (a *StreamAnalyzer) ObserveJSON(raw []byte) {
 	if a == nil || len(raw) == 0 {
 		return
 	}
-	a.observePayload(raw, time.Now())
+	a.observePayload(raw, "", time.Now())
 }
 
 func (a *StreamAnalyzer) observeEvent(ev SSEEvent, now time.Time) {
@@ -315,18 +337,31 @@ func (a *StreamAnalyzer) observeEvent(ev SSEEvent, now time.Time) {
 		a.terminalAt = now
 		return
 	}
-	a.observePayload([]byte(data), now)
-	if strings.EqualFold(ev.Event, "response.completed") || strings.EqualFold(ev.Event, "response.done") || strings.EqualFold(ev.Event, "message_stop") {
+	a.observePayload([]byte(data), ev.Event, now)
+	if sseEventIsTerminal(ev.Event) {
 		a.signals.Terminal = true
 		a.terminalAt = now
 	}
 }
 
-func (a *StreamAnalyzer) observePayload(raw []byte, now time.Time) {
+func sseEventIsTerminal(event string) bool {
+	switch strings.ToLower(strings.TrimSpace(event)) {
+	case "response.completed", "response.done", "response.incomplete", "response.failed", "message_stop":
+		return true
+	default:
+		return false
+	}
+}
+
+func (a *StreamAnalyzer) observePayload(raw []byte, fallbackEvent string, now time.Time) {
 	var payload map[string]any
 	if errUnmarshal := json.Unmarshal(raw, &payload); errUnmarshal != nil {
 		a.signals.ParseFailures++
 		return
+	}
+	a.signals.ParsedEvents++
+	if fallbackEvent != "" && payload != nil && strings.TrimSpace(asString(payload["type"])) == "" {
+		payload["type"] = fallbackEvent
 	}
 	protocol := a.protocol
 	if protocol == "" {
@@ -846,6 +881,7 @@ func (a *StreamAnalyzer) snapshot(final bool) Signals {
 	sig.ChunkCount = a.signals.ChunkCount
 	sig.ByteCount = a.signals.ByteCount
 	sig.EventCount = a.signals.EventCount
+	sig.ParsedEvents = a.signals.ParsedEvents
 	sig.UnknownEvents = a.signals.UnknownEvents
 	sig.ParseFailures = a.signals.ParseFailures
 	return sig
@@ -1135,7 +1171,22 @@ func classifyFinal(sig Signals, cfg QualityConfig, reasoningRequired bool, minOu
 	return QualityVerdict{Action: QualityActionDeliver, Class: ClassNone, Reason: "within_threshold", Signals: sig}
 }
 
+func probeStreamUnparsed(sig Signals) bool {
+	return sig.ByteCount > 0 &&
+		sig.ParsedEvents == 0 &&
+		sig.VisibleTokens <= 0 &&
+		sig.OutputTokens <= 0 &&
+		sig.ReasoningTokens <= 0 &&
+		!sig.SemanticOutput
+}
+
 func classifyProbeResult(sig Signals, cfg QualityConfig, expectedMatched, thinkingRequired bool) QualityVerdict {
+	if probeStreamUnparsed(sig) {
+		return QualityVerdict{Action: QualityActionWithhold, Class: ClassProbeError, Reason: "probe stream produced no parseable events", Signals: sig}
+	}
+	if !sig.Terminal {
+		return QualityVerdict{Action: QualityActionWithhold, Class: ClassProbeError, Reason: "probe stream ended without a terminal event", Signals: sig}
+	}
 	if !expectedMatched {
 		return QualityVerdict{Action: QualityActionWithhold, Class: ClassExpectedMarkerMissing, Reason: "expected marker missing", Signals: sig}
 	}

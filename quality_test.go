@@ -166,3 +166,42 @@ func TestReasoningDisabledBody(t *testing.T) {
 		t.Fatal("reasoning effort high should require thinking evidence")
 	}
 }
+
+func TestSSEParserHandlesHostLineChunks(t *testing.T) {
+	analyzer := NewStreamAnalyzerWithProtocol(qualityProtocolResponses)
+	analyzer.ObserveChunk([]byte("event: response.output_text.delta"))
+	analyzer.ObserveChunk([]byte(`data: {"type":"response.output_text.delta","delta":"QUALITY_OK"}`))
+	analyzer.ObserveChunk([]byte("event: response.completed"))
+	analyzer.ObserveChunk([]byte(`data: {"response":{"usage":{"output_tokens":40,"output_tokens_details":{"reasoning_tokens":10}}}}`))
+	sig := analyzer.Finalize(true)
+	if sig.VisibleText != "QUALITY_OK" {
+		t.Fatalf("VisibleText = %q, want QUALITY_OK", sig.VisibleText)
+	}
+	if !sig.Terminal || sig.ParsedEvents != 2 || sig.OutputTokens != 40 || sig.ReasoningTokens != 10 {
+		t.Fatalf("unexpected line-chunk signals: %#v", sig)
+	}
+	if verdict := classifyProbeResult(sig, DefaultQualityConfig(), true, true); verdict.Class != ClassNone {
+		t.Fatalf("line-chunk probe class = %q, want none", verdict.Class)
+	}
+}
+
+func TestSSEParserJoinsSplitFieldChunks(t *testing.T) {
+	analyzer := NewStreamAnalyzer()
+	analyzer.ObserveChunk([]byte("da"))
+	analyzer.ObserveChunk([]byte(`ta: {"choices":[{"delta":{"content":"QUALITY_OK"}}]}`))
+	analyzer.ObserveChunk([]byte(`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}`))
+	sig := analyzer.Finalize(true)
+	if sig.VisibleText != "QUALITY_OK" || !sig.Terminal {
+		t.Fatalf("split field chunks were not parsed: %#v", sig)
+	}
+}
+
+func TestSSEParserHandlesBareJSONChatChunks(t *testing.T) {
+	analyzer := NewStreamAnalyzerWithProtocol(qualityProtocolChat)
+	analyzer.ObserveChunk([]byte(`{"choices":[{"delta":{"content":"QUALITY_OK"}}]}`))
+	analyzer.ObserveChunk([]byte(`{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"completion_tokens":40}}`))
+	sig := analyzer.Finalize(true)
+	if sig.VisibleText != "QUALITY_OK" || !sig.Terminal || sig.OutputTokens != 40 {
+		t.Fatalf("bare JSON chat chunks were not parsed: %#v", sig)
+	}
+}
