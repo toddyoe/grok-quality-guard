@@ -98,47 +98,6 @@ func TestProbeSuccessReenablesCooldownAndClearsStrikes(t *testing.T) {
 		t.Fatal("probe success did not clear the missing-thinking strike")
 	}
 }
-func TestReconcileReleasesLegacyMarkerParseCooldown(t *testing.T) {
-	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
-	host := newMockHostCall(entries, auths)
-	plugin := newTestPlugin(t, host, func(cfg *Config) { cfg.AutoAction = "cooldown_only" })
-	verdict := QualityVerdict{Class: ClassExpectedMarkerMissing, Signals: Signals{
-		Streaming:  true,
-		ByteCount:  62000,
-		EventCount: 1,
-	}}
-	if errApply := plugin.ApplyVerdict(context.Background(), "auth-1", verdict, "probe", ""); errApply != nil {
-		t.Fatal(errApply)
-	}
-	before, _ := plugin.stateAccount("auth-1")
-	if before.State != StateCooling || before.LastEvidence == nil {
-		t.Fatalf("legacy cooldown was not established: %#v", before)
-	}
-	if errReconcile := plugin.Reconcile(context.Background()); errReconcile != nil {
-		t.Fatal(errReconcile)
-	}
-	after, _ := plugin.stateAccount("auth-1")
-	if after.State != StateSuspect || !after.CooldownUntil.IsZero() || after.DisableKind != "" {
-		t.Fatalf("legacy cooldown was not released: %#v", after)
-	}
-	saved, errDecode := rawAuthToMap(host.auths["auth-1"])
-	if errDecode != nil {
-		t.Fatal(errDecode)
-	}
-	if authDisabled(saved) || guardMeta(saved).DisableKind != "" || guardMeta(saved).CooldownUntil != "" {
-		t.Fatalf("legacy cooldown metadata was not cleared: %#v", saved)
-	}
-	released := false
-	for _, event := range plugin.store.Snapshot().Events {
-		if event.AuthID == "auth-1" && event.Action == "probe" && event.Result == "released" {
-			released = true
-			break
-		}
-	}
-	if !released {
-		t.Fatal("legacy cooldown release was not recorded")
-	}
-}
 
 func TestProbeParsesHostLineChunksWithoutNewlines(t *testing.T) {
 	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)

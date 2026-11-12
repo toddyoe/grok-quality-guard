@@ -654,76 +654,9 @@ func (p *Plugin) Reconcile(ctx context.Context) error {
 		if !isIsolatedState(stateAccount.State) && stateAccount.State != StateUnknown {
 			continue
 		}
-		if legacyMarkerParseFailure(stateAccount) && p.releaseLegacyProbeCooldown(ctx, authID) {
-			continue
-		}
 		p.reconcileAccount(ctx, authID, stateAccount.State)
 	}
 	return nil
-}
-
-// legacyMarkerParseFailure identifies cooldowns written before the host SSE
-// parser handled newline-less executor chunks. Those probes parsed no payload
-// but were incorrectly treated as a hard marker miss.
-func legacyMarkerParseFailure(account *AccountState) bool {
-	if account == nil || account.State != StateCooling {
-		return false
-	}
-	evidence := account.LastEvidence
-	if evidence == nil || evidence.Source != "probe" || evidence.Class != ClassExpectedMarkerMissing {
-		return false
-	}
-	return evidence.ByteCount > 0 &&
-		evidence.ParsedEvents == 0 &&
-		evidence.VisibleTokens <= 0 &&
-		evidence.OutputTokens <= 0 &&
-		evidence.ReasoningTokens <= 0 &&
-		evidence.EventCount <= 1 &&
-		evidence.ParseFailures == 0 &&
-		!evidence.SemanticOutput
-}
-
-func (p *Plugin) releaseLegacyProbeCooldown(ctx context.Context, authID string) bool {
-	lock := p.accountLock(authID)
-	lock.Lock()
-	defer lock.Unlock()
-
-	_, response, raw, errResolve := p.resolveAuth(ctx, authID)
-	if errResolve != nil {
-		return false
-	}
-	meta := guardMeta(raw)
-	if !meta.Managed || meta.DisableKind != DisableKindCooldown {
-		return false
-	}
-	meta.DisableKind = ""
-	meta.CooldownUntil = ""
-	meta.StrikeMissingThinking = false
-	if errMeta := setGuardMeta(raw, meta); errMeta != nil {
-		return false
-	}
-	if errSave := p.saveAuthDisabled(response.Name, raw, false); errSave != nil {
-		return false
-	}
-	now := time.Now().UTC()
-	errUpdate := p.stateStore().Update(func(state *State) error {
-		account := p.ensureStateAccount(state, authID, "", "")
-		account.State = StateSuspect
-		account.CooldownUntil = time.Time{}
-		account.ProbeBackoffUntil = time.Time{}
-		account.DisableKind = ""
-		account.PreviousDisabled = false
-		account.QualityStrikeMissingThinking = false
-		account.SoftStrikes = 0
-		account.ErrorStrikes = 0
-		account.ThinkingStrikes = 0
-		account.LastReason = ClassProbeError
-		account.LastAttempt = &AttemptEvidence{At: now, Source: "probe", Class: ClassProbeError, Reason: "legacy probe parse failure released"}
-		account.LastEvidence = &QualityEvidence{At: now, Source: "probe", Action: QualityActionWithhold, Class: ClassProbeError, Reason: "legacy probe parse failure released", Streaming: true}
-		p.recordEvent(state, authID, ClassProbeError, "probe", "released", "legacy probe parse failure released")
-		return nil
-	})
-	return errUpdate == nil
 }
 
 func (p *Plugin) reconcileAccount(ctx context.Context, authID, currentState string) {
