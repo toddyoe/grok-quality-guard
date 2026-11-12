@@ -114,6 +114,9 @@ func (p *Plugin) applyVerdictLocked(
 			}
 		}
 		eventAction := "observe"
+		if source == "probe" {
+			eventAction = "probe"
+		}
 		eventResult := "recorded"
 		eventDetail := source
 		if verdict.Reason != "" {
@@ -171,12 +174,18 @@ func (p *Plugin) applyVerdictLocked(
 				outcome.Actioned = true
 				eventResult = "threshold_reached"
 				eventDetail = fmt.Sprintf("%s · 连续探测错误 %d/%d", source, account.ErrorStrikes, threshold)
+				if verdict.Reason != "" {
+					eventDetail += " · " + verdict.Reason
+				}
 				if !preserveIsolation() {
 					account.State = StateDegraded
 				}
 			} else {
 				eventResult = "pending"
 				eventDetail = fmt.Sprintf("%s · 连续探测错误 %d/%d", source, account.ErrorStrikes, threshold)
+				if verdict.Reason != "" {
+					eventDetail += " · " + verdict.Reason
+				}
 				if !preserveIsolation() {
 					account.State = StateSuspect
 				}
@@ -186,6 +195,9 @@ func (p *Plugin) applyVerdictLocked(
 			eventClass = ""
 			eventResult = "ignored"
 			eventDetail = source + " · 非质量类错误，未计入连续错误"
+			if verdict.Reason != "" {
+				eventDetail += " · " + verdict.Reason
+			}
 
 		case ClassMissingThinking:
 			account.ThinkingStrikes++
@@ -230,6 +242,9 @@ func (p *Plugin) applyVerdictLocked(
 				account.State = StateSuspect
 			}
 			eventDetail = source
+			if verdict.Reason != "" {
+				eventDetail += " · " + verdict.Reason
+			}
 		}
 
 		p.recordEvent(state, authID, eventClass, eventAction, eventResult, eventDetail)

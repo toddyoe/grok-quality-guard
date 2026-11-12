@@ -112,3 +112,94 @@ func TestProbeBackoffGrowsAndCaps(t *testing.T) {
 		t.Fatalf("capped backoff = %s", capped)
 	}
 }
+
+func TestManagementProbeDoesNotReuseManagementCallback(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	visible := strings.Repeat("reliable systems need careful design. ", 10) + "\\nQUALITY_OK"
+	host.scriptStream("auth-1", []pluginapi.HostModelStreamReadResponse{
+		streamData("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"plan carefully\"}}]}\n\n"),
+		streamData("data: {\"choices\":[{\"delta\":{\"content\":\"" + visible + "\"}}]}\n\n"),
+		streamData("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":120,\"completion_tokens_details\":{\"reasoning_tokens\":1}}}\n\n"),
+		{Done: true},
+	}...)
+	plugin := newTestPlugin(t, host, func(cfg *Config) {
+		cfg.Quality.SoftTPS = 1e9
+		cfg.Quality.HardTPS = 2e9
+	})
+	response := actionManagementForTest(t, plugin, "accounts.probe", map[string]any{
+		"auth_id": "auth-1",
+		"force":   true,
+	})
+	if response.StatusCode != 200 {
+		t.Fatalf("probe status = %d body=%s", response.StatusCode, response.Body)
+	}
+	host.mu.Lock()
+	callbacks := append([]string(nil), host.callbacks...)
+	host.mu.Unlock()
+	if len(callbacks) != 1 || callbacks[0] != "" {
+		t.Fatalf("management probe callbacks = %#v", callbacks)
+	}
+}
+
+func TestProbeMarkerMissingRecordsQualityEventOnly(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	host.scriptStream("auth-1", []pluginapi.HostModelStreamReadResponse{
+		streamData("data: {\"choices\":[{\"delta\":{\"content\":\"wrong answer\"}}]}\n\n"),
+		{Done: true},
+	}...)
+	plugin := newTestPlugin(t, host, func(cfg *Config) { cfg.AutoAction = "observe" })
+	if errProbe := plugin.ProbeAccount(context.Background(), "auth-1", true, ""); errProbe != nil {
+		t.Fatal(errProbe)
+	}
+	state := plugin.store.Snapshot()
+	internalErrors := 0
+	qualityEvents := 0
+	for _, event := range state.Events {
+		if event.AuthID != "auth-1" {
+			continue
+		}
+		if event.Action == "internal_error" {
+			internalErrors++
+		}
+		if event.Class == ClassExpectedMarkerMissing && event.Action == "probe" && event.Result == "threshold_reached" {
+			qualityEvents++
+		}
+	}
+	if internalErrors != 0 {
+		t.Fatalf("marker missing recorded %d internal errors", internalErrors)
+	}
+	if qualityEvents != 1 {
+		t.Fatalf("marker missing quality events = %d, events=%#v", qualityEvents, state.Events)
+	}
+}
+
+func TestProbeTransportFailureRecordsInternalError(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	plugin := newTestPlugin(t, host, func(cfg *Config) { cfg.AutoAction = "observe" })
+	if errProbe := plugin.ProbeAccount(context.Background(), "auth-1", true, ""); errProbe != nil {
+		t.Fatal(errProbe)
+	}
+	state := plugin.store.Snapshot()
+	internalErrors := 0
+	probeErrors := 0
+	for _, event := range state.Events {
+		if event.AuthID != "auth-1" {
+			continue
+		}
+		if event.Action == "internal_error" {
+			internalErrors++
+		}
+		if event.Class == ClassProbeError && event.Action == "probe" {
+			probeErrors++
+		}
+	}
+	if internalErrors != 1 {
+		t.Fatalf("transport failure internal errors = %d, events=%#v", internalErrors, state.Events)
+	}
+	if probeErrors != 1 {
+		t.Fatalf("transport failure probe events = %d, events=%#v", probeErrors, state.Events)
+	}
+}

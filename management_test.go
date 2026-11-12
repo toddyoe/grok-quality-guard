@@ -107,7 +107,7 @@ func TestManagementResourceAndActionAccess(t *testing.T) {
 	if response.StatusCode != http.StatusOK || !strings.Contains(string(response.Body), "/plugins/grok-quality-guard/api") {
 		t.Fatalf("unexpected dashboard response: status=%d body=%s", response.StatusCode, response.Body)
 	}
-	for _, removed := range []string{"proxy_url", "代理（脱敏）", "选择全部筛选结果", " 代理", "代理 "} {
+	for _, removed := range []string{"proxy_url", "代理（脱敏）", "选择全部筛选结果", " 代理", "代理 ", "const strikeBadge = strikes.length", "badge('连续 ' + strikes.join"} {
 		if strings.Contains(string(response.Body), removed) {
 			t.Fatalf("dashboard still contains legacy label %q", removed)
 		}
@@ -118,7 +118,7 @@ func TestManagementResourceAndActionAccess(t *testing.T) {
 	if strings.Contains(string(response.Body), "对齐旧插件") {
 		t.Fatal("dashboard should describe the setting semantically instead of referencing the old plugin")
 	}
-	for _, expected := range []string{"概览", "账号质量", "Resin 租约", "事件日志", "设置", "24 小时统计", "resin.config.get", "resin.clear", "leaseSelectAll", "clearSelectedBtn", "accountsPager", "leasesPager", "eventsPager", "selectFilteredBtn", "selectAllAccountsBtn", "全选当前筛选", "全选所有账号", "选择本页全部账号", "r_local_only", "本地轮换", "state_file.update", "id=\"p_state_file\" type=\"text\"", "summary-value truncate", "连续检测到缺少真实思考的响应达到该次数后触发处置或交叉验证", `type="password"`} {
+	for _, expected := range []string{"概览", "账号质量", "Resin 租约", "事件日志", "设置", "24 小时统计", "resin.config.get", "resin.clear", "leaseSelectAll", "clearSelectedBtn", "accountsPager", "leasesPager", "eventsPager", "selectFilteredBtn", "selectAllAccountsBtn", "全选当前筛选", "全选所有账号", "选择本页全部账号", "r_local_only", "本地轮换", "state_file.update", "id=\"p_state_file\" type=\"text\"", "summary-value truncate", "连续检测到缺少真实思考的响应达到该次数后触发处置或交叉验证", `type="password"`, "const REASON_DETAIL_LABELS", "'expected marker missing': '探测标记缺失'", "真实思考：", "终止：", "解析失败：", "<td class=\"nowrap\">"} {
 		if !strings.Contains(string(response.Body), expected) {
 			t.Fatalf("dashboard is missing %q", expected)
 		}

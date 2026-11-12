@@ -926,12 +926,6 @@
       flex-wrap: wrap;
     }
 
-    .subtle-line {
-      margin-top: 2px;
-      color: var(--subtle);
-      font-size: 10px;
-    }
-
     .empty {
       display: flex;
       flex-direction: column;
@@ -2097,6 +2091,46 @@
       expected_marker_missing: '探测标记缺失', probe_error: '探测错误', proxy_error: '代理错误',
       ignored: '非质量错误', manual: '手动操作'
     };
+    const REASON_DETAIL_LABELS = {
+      'expected marker missing': '探测标记缺失',
+      'probe transport error': '探测传输错误',
+      'probe context ended': '探测已取消或超时',
+      'probe stream read error': '读取探测流失败',
+      'probe stream error': '探测流错误',
+      'probe response exceeded buffer limit': '探测响应超过缓冲区限制',
+      'probe passed': '探测通过',
+      within_threshold: '指标正常',
+      'insufficient output tokens': '输出 Token 不足',
+      'missing thinking': '缺少真实思考',
+      'insufficient generation window': '生成窗口不足',
+      'short generation window dumped output': '生成窗口过短且输出集中突增',
+      'cipher-only stream is dumping visible text': '仅密文流突然输出可见文本',
+      'encrypted or billed reasoning preceded a fast visible dump': '加密或计费推理后快速输出可见文本',
+      'reasoning tokens dominate a fast visible dump': '推理 Token 占比异常且快速输出',
+      'real reasoning delta observed': '观察到真实推理增量',
+      'encrypted reasoning met the floor': '加密推理达到下限',
+      'encrypted reasoning with sustained visible output': '加密推理伴随持续可见输出',
+      'waiting for encrypted reasoning evidence': '等待加密推理证据',
+      'waiting for reasoning evidence': '等待推理证据',
+      'empty terminal stream': '终止流为空',
+      'no real reasoning evidence': '缺少真实思考证据',
+      'short response below thinking threshold': '响应过短，未达思考检查阈值',
+      'hold expired without output': '扣留超时且仍无输出',
+      'waiting for enough output': '等待足够输出',
+      'upstream stream completed without content': '上游流已结束但没有内容',
+      'upstream response completed without content': '上游响应已结束但没有内容',
+      'reasoning was disabled for this request': '本次请求未启用推理',
+      not_build_stream: '非 Build 流式请求',
+      missing_first_token: '缺少首 Token 时间',
+      unsuccessful: '请求未成功',
+      manual: '手动操作',
+      'host callback context closed while opening model stream': '打开模型流时宿主回调上下文已关闭',
+      'host model executor is unavailable': '宿主模型执行器不可用',
+      'host model stream bridge is unavailable': '宿主模型流桥接不可用',
+      'host plugin callback instance is closed': '宿主插件回调实例已关闭',
+      'host model stream closed during startup': '宿主模型流在启动时关闭',
+      'host.model.execute_stream returned an empty stream_id': '宿主模型流返回了空流 ID'
+    };
     const ACTION_LABELS = {
       observe: '被动观测', probe: '主动探测', guard_disable: '自动处置', external_disable: '外部禁用',
       restore: '恢复账号', resin_bind: '绑定租约', resin_rotate: '轮换租约', resin_clear: '清除代理',
@@ -2119,11 +2153,35 @@
     const QUALITY_ACTION_LABELS = { wait: '等待更多证据', deliver: '放行', withhold: '扣留' };
     const PROTOCOL_LABELS = { chat: 'Chat Completions', responses: 'Responses', anthropic: 'Anthropic Messages' };
     const sourceLabel = (value) => SOURCE_LABELS[value] || value || '系统';
+    const reasonText = (value) => {
+      const text = String(value == null ? '' : value).trim();
+      if (!text) return '';
+      if (REASON_LABELS[text]) return REASON_LABELS[text];
+      if (REASON_DETAIL_LABELS[text]) return REASON_DETAIL_LABELS[text];
+      let match = text.match(/^upstream status (\d+)$/i);
+      if (match) return '上游状态：' + match[1];
+      match = text.match(/^probe upstream status (\d+)$/i);
+      if (match) return '探测上游状态：' + match[1];
+      match = text.match(/^probe quality check failed:\s*(.+)$/i);
+      if (match) return '探测质量检查失败：' + reasonText(match[1]);
+      match = text.match(/^host_call_failed:\s*(.+)$/i);
+      if (match) return '宿主调用失败：' + reasonText(match[1]);
+      return text;
+    };
+    const localizeDetail = (value) => String(value == null ? '' : value).split(' · ').map((part) => {
+      const text = part.trim();
+      if (!text) return '';
+      if (SOURCE_LABELS[text]) return SOURCE_LABELS[text];
+      if (text === 'permanent_eligible=true') return '永久禁用候选：是';
+      if (text === 'permanent_eligible=false') return '永久禁用候选：否';
+      return reasonText(text);
+    }).filter(Boolean).join(' · ');
     const attemptLabel = (attempt) => {
       if (!attempt) return '暂无尝试';
       const prefix = attempt.source ? sourceLabel(attempt.source) + ' · ' : '';
       const verdict = attempt.class ? reasonLabel(attempt.class) : '通过';
-      const detail = attempt.reason && attempt.reason !== attempt.class ? ' · ' + attempt.reason : '';
+      const reason = reasonText(attempt.reason);
+      const detail = reason && attempt.reason !== attempt.class && reason !== verdict ? ' · ' + reason : '';
       const at = attempt.at ? ' · ' + formatFullTime(attempt.at) : '';
       return prefix + verdict + detail + at;
     };
@@ -2164,26 +2222,26 @@
       const actionText = QUALITY_ACTION_LABELS[evidence.action] || evidence.action || '未记录';
       const protocolText = PROTOCOL_LABELS[evidence.protocol] || evidence.protocol || '自动识别';
       const flags = [
-        '真实思考 ' + yesNo(evidence.has_thinking),
-        '明文推理 ' + yesNo(evidence.has_reasoning_delta),
-        '推理开始 ' + yesNo(evidence.reasoning_started),
-        '语义输出 ' + yesNo(evidence.semantic_output),
-        '用量上报 ' + yesNo(evidence.usage_reported)
+        '真实思考：' + yesNo(evidence.has_thinking),
+        '明文推理：' + yesNo(evidence.has_reasoning_delta),
+        '推理开始：' + yesNo(evidence.reasoning_started),
+        '语义输出：' + yesNo(evidence.semantic_output),
+        '用量上报：' + yesNo(evidence.usage_reported)
       ].join(' · ');
       return [
         '<div class="drawer-section"><h3>质量判定依据</h3><div class="detail-grid">',
         evidenceCell('判定来源', sourceLabel(evidence.source) + ' · ' + formatFullTime(evidence.at)),
         evidenceCell('判定结果', classText + ' · ' + actionText),
-        evidenceCell('判定说明', evidence.reason || '-'),
+        evidenceCell('判定说明', reasonText(evidence.reason) || '-'),
         evidenceCell('协议 / 模式', protocolText + ' · ' + (evidence.streaming ? '流式' : '非流式')),
-        evidenceCell('终止 / Hold', '终止 ' + yesNo(evidence.terminal) + ' · 超时 ' + yesNo(evidence.hold_expired)),
-        evidenceCell('可见 / 输出 / 推理', num(evidence.visible_tokens) + ' / ' + num(evidence.output_tokens) + ' / ' + num(evidence.reasoning_tokens)),
-        evidenceCell('密文 / 下限', formatBytes(evidence.encrypted_bytes) + ' / ' + formatBytes(evidence.encrypted_floor)),
-        evidenceCell('TTFT / 总时长', num(evidence.first_token_ms) + ' / ' + num(evidence.duration_ms) + ' 毫秒'),
-        evidenceCell('生成窗口 / 可见 Flush', num(evidence.generation_ms) + ' / ' + num(evidence.visible_flush_ms) + ' 毫秒'),
+        evidenceCell('终止 / 超时', '终止：' + yesNo(evidence.terminal) + ' · 超时：' + yesNo(evidence.hold_expired)),
+        evidenceCell('可见 / 输出 / 推理', '可见：' + num(evidence.visible_tokens) + ' · 输出：' + num(evidence.output_tokens) + ' · 推理：' + num(evidence.reasoning_tokens)),
+        evidenceCell('密文 / 下限', '密文：' + formatBytes(evidence.encrypted_bytes) + ' · 下限：' + formatBytes(evidence.encrypted_floor)),
+        evidenceCell('首 Token / 总时长', '首 Token：' + num(evidence.first_token_ms) + ' 毫秒 · 总时长：' + num(evidence.duration_ms) + ' 毫秒'),
+        evidenceCell('生成窗口 / 可见输出延迟', '生成窗口：' + num(evidence.generation_ms) + ' 毫秒 · 可见输出延迟：' + num(evidence.visible_flush_ms) + ' 毫秒'),
         evidenceCell('输出速度', num(evidence.tps, 1) + ' TPS'),
         evidenceCell('思考证据状态', flags),
-        evidenceCell('解析统计', '块 ' + num(evidence.chunk_count) + ' · 字节 ' + formatBytes(evidence.byte_count) + ' · 事件 ' + num(evidence.event_count) + ' · 未知 ' + num(evidence.unknown_events) + ' · 解析失败 ' + num(evidence.parse_failures)),
+        evidenceCell('解析统计', '块：' + num(evidence.chunk_count) + ' · 字节：' + formatBytes(evidence.byte_count) + ' · 事件：' + num(evidence.event_count) + ' · 未知：' + num(evidence.unknown_events) + ' · 解析失败：' + num(evidence.parse_failures)),
         '</div><p class="hint" style="margin-top:9px">仅展示脱敏后的判定统计，不包含 prompt、响应正文或任何凭据</p></div>'
       ].join('');
     };
@@ -2380,7 +2438,7 @@
     }
     function recentEventHTML(event) {
       const tone = event.class ? 'bad' : (event.action === 'restore' ? 'good' : '');
-      return '<div class="recent-item"><span class="event-dot ' + esc(tone) + '"></span><div style="min-width:0"><div class="recent-title">' + esc(actionLabel(event.action)) + ' · ' + esc(event.class ? reasonLabel(event.class) : resultLabel(event.result)) + '</div><div class="recent-detail">' + esc(event.auth_id || '系统事件') + (event.detail ? ' · ' + esc(event.detail) : '') + '</div></div><time class="recent-time">' + esc(formatTime(event.time)) + '</time></div>';
+      return '<div class="recent-item"><span class="event-dot ' + esc(tone) + '"></span><div style="min-width:0"><div class="recent-title">' + esc(actionLabel(event.action)) + ' · ' + esc(event.class ? reasonLabel(event.class) : resultLabel(event.result)) + '</div><div class="recent-detail">' + esc(event.auth_id || '系统事件') + (event.detail ? ' · ' + esc(localizeDetail(event.detail)) : '') + '</div></div><time class="recent-time">' + esc(formatTime(event.time)) + '</time></div>';
     }
     function renderOverview() {
       const overview = state.overview || {};
@@ -2476,16 +2534,10 @@
       const authID = esc(account.auth_id);
       const resin = account.resin_managed ? badge((state.resin && state.resin.local_only) ? '本地管理' : '已绑定', 'info') : (account.proxy_status === 'conflict' ? badge('代理冲突', 'warn') : badge('未绑定', ''));
       const resinDetail = account.resin_account ? '<div class="subline">' + esc(account.resin_account) + ' · 第 ' + esc(account.resin_generation || 0) + ' 代</div>' : '';
-      const cooldown = account.cooldown_until ? '冷却至 ' + esc(formatFullTime(account.cooldown_until)) : '无冷却';
-      const probe = account.probe_backoff_until ? '探测退避至 ' + esc(formatFullTime(account.probe_backoff_until)) : '可立即探测';
-      const strike = account.strike_missing_thinking ? badge('思考命中', 'warn') : '';
-      const strikes = [];
-      if (account.soft_strikes) strikes.push('软 ' + account.soft_strikes);
-      if (account.error_strikes) strikes.push('错 ' + account.error_strikes);
-      if (account.thinking_strikes) strikes.push('思 ' + account.thinking_strikes);
-      const strikeBadge = strikes.length ? badge('连续 ' + strikes.join(' / '), 'warn') : '';
-      const attemptDetail = account.last_attempt ? '最近尝试 ' + attemptLabel(account.last_attempt) : '最近观测 ' + formatTime(account.last_observed_at);
-      return '<tr><td><div class="account-name" title="' + esc(account.display_full || account.display || account.label || '未命名账号') + '">' + esc(account.display || account.label || '未命名账号') + '</div><div class="subline" title="' + esc(account.auth_id) + '">' + esc(account.auth_id_display || account.auth_id) + '</div></td><td><div>' + badge(stateLabel(account.state), stateTone(account.state)) + ' ' + strike + ' ' + strikeBadge + '</div><div class="subtle-line">' + esc(account.state === 'externally_disabled' ? '外部禁用' : '') + '</div></td><td><div>' + esc(reasonLabel(account.last_reason)) + '</div><div class="subline">' + esc(attemptDetail) + '</div></td><td><div class="metric-inline"><strong>' + esc(num(account.tps, 1)) + '</strong><span class="muted">TPS</span></div><div class="subline">输出 ' + esc(num(account.output_tokens)) + ' · 推理 ' + esc(num(account.reasoning_tokens)) + ' · 密文 ' + esc(formatBytes(account.encrypted_bytes)) + '</div></td><td>' + resin + resinDetail + '</td><td><div>' + cooldown + '</div><div class="subline">' + probe + '</div></td><td><div class="actions"><button class="btn btn-xs" type="button" data-account-action="accounts.probe" data-auth="' + authID + '">' + icon('play') + '检测</button><button class="btn btn-xs" type="button" data-open-account="' + authID + '">' + icon('eye') + '详情</button></div></td></tr>';
+      const cooldown = account.cooldown_until ? '冷却至：' + esc(formatFullTime(account.cooldown_until)) : '无冷却';
+      const probe = account.probe_backoff_until ? '探测退避至：' + esc(formatFullTime(account.probe_backoff_until)) : '可立即探测';
+      const attemptDetail = account.last_attempt ? '最近尝试：' + attemptLabel(account.last_attempt) : '最近观测：' + formatTime(account.last_observed_at);
+      return '<tr><td><div class="account-name" title="' + esc(account.display_full || account.display || account.label || '未命名账号') + '">' + esc(account.display || account.label || '未命名账号') + '</div><div class="subline" title="' + esc(account.auth_id) + '">' + esc(account.auth_id_display || account.auth_id) + '</div></td><td class="nowrap">' + badge(stateLabel(account.state), stateTone(account.state)) + '</td><td><div>' + esc(reasonLabel(account.last_reason)) + '</div><div class="subline">' + esc(attemptDetail) + '</div></td><td><div class="metric-inline"><strong>' + esc(num(account.tps, 1)) + '</strong><span class="muted">TPS</span></div><div class="subline">输出：' + esc(num(account.output_tokens)) + ' · 推理：' + esc(num(account.reasoning_tokens)) + ' · 密文：' + esc(formatBytes(account.encrypted_bytes)) + '</div></td><td>' + resin + resinDetail + '</td><td><div>' + cooldown + '</div><div class="subline">' + probe + '</div></td><td><div class="actions"><button class="btn btn-xs" type="button" data-account-action="accounts.probe" data-auth="' + authID + '">' + icon('play') + '检测</button><button class="btn btn-xs" type="button" data-open-account="' + authID + '">' + icon('eye') + '详情</button></div></td></tr>';
     }
     function leaseStatus(account) {
       if (account.resin_managed || account.proxy_status === 'bound') return 'bound';
@@ -2618,7 +2670,7 @@
         const tone = event.class ? 'bad' : (event.action === 'restore' ? 'good' : (String(event.action || '').startsWith('resin') ? 'info' : ''));
         const title = actionLabel(event.action);
         const eventResult = event.result ? resultLabel(event.result) : '';
-        const meta = [event.class ? reasonLabel(event.class) : '', event.detail || ''].filter(Boolean).join(' · ');
+        const meta = [event.class ? reasonLabel(event.class) : '', localizeDetail(event.detail)].filter(Boolean).join(' · ');
         return '<div class="event-item"><span class="event-dot ' + esc(tone) + '"></span><div style="min-width:0"><div class="event-title"><span>' + esc(title) + '</span>' + (eventResult ? badge(eventResult, tone === 'good' ? 'good' : '') : '') + '</div><div class="event-meta">' + esc(event.auth_id || '系统事件') + (meta ? ' · ' + esc(meta) : '') + '</div></div><time class="recent-time">' + esc(formatFullTime(event.time)) + '</time></div>';
       }).join('');
       document.getElementById('eventsEmpty').hidden = result.total > 0;
@@ -2862,7 +2914,7 @@
         '<div class="detail-cell"><div class="detail-label">输出 / 推理</div><div class="detail-value">' + esc(num(account.output_tokens)) + ' / ' + esc(num(account.reasoning_tokens)) + '</div></div>',
         '<div class="detail-cell"><div class="detail-label">可见 Token</div><div class="detail-value">' + esc(num(account.visible_tokens)) + '</div></div>',
         '<div class="detail-cell"><div class="detail-label">加密思考</div><div class="detail-value">' + esc(formatBytes(account.encrypted_bytes)) + '</div></div>',
-        '<div class="detail-cell"><div class="detail-label">连续计数</div><div class="detail-value">软 ' + esc(num(account.soft_strikes || 0)) + ' / 错 ' + esc(num(account.error_strikes || 0)) + ' / 思 ' + esc(num(account.thinking_strikes || 0)) + '</div></div>',
+        '<div class="detail-cell"><div class="detail-label">连续计数</div><div class="detail-value">软：' + esc(num(account.soft_strikes || 0)) + ' / 错：' + esc(num(account.error_strikes || 0)) + ' / 思：' + esc(num(account.thinking_strikes || 0)) + '</div></div>',
         '</div></div>',
         evidenceSection(evidence),
         '<div class="drawer-section"><h3>账号信息</h3><div class="detail-grid">',

@@ -304,7 +304,8 @@ func (p *Plugin) actionProbe(ctx context.Context, params map[string]any, callbac
 	}
 	force := boolFromParams(params, "force")
 	task := p.startTask("accounts.probe", []string{authID}, "正在执行主动探测", func(taskCtx context.Context) (any, error) {
-		if errProbe := p.ProbeAccount(taskCtx, authID, force, callbackID); errProbe != nil {
+		// Detached tasks must not reuse the short-lived management callback
+		if errProbe := p.ProbeAccount(taskCtx, authID, force, ""); errProbe != nil {
 			return nil, errProbe
 		}
 		account, okAccount := p.findAccount(authID)

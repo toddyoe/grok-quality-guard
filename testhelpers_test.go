@@ -28,6 +28,7 @@ type mockHostCall struct {
 	emitted    map[string][][]byte
 	closes     map[string]*pluginabi.Error
 	modelCalls []pluginapi.HostModelExecutionRequest
+	callbacks  []string
 }
 
 func newMockHostCall(entries []pluginapi.HostAuthFileEntry, auths map[string]json.RawMessage) *mockHostCall {
@@ -112,6 +113,7 @@ func (m *mockHostCall) call(method string, payload any) (json.RawMessage, error)
 		}
 		m.mu.Lock()
 		m.modelCalls = append(m.modelCalls, req.HostModelExecutionRequest)
+		m.callbacks = append(m.callbacks, req.HostCallbackID)
 		m.mu.Unlock()
 		return marshalTestResult(pluginapi.HostModelExecutionResponse{StatusCode: http.StatusOK, Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: []byte(`{"output_text":"ok"}`)})
 	case pluginabi.MethodHostModelExecuteStream:
@@ -122,6 +124,7 @@ func (m *mockHostCall) call(method string, payload any) (json.RawMessage, error)
 		m.mu.Lock()
 		defer m.mu.Unlock()
 		m.modelCalls = append(m.modelCalls, req.HostModelExecutionRequest)
+		m.callbacks = append(m.callbacks, req.HostCallbackID)
 		reads, ok := m.streams[req.AuthID]
 		if !ok {
 			return nil, fmt.Errorf("mock stream for auth %s not configured", req.AuthID)

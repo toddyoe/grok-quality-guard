@@ -260,7 +260,8 @@ func (p *Plugin) markProbeSuccess(authID string, raw map[string]json.RawMessage,
 }
 
 func (p *Plugin) handleProbeFailure(authID string, raw map[string]json.RawMessage, response pluginapi.HostAuthGetResponse, reEnabled bool, verdict QualityVerdict, errProbe error) error {
-	if errProbe != nil {
+	// Keep marker and TPS verdicts out of internal error events
+	if errProbe != nil && verdict.Class == ClassProbeError {
 		_ = p.recordInternalError(authID, errProbe)
 	}
 	_, errApply := p.applyVerdictLocked(
