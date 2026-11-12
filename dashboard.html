@@ -1872,6 +1872,8 @@
                     <div class="field"><label for="p_consecutive_missing_thinking">连续缺少思考次数</label><input
                         id="p_consecutive_missing_thinking" type="number" min="1"><span
                         class="hint">连续检测到缺少真实思考的响应达到该次数后触发处置或交叉验证；默认 1</span></div>
+                    <div class="field"><label for="p_min_generation_ms">最小生成窗口</label><input id="p_min_generation_ms"
+                        type="number" min="1"><span class="hint">单位：毫秒</span></div>
                     <label class="check-card"><input id="p_thinking_guard" type="checkbox"><span
                         class="check-copy"><span class="check-title">启用缺少思考检测</span><span class="check-desc">关闭后只保留 TPS
                           与空流等质量检查</span></span></label>
@@ -1881,8 +1883,6 @@
                     <label class="check-card"><input id="p_thinking_cross_verify" type="checkbox"><span
                         class="check-copy"><span class="check-title">缺思考交叉验证</span><span
                           class="check-desc">连续缺少思考达到阈值后先异步主动探测，再决定是否处置</span></span></label>
-                    <div class="field"><label for="p_min_generation_ms">最小生成窗口</label><input id="p_min_generation_ms"
-                        type="number" min="1"><span class="hint">单位：毫秒</span></div>
                     <label class="check-card"><input id="p_fail_closed" type="checkbox"><span
                         class="check-copy"><span class="check-title">短生成窗口严格判定</span><span class="check-desc">开启后，生成窗口过短且 TPS 达到软阈值时直接判为短窗口突发</span></span></label>
                     <div class="field"><label for="p_min_passive_output">被动审计最小输出 Token</label><input
@@ -3128,7 +3128,7 @@
         toast('当前没有需要检测的非健康账号', 'success');
         return;
       }
-      if (!window.confirm('确认立即检测所有 ' + count + ' 个非健康状态账号？\n检测会发起真实模型请求并可能产生额度消耗；外部禁用和已永久隔离账号会跳过。')) return;
+      if (!window.confirm('确认立即检测所有 ' + count + ' 个非健康状态账号？\n检测会发起真实模型请求并可能产生额度消耗；外部禁用账号会跳过，插件冷却或隔离账号会先自动恢复再检测。')) return;
       setBusy(button, true);
       try {
         const task = await api('accounts.probe_non_healthy');

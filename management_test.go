@@ -99,6 +99,17 @@ func waitTaskForTest(t *testing.T, plugin *Plugin, taskID string) Task {
 	return Task{}
 }
 
+func scriptHealthyProbeStream(t *testing.T, host *mockHostCall, authID string) {
+	t.Helper()
+	visible := strings.Repeat("reliable systems need careful design. ", 10) + "\\nQUALITY_OK"
+	host.scriptStream(authID, []pluginapi.HostModelStreamReadResponse{
+		streamData("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"plan carefully\"}}]}\n\n"),
+		streamData("data: {\"choices\":[{\"delta\":{\"content\":\"" + visible + "\"}}]}\n\n"),
+		streamData("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":120,\"completion_tokens_details\":{\"reasoning_tokens\":1}}}\n\n"),
+		{Done: true},
+	}...)
+}
+
 func TestManagementResourceAndActionAccess(t *testing.T) {
 	entries, auths := singleGrokAuth(t, "auth-1", "alice@example.com", nil)
 	host := newMockHostCall(entries, auths)
@@ -269,6 +280,50 @@ func TestManualActionsUpdateState(t *testing.T) {
 	}
 }
 
+func TestManualProbeRestoresGuardOwnedAccounts(t *testing.T) {
+	cases := []struct {
+		name   string
+		action string
+		params map[string]any
+	}{
+		{name: "cooling", action: "accounts.cooldown", params: map[string]any{"auth_id": "auth-1", "duration": "2h"}},
+		{name: "disabled", action: "accounts.disable", params: map[string]any{"auth_id": "auth-1", "reason": "manual"}},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+			host := newMockHostCall(entries, auths)
+			scriptHealthyProbeStream(t, host, "auth-1")
+			plugin := newTestPlugin(t, host, func(cfg *Config) {
+				cfg.Quality.SoftTPS = 1e9
+				cfg.Quality.HardTPS = 2e9
+			})
+			response := actionManagementForTest(t, plugin, testCase.action, testCase.params)
+			if response.StatusCode != http.StatusOK {
+				t.Fatalf("prepare guarded state status = %d body=%s", response.StatusCode, response.Body)
+			}
+			if account, _ := plugin.stateAccount("auth-1"); account.State == StateHealthy {
+				t.Fatalf("account should be non-healthy before manual probe: %#v", account)
+			}
+			response = actionManagementForTest(t, plugin, "accounts.probe", map[string]any{"auth_id": "auth-1", "force": true})
+			if response.StatusCode != http.StatusOK {
+				t.Fatalf("manual probe status = %d body=%s", response.StatusCode, response.Body)
+			}
+			account, _ := plugin.stateAccount("auth-1")
+			if account.State != StateHealthy {
+				t.Fatalf("manual probe did not restore and probe account: %#v", account)
+			}
+			saved, errDecode := rawAuthToMap(host.saves["auth-1"])
+			if errDecode != nil {
+				t.Fatal(errDecode)
+			}
+			if authDisabled(saved) {
+				t.Fatal("manual probe left auth disabled")
+			}
+		})
+	}
+}
+
 func TestRestoreNonHealthyBatchManagement(t *testing.T) {
 	entriesHealthy, authsHealthy := singleGrokAuth(t, "auth-healthy", "[EMAIL]", nil)
 	entriesDegraded, authsDegraded := singleGrokAuth(t, "auth-degraded", "[EMAIL]", nil)
@@ -354,27 +409,27 @@ func TestRestoreNonHealthyBatchManagement(t *testing.T) {
 func TestProbeNonHealthyBatchManagement(t *testing.T) {
 	entriesHealthy, authsHealthy := singleGrokAuth(t, "auth-healthy", "[EMAIL]", nil)
 	entriesSuspect, authsSuspect := singleGrokAuth(t, "auth-suspect", "[EMAIL]", nil)
+	entriesGuard, authsGuard := singleGrokAuth(t, "auth-guard", "[EMAIL]", nil)
 	entriesExternal, authsExternal := singleGrokAuth(t, "auth-external", "[EMAIL]", map[string]any{"disabled": true})
 	entries := append(entriesHealthy, entriesSuspect...)
+	entries = append(entries, entriesGuard...)
 	entries = append(entries, entriesExternal...)
-	auths := make(map[string]json.RawMessage, len(authsHealthy)+len(authsSuspect)+len(authsExternal))
+	auths := make(map[string]json.RawMessage, len(authsHealthy)+len(authsSuspect)+len(authsGuard)+len(authsExternal))
 	for key, value := range authsHealthy {
 		auths[key] = value
 	}
 	for key, value := range authsSuspect {
 		auths[key] = value
 	}
+	for key, value := range authsGuard {
+		auths[key] = value
+	}
 	for key, value := range authsExternal {
 		auths[key] = value
 	}
 	host := newMockHostCall(entries, auths)
-	visible := strings.Repeat("reliable systems need careful design. ", 10) + "\\nQUALITY_OK"
-	host.scriptStream("auth-suspect", []pluginapi.HostModelStreamReadResponse{
-		streamData("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"plan carefully\"}}]}\n\n"),
-		streamData("data: {\"choices\":[{\"delta\":{\"content\":\"" + visible + "\"}}]}\n\n"),
-		streamData("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":120,\"completion_tokens_details\":{\"reasoning_tokens\":1}}}\n\n"),
-		{Done: true},
-	}...)
+	scriptHealthyProbeStream(t, host, "auth-suspect")
+	scriptHealthyProbeStream(t, host, "auth-guard")
 	plugin := newTestPlugin(t, host, func(cfg *Config) {
 		cfg.Quality.SoftTPS = 1e9
 		cfg.Quality.HardTPS = 2e9
@@ -386,6 +441,9 @@ func TestProbeNonHealthyBatchManagement(t *testing.T) {
 		return nil
 	}); errUpdate != nil {
 		t.Fatal(errUpdate)
+	}
+	if response := actionManagementForTest(t, plugin, "accounts.disable", map[string]any{"auth_id": "auth-guard", "reason": "manual"}); response.StatusCode != http.StatusOK {
+		t.Fatalf("disable guard account status = %d body=%s", response.StatusCode, response.Body)
 	}
 
 	body, errMarshal := json.Marshal(actionRequest{Action: "accounts.probe_non_healthy"})
@@ -417,14 +475,14 @@ func TestProbeNonHealthyBatchManagement(t *testing.T) {
 	if errUnmarshal := json.Unmarshal(encodedResult, &result); errUnmarshal != nil {
 		t.Fatal(errUnmarshal)
 	}
-	if result.Count != 2 || result.Probed != 1 || result.Skipped != 1 || result.Failed != 0 {
+	if result.Count != 3 || result.Probed != 2 || result.Skipped != 1 || result.Failed != 0 {
 		t.Fatalf("unexpected probe summary: %#v", result)
 	}
 	statuses := make(map[string]string, len(result.Items))
 	for _, item := range result.Items {
 		statuses[item.AuthID] = item.Status
 	}
-	if statuses["auth-suspect"] != "probed" || statuses["auth-external"] != "skipped" {
+	if statuses["auth-suspect"] != "probed" || statuses["auth-guard"] != "probed" || statuses["auth-external"] != "skipped" {
 		t.Fatalf("unexpected probe items: %#v", result.Items)
 	}
 	state := plugin.stateStore().Snapshot()
@@ -433,6 +491,9 @@ func TestProbeNonHealthyBatchManagement(t *testing.T) {
 	}
 	if state.Accounts["auth-suspect"].State != StateHealthy {
 		t.Fatalf("suspect account was not probed to healthy: %#v", state.Accounts["auth-suspect"])
+	}
+	if state.Accounts["auth-guard"].State != StateHealthy {
+		t.Fatalf("guard-disabled account was not restored and probed: %#v", state.Accounts["auth-guard"])
 	}
 	if state.Accounts["auth-external"].State != StateExternallyDisabled {
 		t.Fatalf("external account should be skipped: %#v", state.Accounts["auth-external"])

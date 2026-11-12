@@ -370,6 +370,12 @@ func (p *Plugin) actionProbe(ctx context.Context, params map[string]any) (any, i
 	force := boolFromParams(params, "force")
 	task := p.startTask("accounts.probe", []string{authID}, "正在执行主动探测", func(taskCtx context.Context) (any, error) {
 		// Detached tasks must not reuse the short-lived management callback
+		if force {
+			stateAccount, _ := p.stateAccount(authID)
+			if errRestore := p.restoreBeforeManualProbe(taskCtx, authID, stateAccount.State); errRestore != nil {
+				return nil, errRestore
+			}
+		}
 		if errProbe := p.ProbeAccount(taskCtx, authID, force, ""); errProbe != nil {
 			return nil, errProbe
 		}
@@ -380,6 +386,15 @@ func (p *Plugin) actionProbe(ctx context.Context, params map[string]any) (any, i
 		return p.accountView(taskCtx, account)
 	})
 	return task, http.StatusAccepted, nil
+}
+
+func (p *Plugin) restoreBeforeManualProbe(ctx context.Context, authID, stateBefore string) error {
+	switch stateBefore {
+	case StateCooling, StateDisabledByGuard:
+		return p.ManualRestore(ctx, authID)
+	default:
+		return nil
+	}
 }
 
 func (p *Plugin) actionProbeNonHealthy(ctx context.Context, _ map[string]any) (any, int, error) {
@@ -396,7 +411,7 @@ func (p *Plugin) actionProbeNonHealthy(ctx context.Context, _ map[string]any) (a
 		var wg sync.WaitGroup
 		for index, candidate := range candidates {
 			result.Items[index] = probeBatchItem{AuthID: candidate.authID, StateBefore: candidate.stateBefore}
-			if candidate.stateBefore == StateDisabledByGuard || candidate.stateBefore == StateExternallyDisabled {
+			if candidate.stateBefore == StateExternallyDisabled {
 				result.Items[index].Status = "skipped"
 				continue
 			}
@@ -404,6 +419,12 @@ func (p *Plugin) actionProbeNonHealthy(ctx context.Context, _ map[string]any) (a
 			go func(index int, candidate nonHealthyCandidate) {
 				defer wg.Done()
 				entry := probeBatchItem{AuthID: candidate.authID, StateBefore: candidate.stateBefore}
+				if errRestore := p.restoreBeforeManualProbe(taskCtx, candidate.authID, candidate.stateBefore); errRestore != nil {
+					entry.Status = "failed"
+					entry.Error = sanitizeError(errRestore)
+					result.Items[index] = entry
+					return
+				}
 				if errProbe := p.ProbeAccount(taskCtx, candidate.authID, true, ""); errProbe != nil {
 					entry.Status = "failed"
 					entry.Error = sanitizeError(errProbe)
