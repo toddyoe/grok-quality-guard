@@ -21,7 +21,7 @@ func TestProbeFailureAfterStrikePermanentlyDisablesWithoutDeadlock(t *testing.T)
 	})
 	host := newMockHostCall(entries, auths)
 	host.scriptStream("auth-1", badStreamScript()...)
-	plugin := newTestPlugin(t, host, nil)
+	plugin := newTestPlugin(t, host, func(cfg *Config) { cfg.AutoAction = "cooldown_then_disable" })
 	done := make(chan error, 1)
 	go func() {
 		done <- plugin.ProbeAccount(context.Background(), "auth-1", true, "callback-1")
@@ -47,7 +47,7 @@ func TestProbeFailureAfterStrikePermanentlyDisablesWithoutDeadlock(t *testing.T)
 	}
 }
 
-func TestProbeSuccessReenablesCooldownAndKeepsStrike(t *testing.T) {
+func TestProbeSuccessReenablesCooldownAndClearsStrikes(t *testing.T) {
 	entries, auths := singleGrokAuth(t, "auth-1", "alice@example.com", map[string]any{
 		"disabled": true,
 		"grok_quality_guard": map[string]any{
@@ -73,7 +73,7 @@ func TestProbeSuccessReenablesCooldownAndKeepsStrike(t *testing.T) {
 		t.Fatal(errProbe)
 	}
 	account, _ := plugin.stateAccount("auth-1")
-	if account.State != StateHealthy || !account.QualityStrikeMissingThinking {
+	if account.State != StateHealthy || account.QualityStrikeMissingThinking || account.SoftStrikes != 0 || account.ErrorStrikes != 0 || account.ThinkingStrikes != 0 {
 		t.Fatalf("unexpected state after successful probe: %#v", account)
 	}
 	saved, errDecode := rawAuthToMap(host.saves["auth-1"])
@@ -87,8 +87,8 @@ func TestProbeSuccessReenablesCooldownAndKeepsStrike(t *testing.T) {
 	if meta.DisableKind != "" || meta.CooldownUntil != "" {
 		t.Fatalf("probe success did not clear cooldown metadata: %#v", meta)
 	}
-	if !meta.StrikeMissingThinking {
-		t.Fatal("probe success incorrectly cleared missing-thinking strike")
+	if meta.StrikeMissingThinking {
+		t.Fatal("probe success did not clear the missing-thinking strike")
 	}
 }
 func TestProbeBackoffGrowsAndCaps(t *testing.T) {

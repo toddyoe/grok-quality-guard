@@ -43,6 +43,9 @@ type accountView struct {
 	ProbeBackoffUntil     time.Time `json:"probe_backoff_until,omitempty"`
 	DisableKind           string    `json:"disable_kind,omitempty"`
 	StrikeMissingThinking bool      `json:"strike_missing_thinking"`
+	SoftStrikes           int       `json:"soft_strikes"`
+	ErrorStrikes          int       `json:"error_strikes"`
+	ThinkingStrikes       int       `json:"thinking_strikes"`
 	ResinManaged          bool      `json:"resin_managed"`
 	ResinAccount          string    `json:"resin_account,omitempty"`
 	ResinGeneration       int64     `json:"resin_generation"`
@@ -89,7 +92,10 @@ func (p *Plugin) HandleManagement(request []byte) ([]byte, error) {
 		}
 		return okEnvelope(managementResponse{StatusCode: status, Headers: jsonHeaders(), Body: jsonError(actionErrorCode(status), sanitizeError(errAction))})
 	}
-	return okEnvelope(managementResponse{StatusCode: http.StatusOK, Headers: jsonHeaders(), Body: jsonOK(data)})
+	if status == 0 {
+		status = http.StatusOK
+	}
+	return okEnvelope(managementResponse{StatusCode: status, Headers: jsonHeaders(), Body: jsonOK(data)})
 }
 
 func (p *Plugin) handleAction(ctx context.Context, action actionRequest, callbackID string) (any, int, error) {
@@ -130,6 +136,10 @@ func (p *Plugin) handleAction(ctx context.Context, action actionRequest, callbac
 		return p.actionPolicyReset()
 	case "events.list":
 		return p.actionEventsList(action.Params)
+	case "tasks.get":
+		return p.actionTaskGet(action.Params)
+	case "tasks.list":
+		return p.actionTaskList(action.Params)
 	default:
 		return nil, http.StatusBadRequest, fmt.Errorf("unknown action")
 	}
@@ -174,6 +184,10 @@ func (p *Plugin) actionOverview(ctx context.Context) (any, int, error) {
 	enabled := p.cfg.Enabled
 	policy := p.policy
 	p.mu.RUnlock()
+	stateFile := ""
+	if store := p.stateStore(); store != nil {
+		stateFile = store.Path()
+	}
 	return map[string]any{
 		"enabled":              enabled,
 		"updated_at":           state.UpdatedAt,
@@ -182,6 +196,7 @@ func (p *Plugin) actionOverview(ctx context.Context) (any, int, error) {
 		"resin":                map[string]int{"bound": resinBound, "unbound": resinUnbound, "conflict": resinConflicts},
 		"recent_anomalies_24h": recentAnomalies,
 		"policy":               policy,
+		"state_file":           stateFile,
 	}, http.StatusOK, nil
 }
 
@@ -275,19 +290,24 @@ func (p *Plugin) actionProbe(ctx context.Context, params map[string]any, callbac
 	if authID == "" {
 		return nil, http.StatusBadRequest, fmt.Errorf("auth_id is required")
 	}
+	if _, okAccount := p.findAccount(authID); !okAccount {
+		_ = p.RefreshCatalog(ctx)
+		if _, okAccount = p.findAccount(authID); !okAccount {
+			return nil, http.StatusNotFound, fmt.Errorf("auth not found")
+		}
+	}
 	force := boolFromParams(params, "force")
-	if errProbe := p.ProbeAccount(ctx, authID, force, callbackID); errProbe != nil {
-		return nil, http.StatusBadGateway, errProbe
-	}
-	account, okAccount := p.findAccount(authID)
-	if !okAccount {
-		return nil, http.StatusNotFound, fmt.Errorf("auth not found")
-	}
-	view, errView := p.accountView(ctx, account)
-	if errView != nil {
-		return nil, http.StatusBadGateway, errView
-	}
-	return view, http.StatusOK, nil
+	task := p.startTask("accounts.probe", []string{authID}, "正在执行主动探测", func(taskCtx context.Context) (any, error) {
+		if errProbe := p.ProbeAccount(taskCtx, authID, force, callbackID); errProbe != nil {
+			return nil, errProbe
+		}
+		account, okAccount := p.findAccount(authID)
+		if !okAccount {
+			return nil, fmt.Errorf("auth not found")
+		}
+		return p.accountView(taskCtx, account)
+	})
+	return task, http.StatusAccepted, nil
 }
 
 func (p *Plugin) actionCooldown(ctx context.Context, params map[string]any) (any, int, error) {
@@ -331,83 +351,73 @@ func (p *Plugin) actionRestore(ctx context.Context, params map[string]any) (any,
 	return p.actionAccountGet(ctx, map[string]any{"auth_id": authID})
 }
 
-func (p *Plugin) actionResinBind(ctx context.Context, params map[string]any) (any, int, error) {
+func (p *Plugin) actionResinBind(_ context.Context, params map[string]any) (any, int, error) {
+	authIDs := authIDsFromParams(params)
+	if len(authIDs) == 0 {
+		return nil, http.StatusBadRequest, fmt.Errorf("auth_id or auth_ids is required")
+	}
 	dryRun := boolFromParams(params, "dry_run")
-	if rawIDs, ok := params["auth_ids"].([]any); ok {
-		results := make([]ResinBindResult, 0, len(rawIDs))
-		for _, rawID := range rawIDs {
-			authID := strings.TrimSpace(asString(rawID))
-			if authID == "" {
-				continue
-			}
-			result, errBind := p.BindResin(ctx, authID, dryRun)
+	task := p.startTask("resin.bind", authIDs, "正在绑定 Resin 代理", func(taskCtx context.Context) (any, error) {
+		results := make([]ResinBindResult, 0, len(authIDs))
+		for _, authID := range authIDs {
+			result, errBind := p.BindResin(taskCtx, authID, dryRun)
 			if errBind != nil && result.Error == "" {
-				result.Error = errBind.Error()
+				result.Error = sanitizeError(errBind)
 			}
 			results = append(results, result)
 		}
-		return results, http.StatusOK, nil
-	}
-	authID := strings.TrimSpace(asString(params["auth_id"]))
-	if authID == "" {
+		return map[string]any{"items": results, "count": len(results)}, nil
+	})
+	return task, http.StatusAccepted, nil
+}
+
+func (p *Plugin) actionResinBindUnbound(_ context.Context, params map[string]any) (any, int, error) {
+	dryRun := boolFromParams(params, "dry_run")
+	task := p.startTask("resin.bind_unbound", nil, "正在批量绑定未绑定账号", func(taskCtx context.Context) (any, error) {
+		results, errBind := p.BindUnboundResin(taskCtx, dryRun)
+		if errBind != nil {
+			return nil, errBind
+		}
+		return map[string]any{"items": results, "count": len(results)}, nil
+	})
+	return task, http.StatusAccepted, nil
+}
+
+func (p *Plugin) actionResinClear(_ context.Context, params map[string]any) (any, int, error) {
+	authIDs := authIDsFromParams(params)
+	if len(authIDs) == 0 {
 		return nil, http.StatusBadRequest, fmt.Errorf("auth_id or auth_ids is required")
 	}
-	result, errBind := p.BindResin(ctx, authID, dryRun)
-	if errBind != nil {
-		return result, http.StatusConflict, errBind
-	}
-	return result, http.StatusOK, nil
-}
-
-func (p *Plugin) actionResinBindUnbound(ctx context.Context, params map[string]any) (any, int, error) {
-	results, errBind := p.BindUnboundResin(ctx, boolFromParams(params, "dry_run"))
-	if errBind != nil {
-		return nil, http.StatusBadGateway, errBind
-	}
-	return map[string]any{"items": results, "count": len(results)}, http.StatusOK, nil
-}
-
-func (p *Plugin) actionResinClear(ctx context.Context, params map[string]any) (any, int, error) {
-	if rawIDs, ok := params["auth_ids"].([]any); ok {
-		results := make([]ResinClearResult, 0, len(rawIDs))
-		seen := make(map[string]struct{}, len(rawIDs))
-		for _, rawID := range rawIDs {
-			authID := strings.TrimSpace(asString(rawID))
-			if authID == "" {
-				continue
-			}
-			if _, exists := seen[authID]; exists {
-				continue
-			}
-			seen[authID] = struct{}{}
-			result, errClear := p.ClearResinProxy(ctx, authID)
+	task := p.startTask("resin.clear", authIDs, "正在清除账号代理", func(taskCtx context.Context) (any, error) {
+		results := make([]ResinClearResult, 0, len(authIDs))
+		for _, authID := range authIDs {
+			result, errClear := p.ClearResinProxy(taskCtx, authID)
 			if errClear != nil && result.Error == "" {
-				result.Error = errClear.Error()
+				result.Error = sanitizeError(errClear)
 			}
 			results = append(results, result)
 		}
-		return results, http.StatusOK, nil
-	}
-	authID := strings.TrimSpace(asString(params["auth_id"]))
-	if authID == "" {
-		return nil, http.StatusBadRequest, fmt.Errorf("auth_id or auth_ids is required")
-	}
-	result, errClear := p.ClearResinProxy(ctx, authID)
-	if errClear != nil {
-		return result, http.StatusConflict, errClear
-	}
-	return result, http.StatusOK, nil
+		return map[string]any{"items": results, "count": len(results)}, nil
+	})
+	return task, http.StatusAccepted, nil
 }
 
-func (p *Plugin) actionResinRotate(ctx context.Context, params map[string]any) (any, int, error) {
+func (p *Plugin) actionResinRotate(_ context.Context, params map[string]any) (any, int, error) {
 	authID := strings.TrimSpace(asString(params["auth_id"]))
 	if authID == "" {
 		return nil, http.StatusBadRequest, fmt.Errorf("auth_id is required")
 	}
-	if errRotate := p.RotateResin(ctx, authID); errRotate != nil {
-		return nil, http.StatusConflict, errRotate
-	}
-	return p.actionAccountGet(ctx, map[string]any{"auth_id": authID})
+	task := p.startTask("resin.rotate", []string{authID}, "正在轮换代理租约", func(taskCtx context.Context) (any, error) {
+		if errRotate := p.RotateResin(taskCtx, authID); errRotate != nil {
+			return nil, errRotate
+		}
+		account, okAccount := p.findAccount(authID)
+		if !okAccount {
+			return nil, fmt.Errorf("auth not found")
+		}
+		return p.accountView(taskCtx, account)
+	})
+	return task, http.StatusAccepted, nil
 }
 
 func (p *Plugin) actionPolicyGet() (any, int, error) {
@@ -490,6 +500,22 @@ func (p *Plugin) actionPolicyReset() (any, int, error) {
 	return normalized, http.StatusOK, nil
 }
 
+func (p *Plugin) actionTaskGet(params map[string]any) (any, int, error) {
+	taskID := strings.TrimSpace(asString(params["task_id"]))
+	if taskID == "" {
+		return nil, http.StatusBadRequest, fmt.Errorf("task_id is required")
+	}
+	task, okTask := p.taskByID(taskID)
+	if !okTask {
+		return nil, http.StatusNotFound, fmt.Errorf("task not found")
+	}
+	return task, http.StatusOK, nil
+}
+
+func (p *Plugin) actionTaskList(params map[string]any) (any, int, error) {
+	return map[string]any{"items": p.listTasks(intFromParams(params, "limit", 50))}, http.StatusOK, nil
+}
+
 func (p *Plugin) actionEventsList(params map[string]any) (any, int, error) {
 	state := p.stateStore().Snapshot()
 	events := append([]Event(nil), state.Events...)
@@ -555,6 +581,9 @@ func (p *Plugin) accountView(ctx context.Context, account Account) (accountView,
 		ProbeBackoffUntil:     stateAccount.ProbeBackoffUntil,
 		DisableKind:           stateAccount.DisableKind,
 		StrikeMissingThinking: stateAccount.QualityStrikeMissingThinking,
+		SoftStrikes:           stateAccount.SoftStrikes,
+		ErrorStrikes:          stateAccount.ErrorStrikes,
+		ThinkingStrikes:       stateAccount.ThinkingStrikes,
 		ResinManaged:          meta.Managed || stateAccount.Resin.Managed,
 		ResinAccount:          firstNonEmpty(meta.ResinAccount, stateAccount.Resin.Account),
 		ResinGeneration:       resinGeneration,
@@ -598,6 +627,30 @@ func intFromParams(params map[string]any, key string, fallback int) int {
 		return int(value)
 	}
 	return fallback
+}
+
+func authIDsFromParams(params map[string]any) []string {
+	if rawIDs, ok := params["auth_ids"].([]any); ok {
+		out := make([]string, 0, len(rawIDs))
+		seen := make(map[string]struct{}, len(rawIDs))
+		for _, rawID := range rawIDs {
+			authID := strings.TrimSpace(asString(rawID))
+			if authID == "" {
+				continue
+			}
+			if _, exists := seen[authID]; exists {
+				continue
+			}
+			seen[authID] = struct{}{}
+			out = append(out, authID)
+		}
+		return out
+	}
+	authID := strings.TrimSpace(asString(params["auth_id"]))
+	if authID == "" {
+		return nil
+	}
+	return []string{authID}
 }
 
 func boolFromParams(params map[string]any, key string) bool {

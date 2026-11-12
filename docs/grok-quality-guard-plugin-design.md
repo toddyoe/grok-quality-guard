@@ -1270,7 +1270,7 @@ Content-Type: application/json
 }
 ```
 
-状态码：200 成功、400 参数错误或 Resin 验证失败、403 动作不允许、404 auth/事件不存在、409 状态冲突、429 操作过于频繁、500 插件内部错误、502 Resin Admin API/代理不可达、503 CPA host 回调或上游不可用。
+状态码：200 成功、202 已接受异步任务、400 参数错误或 Resin 验证失败、403 动作不允许、404 auth/事件不存在、409 状态冲突、429 操作过于频繁、500 插件内部错误、502 Resin Admin API/代理不可达、503 CPA host 回调或上游不可用。异步任务的最终失败通过 `tasks.get` 的 `error` 和 `error_status` 返回。
 
 ### 10.4 Action 列表
 
@@ -1279,21 +1279,23 @@ Content-Type: application/json
 | `overview` | 无 | 汇总状态和计数 |
 | `accounts.list` | `page`、`page_size`、`state`、`query` | 分页账号列表 |
 | `accounts.get` | `auth_id` | 单个账号详情 |
-| `accounts.probe` | `auth_id`、`force` | 同步探测，90s 超时 |
+| `accounts.probe` | `auth_id`、`force` | 提交异步探测任务，返回 `task_id` |
 | `accounts.cooldown` | `auth_id`、`duration` | 手动冷却 |
 | `accounts.disable` | `auth_id`、`reason` | 手动永久禁用 |
 | `accounts.restore` | `auth_id` | 恢复 guard-owned auth 并清除 strike |
-| `resin.bind` | `auth_id` 或 `auth_ids` | API 模式下显式绑定；仅本地轮换模式拒绝 |
-| `resin.bind_unbound` | `dry_run` | 批量绑定未绑定账号 |
-| `resin.rotate` | `auth_id` | API 模式删除旧租约并重绑；本地模式只改写已有代理用户名 |
-| `resin.clear` | `auth_id` 或 `auth_ids` | API 模式删除插件管理的远端租约并清除代理；外部代理或本地模式只清除 auth 配置 |
+| `resin.bind` | `auth_id` 或 `auth_ids` | 提交异步绑定任务；仅本地轮换模式拒绝 |
+| `resin.bind_unbound` | `dry_run` | 提交异步批量绑定任务 |
+| `resin.rotate` | `auth_id` | 提交异步轮换任务；API 模式删除旧租约并重绑，本地模式只改写已有代理用户名 |
+| `resin.clear` | `auth_id` 或 `auth_ids` | 提交异步清除任务；API 模式删除插件管理的远端租约并清除代理，外部代理或本地模式只清除 auth 配置 |
 | `resin.config.get` | 无 | 返回脱敏的 Resin 配置和 token 是否已设置 |
-| `resin.config.validate` | Resin 配置字段 | API 模式验证 Admin API、Admin Token、平台和 Proxy Token；本地模式直接返回 |
-| `resin.config.save` | Resin 配置字段 | API 模式再次验证后原子持久化；本地模式直接持久化 |
+| `resin.config.validate` | Resin 配置字段 | 提交异步验证任务 |
+| `resin.config.save` | Resin 配置字段 | 提交异步验证并保存任务 |
 | `policy.get` | 无 | 返回运行时策略 |
 | `policy.update` | `policy` | 校验并持久化策略 |
 | `policy.reset` | 无 | 重置为 YAML 默认值 |
 | `events.list` | `limit`、`cursor`、`auth_id` | 事件列表 |
+| `tasks.get` | `task_id` | 查询异步任务状态、结果和错误 |
+| `tasks.list` | `limit` | 列出最近异步任务 |
 
 ### 10.5 管理页与 host 认证
 
@@ -1328,6 +1330,12 @@ plugins:
       quality:
         soft_tps: 500
         hard_tps: 1000
+        consecutive_soft: 2
+        consecutive_errors: 2
+        consecutive_missing_thinking: 1
+        thinking_guard: true
+        soft_cross_verify: false
+        thinking_cross_verify: false
         min_generation_ms: 1000
         min_passive_output_tokens: 32
         min_hold_output_tokens: 8
@@ -1360,7 +1368,7 @@ plugins:
         proxy_template: "socks5h://{platform}.{account}:{proxy_token}@resin:2260"
         auto_rotate_after_quality_failure: true
 
-      state_file: ""
+      state_file: "/CLIProxyAPI/plugin-data/grok-quality-guard/state.json"
       events_limit: 1000
 ```
 
@@ -1378,6 +1386,8 @@ Resin 配置采用“YAML 初始化，管理页验证后保存并优先使用”
 - state 未配置 Resin 且 token 为空时，从 `admin_token_env` 和 `proxy_token_env` 读取环境变量回退
 - 管理页 `resin.config.save` 成功后，state 中的完整 Resin 配置优先；`local_only=true` 时不读取 API 凭据
 - 后续 YAML 修改不会静默覆盖已保存的 Resin 配置；管理员需在管理页重新保存，API 模式还需重新验证
+
+长时间运行的探测、Resin 配置验证/保存、绑定、清除、轮换和批量绑定通过插件内异步任务执行，管理 API 返回 `202 Accepted` 和 `task_id`，调用方通过 `tasks.get` 轮询。这样请求不会因为超过 oh-my-cpa 默认 15 秒管理超时而被网关转成 502。
 
 运行时策略首次从 YAML 初始化到 state，之后由管理页修改：
 
@@ -1399,6 +1409,12 @@ Resin 配置采用“YAML 初始化，管理页验证后保存并优先使用”
 - `auto_action=observe`
 - `on_exhausted=fail_closed`
 - `max_attempts=6`
+- `quality.consecutive_soft=2`
+- `quality.consecutive_errors=2`
+- `quality.consecutive_missing_thinking=1`
+- `quality.thinking_guard=true`
+- `quality.soft_cross_verify=false`
+- `quality.thinking_cross_verify=false`
 - `probe.recovery_only=true`
 - `probe.concurrency=1`
 - `resin.enabled=false`
@@ -1409,13 +1425,16 @@ Resin 配置采用“YAML 初始化，管理页验证后保存并优先使用”
 
 ### 12.1 路径
 
-默认路径：
+默认路径按顺序选择第一个可写位置：
 
 ```text
+/CLIProxyAPI/plugin-data/grok-quality-guard/state.json
+plugin-data/grok-quality-guard/state.json
 <os.UserConfigDir()>/cliproxyapi/grok-quality-guard/state.json
+<temp>/grok-quality-guard/state.json
 ```
 
-也允许通过 `state_file` 覆盖。目录权限 `0700`，文件权限 `0600`。
+Docker 部署必须将 `/CLIProxyAPI/plugin-data/grok-quality-guard` 挂载为宿主持久卷，否则容器重建后 state 会丢失。也允许通过 `state_file` 显式覆盖；显式路径不可写时不会静默替换。目录权限 `0700`，文件权限 `0600`。
 
 ### 12.2 Schema
 
@@ -1449,6 +1468,9 @@ Resin 配置采用“YAML 初始化，管理页验证后保存并优先使用”
       "last_probe_at": "",
       "cooldown_until": "",
       "quality_strike_missing_thinking": false,
+      "soft_strikes": 0,
+      "error_strikes": 0,
+      "thinking_strikes": 0,
       "probe_backoff_until": "",
       "resin": {
         "managed": false,

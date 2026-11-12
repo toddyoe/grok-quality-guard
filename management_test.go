@@ -61,7 +61,42 @@ func actionManagementForTest(t *testing.T, plugin *Plugin, action string, params
 		t.Fatal(errMarshal)
 	}
 	headers := http.Header{"Content-Type": []string{"application/json"}}
-	return callManagementForTest(t, plugin, http.MethodPost, "/plugins/grok-quality-guard/api", headers, body)
+	response := callManagementForTest(t, plugin, http.MethodPost, "/plugins/grok-quality-guard/api", headers, body)
+	if response.StatusCode != http.StatusAccepted {
+		return response
+	}
+	var envelope struct {
+		Data Task `json:"data"`
+	}
+	if errUnmarshal := json.Unmarshal(response.Body, &envelope); errUnmarshal != nil {
+		t.Fatalf("decode accepted task: %v", errUnmarshal)
+	}
+	task := waitTaskForTest(t, plugin, envelope.Data.ID)
+	if task.Status == taskStatusFailed {
+		status := task.ErrorStatus
+		if status == 0 {
+			status = http.StatusBadGateway
+		}
+		return managementResponse{StatusCode: status, Headers: jsonHeaders(), Body: jsonError(actionErrorCode(status), task.Error)}
+	}
+	return managementResponse{StatusCode: http.StatusOK, Headers: jsonHeaders(), Body: jsonOK(task.Result)}
+}
+
+func waitTaskForTest(t *testing.T, plugin *Plugin, taskID string) Task {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		task, okTask := plugin.taskByID(taskID)
+		if !okTask {
+			t.Fatalf("task %s disappeared", taskID)
+		}
+		if task.Status == taskStatusSucceeded || task.Status == taskStatusFailed {
+			return task
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("task %s did not finish", taskID)
+	return Task{}
 }
 
 func TestManagementResourceAndActionAccess(t *testing.T) {

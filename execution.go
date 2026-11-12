@@ -753,6 +753,13 @@ func (p *Plugin) rotateAfterFailure(ctx context.Context, authID, class string) (
 	return true, nil
 }
 
+func classifyProbeStatus(status int) string {
+	if status == http.StatusProxyAuthRequired {
+		return ClassProxyError
+	}
+	return ClassIgnored
+}
+
 func classifyTransportError(errValue error) string {
 	if errValue == nil {
 		return ClassProbeError
@@ -760,6 +767,11 @@ func classifyTransportError(errValue error) string {
 	text := strings.ToLower(errValue.Error())
 	if strings.Contains(text, "proxy") || strings.Contains(text, "resin") || strings.Contains(text, "socks") {
 		return ClassProxyError
+	}
+	for _, marker := range []string{"invalid token", "expired", "no auth", "quota", "rate limit", "ratelimit", "too many requests", "permission denied", "forbidden", "unauthorized"} {
+		if strings.Contains(text, marker) {
+			return ClassIgnored
+		}
 	}
 	return ClassProbeError
 }
@@ -796,7 +808,7 @@ func sseHeaders() http.Header {
 	}
 }
 
-func safeReplayRequest(body []byte, sourceFormat, model string) bool {
+func safeReplayRequest(body []byte, sourceFormat, _ string) bool {
 	if len(body) == 0 {
 		return false
 	}
@@ -852,7 +864,6 @@ func safeReplayRequest(body []byte, sourceFormat, model string) bool {
 	if reasoningDisabledBody(payload) {
 		return false
 	}
-	_ = model
 	return true
 }
 

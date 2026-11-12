@@ -115,11 +115,10 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 }
 
 //export cliproxyPluginFree
-func cliproxyPluginFree(ptr unsafe.Pointer, length C.size_t) {
+func cliproxyPluginFree(ptr unsafe.Pointer, _ C.size_t) {
 	if ptr != nil {
 		C.free(ptr)
 	}
-	_ = length
 }
 
 //export cliproxyPluginShutdown

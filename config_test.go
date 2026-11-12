@@ -43,7 +43,9 @@ func TestNormalizePolicyRejectsInvalidTPS(t *testing.T) {
 }
 
 func TestConfigRevisionStable(t *testing.T) {
-	if configRevision([]byte("a: 1")) != configRevision([]byte("a: 1")) {
+	firstRevision := configRevision([]byte("a: 1"))
+	secondRevision := configRevision([]byte("a: 1"))
+	if firstRevision != secondRevision {
 		t.Fatal("same config should produce same revision")
 	}
 	if configRevision([]byte("a: 1")) == configRevision([]byte("a: 2")) {

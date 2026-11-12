@@ -321,9 +321,17 @@ func TestResinConfigSaveDoesNotPersistWhenValidationContextCancelled(t *testing.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	params := validResinParams("http://127.0.0.1:1", "127.0.0.1:1")
-	_, status, errSave := plugin.actionResinConfigSave(ctx, params)
-	if errSave == nil || status != http.StatusBadGateway {
-		t.Fatalf("save error = %v status=%d", errSave, status)
+	taskValue, status, errSave := plugin.actionResinConfigSave(ctx, params)
+	if errSave != nil || status != http.StatusAccepted {
+		t.Fatalf("save submission error = %v status=%d", errSave, status)
+	}
+	task, okTask := taskValue.(Task)
+	if !okTask {
+		t.Fatalf("save did not return a task: %#v", taskValue)
+	}
+	finished := waitTaskForTest(t, plugin, task.ID)
+	if finished.Status != taskStatusFailed || finished.ErrorStatus != http.StatusBadGateway {
+		t.Fatalf("save task result = %#v", finished)
 	}
 	if plugin.store.Snapshot().Resin.Configured {
 		t.Fatal("cancelled validation persisted config")

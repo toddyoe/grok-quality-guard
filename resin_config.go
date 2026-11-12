@@ -156,22 +156,20 @@ func (p *Plugin) actionResinConfigGet() (any, int, error) {
 	return p.resinConfigView(p.ResinConfig()), http.StatusOK, nil
 }
 
-func (p *Plugin) actionResinConfigValidate(ctx context.Context, params map[string]any) (any, int, error) {
+func (p *Plugin) actionResinConfigValidate(_ context.Context, params map[string]any) (any, int, error) {
 	candidate := resinSettingsFromParams(params, p.ResinConfig())
 	normalized, errNormalize := normalizeResinSettings(candidate)
 	if errNormalize != nil {
 		return nil, http.StatusBadRequest, errNormalize
 	}
-	result, errValidate := validateResinSettings(ctx, normalized)
-	if errValidate != nil {
-		return nil, resinErrorStatus(errValidate), errValidate
-	}
-	return result, http.StatusOK, nil
+	task := p.startTask("resin.config.validate", nil, "正在验证 Resin 配置", func(taskCtx context.Context) (any, error) {
+		return validateResinSettings(taskCtx, normalized)
+	})
+	return task, http.StatusAccepted, nil
 }
 
-func (p *Plugin) actionResinConfigSave(ctx context.Context, params map[string]any) (any, int, error) {
-	store := p.stateStore()
-	if store == nil {
+func (p *Plugin) actionResinConfigSave(_ context.Context, params map[string]any) (any, int, error) {
+	if p.stateStore() == nil {
 		return nil, http.StatusInternalServerError, errors.New("state store is not initialized")
 	}
 	candidate := resinSettingsFromParams(params, p.ResinConfig())
@@ -179,9 +177,20 @@ func (p *Plugin) actionResinConfigSave(ctx context.Context, params map[string]an
 	if errNormalize != nil {
 		return nil, http.StatusBadRequest, errNormalize
 	}
+	task := p.startTask("resin.config.save", nil, "正在验证并保存 Resin 配置", func(taskCtx context.Context) (any, error) {
+		return p.saveResinConfig(taskCtx, normalized)
+	})
+	return task, http.StatusAccepted, nil
+}
+
+func (p *Plugin) saveResinConfig(ctx context.Context, normalized ResinSettings) (any, error) {
+	store := p.stateStore()
+	if store == nil {
+		return nil, errors.New("state store is not initialized")
+	}
 	result, errValidate := validateResinSettings(ctx, normalized)
 	if errValidate != nil {
-		return nil, resinErrorStatus(errValidate), errValidate
+		return nil, errValidate
 	}
 	if result.Platform != "" {
 		normalized.Platform = result.Platform
@@ -204,7 +213,7 @@ func (p *Plugin) actionResinConfigSave(ctx context.Context, params map[string]an
 		p.recordEvent(state, "", "", "resin_config_save", eventResult, eventDetail)
 		return nil
 	}); errStore != nil {
-		return nil, http.StatusInternalServerError, errStore
+		return nil, errStore
 	}
 	p.mu.Lock()
 	p.policy.ResinAutoRotateAfterQualityFail = normalized.AutoRotateAfterQualityFailure
@@ -216,9 +225,8 @@ func (p *Plugin) actionResinConfigSave(ctx context.Context, params map[string]an
 	p.cfg.Resin.ProxyTemplate = normalized.ProxyTemplate
 	p.cfg.Resin.AutoRotateAfterQualityFailure = normalized.AutoRotateAfterQualityFailure
 	p.mu.Unlock()
-	return p.resinConfigView(normalized), http.StatusOK, nil
+	return p.resinConfigView(normalized), nil
 }
-
 func resinSettingsFromParams(params map[string]any, current ResinSettings) ResinSettings {
 	settings := current
 	settings.Enabled = optionalBoolParam(params, "enabled", settings.Enabled)
@@ -564,7 +572,9 @@ func validateResinProxyToken(ctx context.Context, settings ResinSettings) error 
 	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
 		deadline = ctxDeadline
 	}
-	_ = conn.SetDeadline(deadline)
+	if errDeadline := conn.SetDeadline(deadline); errDeadline != nil {
+		return resinConfigErrorf(http.StatusBadGateway, "set resin proxy deadline: %s", sanitizeError(errDeadline))
+	}
 	if errHandshake := socks5Authenticate(conn, username, password); errHandshake != nil {
 		if errors.Is(errHandshake, errSocks5AuthRejected) {
 			return resinConfigErrorf(http.StatusBadRequest, "resin proxy token was rejected")
@@ -629,12 +639,4 @@ func writeAll(conn net.Conn, payload []byte) error {
 		payload = payload[written:]
 	}
 	return nil
-}
-
-func resinErrorStatus(errValue error) int {
-	var typed *resinConfigError
-	if errors.As(errValue, &typed) && typed.Status > 0 {
-		return typed.Status
-	}
-	return http.StatusBadRequest
 }

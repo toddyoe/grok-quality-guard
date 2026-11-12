@@ -22,6 +22,7 @@ const (
 	ClassEmptyStream        = "empty_stream"
 	ClassProbeError         = "probe_error"
 	ClassProxyError         = "proxy_error"
+	ClassIgnored            = "ignored"
 	ClassNone               = ""
 )
 
@@ -288,7 +289,7 @@ func (a *StreamAnalyzer) observeJSON(raw []byte, now time.Time) {
 	case "response.output_item.added", "response.output_item.done":
 		a.observeResponseItem(payload, now, eventName == "response.output_item.done")
 	case "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
-		a.addReasoningText(asString(payload["delta"]), now)
+		a.addReasoningText(asString(payload["delta"]))
 	case "response.output_text.delta":
 		a.addVisibleText(asString(payload["delta"]), now)
 	case "response.output_text.done":
@@ -320,7 +321,7 @@ func (a *StreamAnalyzer) observeJSON(raw []byte, now time.Time) {
 
 func (a *StreamAnalyzer) observeChatDelta(delta map[string]any, now time.Time) {
 	if text := firstString(delta, "reasoning", "reasoning_content", "thinking_content"); strings.TrimSpace(text) != "" {
-		a.addReasoningText(text, now)
+		a.addReasoningText(text)
 	}
 	a.addContentParts(delta["content"], now)
 	if _, ok := delta["tool_calls"]; ok {
@@ -333,7 +334,7 @@ func (a *StreamAnalyzer) observeChatDelta(delta map[string]any, now time.Time) {
 
 func (a *StreamAnalyzer) observeChatMessage(message map[string]any, now time.Time) {
 	if text := firstString(message, "reasoning", "reasoning_content", "thinking_content"); strings.TrimSpace(text) != "" {
-		a.addReasoningText(text, now)
+		a.addReasoningText(text)
 	}
 	a.addContentParts(message["content"], now)
 	if _, ok := message["tool_calls"]; ok {
@@ -359,7 +360,7 @@ func (a *StreamAnalyzer) observeResponseItem(payload map[string]any, now time.Ti
 			for _, rawSummary := range summaries {
 				summary, _ := rawSummary.(map[string]any)
 				if summary != nil {
-					a.addReasoningText(asString(summary["text"]), now)
+					a.addReasoningText(asString(summary["text"]))
 				}
 			}
 		}
@@ -367,7 +368,7 @@ func (a *StreamAnalyzer) observeResponseItem(payload map[string]any, now time.Ti
 			for _, rawPart := range content {
 				part, _ := rawPart.(map[string]any)
 				if part != nil {
-					a.addReasoningText(asString(part["text"]), now)
+					a.addReasoningText(asString(part["text"]))
 				}
 			}
 		}
@@ -388,13 +389,13 @@ func (a *StreamAnalyzer) observeAnthropicBlockStart(payload map[string]any, now 
 	switch strings.ToLower(asString(block["type"])) {
 	case "thinking", "redacted_thinking":
 		if text := asString(block["thinking"]); strings.TrimSpace(text) != "" {
-			a.addReasoningText(text, now)
+			a.addReasoningText(text)
 		}
 		if data := asString(block["data"]); strings.TrimSpace(data) != "" {
 			a.addEncrypted(data)
 		}
 		if text := asString(block["text"]); strings.TrimSpace(text) != "" {
-			a.addReasoningText(text, now)
+			a.addReasoningText(text)
 		}
 		a.signals.ReasoningStarted = true
 	case "text":
@@ -411,7 +412,7 @@ func (a *StreamAnalyzer) observeAnthropicDelta(payload map[string]any, now time.
 	}
 	switch strings.ToLower(asString(delta["type"])) {
 	case "thinking_delta":
-		a.addReasoningText(firstString(delta, "thinking", "text"), now)
+		a.addReasoningText(firstString(delta, "thinking", "text"))
 	case "signature_delta":
 		a.addEncrypted(asString(delta["signature"]))
 	case "text_delta":
@@ -436,7 +437,7 @@ func (a *StreamAnalyzer) addContentParts(value any, now time.Time) {
 				a.addVisibleText(asString(part["text"]), now)
 			}
 			if kind == "reasoning_text" || kind == "summary_text" {
-				a.addReasoningText(asString(part["text"]), now)
+				a.addReasoningText(asString(part["text"]))
 			}
 			if kind == "tool_call" || kind == "function_call" {
 				a.signals.SemanticOutput = true
@@ -445,13 +446,12 @@ func (a *StreamAnalyzer) addContentParts(value any, now time.Time) {
 	}
 }
 
-func (a *StreamAnalyzer) addReasoningText(text string, now time.Time) {
+func (a *StreamAnalyzer) addReasoningText(text string) {
 	if strings.TrimSpace(text) == "" {
 		return
 	}
 	a.signals.HasReasoningDelta = true
 	a.reasoningDelta = true
-	_ = now
 }
 
 func (a *StreamAnalyzer) addVisibleText(text string, now time.Time) {
@@ -636,7 +636,7 @@ func classifyFinal(sig Signals, cfg QualityConfig, reasoningRequired bool, minOu
 	if streaming && qualityIsCipherDrool(sig, minOutput) {
 		return QualityVerdict{Class: ClassCipherDrool, Reason: "cipher-only stream is dumping visible text", Signals: sig}
 	}
-	if streaming && qualityIsFakeEncryptedDump(sig, cfg) {
+	if streaming && qualityIsFakeEncryptedDump(sig) {
 		return QualityVerdict{Class: ClassFakeEncryptedDump, Reason: "encrypted or billed reasoning preceded a fast visible dump", Signals: sig}
 	}
 	if streaming && qualityIsFastReasoningRatioDump(sig) {
@@ -686,7 +686,7 @@ func qualityIsCipherDrool(sig Signals, minOutput int64) bool {
 	return sig.VisibleTokens >= 1024 || (sig.Terminal && sig.VisibleTokens >= minOutput)
 }
 
-func qualityIsFakeEncryptedDump(sig Signals, cfg QualityConfig) bool {
+func qualityIsFakeEncryptedDump(sig Signals) bool {
 	if sig.HasReasoningDelta || (sig.EncryptedBytes <= 0 && sig.ReasoningTokens < 80) {
 		return false
 	}

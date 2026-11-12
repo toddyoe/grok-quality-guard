@@ -75,6 +75,12 @@ func (d Duration) MarshalJSON() ([]byte, error) {
 type QualityConfig struct {
 	SoftTPS                         float64  `yaml:"soft_tps" json:"soft_tps"`
 	HardTPS                         float64  `yaml:"hard_tps" json:"hard_tps"`
+	ConsecutiveSoft                 int      `yaml:"consecutive_soft" json:"consecutive_soft"`
+	ConsecutiveErrors               int      `yaml:"consecutive_errors" json:"consecutive_errors"`
+	ConsecutiveMissingThinking      int      `yaml:"consecutive_missing_thinking" json:"consecutive_missing_thinking"`
+	ThinkingGuard                   bool     `yaml:"thinking_guard" json:"thinking_guard"`
+	SoftCrossVerify                 bool     `yaml:"soft_cross_verify" json:"soft_cross_verify"`
+	ThinkingCrossVerify             bool     `yaml:"thinking_cross_verify" json:"thinking_cross_verify"`
 	MinGenerationMS                 int64    `yaml:"min_generation_ms" json:"min_generation_ms"`
 	MinPassiveOutputTokens          int64    `yaml:"min_passive_output_tokens" json:"min_passive_output_tokens"`
 	MinHoldOutputTokens             int64    `yaml:"min_hold_output_tokens" json:"min_hold_output_tokens"`
@@ -143,6 +149,12 @@ func DefaultQualityConfig() QualityConfig {
 	return QualityConfig{
 		SoftTPS:                         500,
 		HardTPS:                         1000,
+		ConsecutiveSoft:                 2,
+		ConsecutiveErrors:               2,
+		ConsecutiveMissingThinking:      1,
+		ThinkingGuard:                   true,
+		SoftCrossVerify:                 false,
+		ThinkingCrossVerify:             false,
 		MinGenerationMS:                 1000,
 		MinPassiveOutputTokens:          32,
 		MinHoldOutputTokens:             8,
@@ -249,6 +261,20 @@ func normalizeConfig(cfg *Config) error {
 	return nil
 }
 
+func (q *QualityConfig) UnmarshalJSON(data []byte) error {
+	if q == nil {
+		return errors.New("quality config is nil")
+	}
+	defaults := DefaultQualityConfig()
+	type qualityAlias QualityConfig
+	decoded := qualityAlias(defaults)
+	if errUnmarshal := json.Unmarshal(data, &decoded); errUnmarshal != nil {
+		return errUnmarshal
+	}
+	*q = QualityConfig(decoded)
+	return nil
+}
+
 func normalizeQuality(q *QualityConfig) error {
 	if q == nil {
 		return errors.New("quality config is nil")
@@ -262,6 +288,15 @@ func normalizeQuality(q *QualityConfig) error {
 	}
 	if q.HardTPS <= q.SoftTPS {
 		return fmt.Errorf("quality.hard_tps must be greater than soft_tps")
+	}
+	if q.ConsecutiveSoft <= 0 {
+		q.ConsecutiveSoft = defaults.ConsecutiveSoft
+	}
+	if q.ConsecutiveErrors <= 0 {
+		q.ConsecutiveErrors = defaults.ConsecutiveErrors
+	}
+	if q.ConsecutiveMissingThinking <= 0 {
+		q.ConsecutiveMissingThinking = defaults.ConsecutiveMissingThinking
 	}
 	if q.MinGenerationMS <= 0 {
 		q.MinGenerationMS = defaults.MinGenerationMS
@@ -338,6 +373,19 @@ func normalizeProbe(p *ProbeConfig) error {
 	return nil
 }
 
+func (p *Policy) UnmarshalJSON(data []byte) error {
+	if p == nil {
+		return errors.New("policy is nil")
+	}
+	type policyAlias Policy
+	decoded := policyAlias(PolicyFromConfig(DefaultConfig()))
+	if errUnmarshal := json.Unmarshal(data, &decoded); errUnmarshal != nil {
+		return errUnmarshal
+	}
+	*p = Policy(decoded)
+	return nil
+}
+
 func PolicyFromConfig(cfg Config) Policy {
 	return Policy{
 		PassiveGuard:                    cfg.PassiveGuard,
@@ -387,10 +435,38 @@ func configRevision(raw []byte) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
+const dockerStatePath = "/CLIProxyAPI/plugin-data/grok-quality-guard/state.json"
+
+// defaultStatePath picks the first writable persistent location. The Docker
+// layout comes first so the default survives CPA container restarts when the
+// plugin-data directory is mounted as a volume.
 func defaultStatePath() string {
-	dir, errDir := os.UserConfigDir()
-	if errDir != nil || strings.TrimSpace(dir) == "" {
-		dir = os.TempDir()
+	candidates := []string{
+		dockerStatePath,
+		filepath.Join("plugin-data", "grok-quality-guard", "state.json"),
 	}
-	return filepath.Join(dir, "cliproxyapi", "grok-quality-guard", "state.json")
+	if dir, errDir := os.UserConfigDir(); errDir == nil && strings.TrimSpace(dir) != "" {
+		candidates = append(candidates, filepath.Join(dir, "cliproxyapi", "grok-quality-guard", "state.json"))
+	}
+	for _, candidate := range candidates {
+		if writableStateDir(filepath.Dir(candidate)) {
+			return candidate
+		}
+	}
+	return filepath.Join(os.TempDir(), "grok-quality-guard", "state.json")
+}
+
+func writableStateDir(dir string) bool {
+	if strings.TrimSpace(dir) == "" {
+		return false
+	}
+	if errMkdir := os.MkdirAll(dir, 0o700); errMkdir != nil {
+		return false
+	}
+	probe := filepath.Join(dir, fmt.Sprintf(".write-probe-%d", os.Getpid()))
+	if errWrite := os.WriteFile(probe, []byte("ok"), 0o600); errWrite != nil {
+		return false
+	}
+	_ = os.Remove(probe)
+	return true
 }

@@ -1,8 +1,8 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
-	"net/http"
 	"regexp"
 	"strings"
 	"time"
@@ -161,13 +161,13 @@ func (p *Plugin) HandleUsage(request []byte) {
 		sig.GenerationMS = generationWindowMS(sig.DurationMS, sig.FirstTokenMS, sig.ReasoningTokens)
 		sig.TPS = tps(sig.OutputTokens, sig.GenerationMS)
 	}
-	required := reasoningRequired(body)
+	required := policy.Quality.ThinkingGuard && reasoningRequired(body)
 	if pending == nil {
 		required = false
 	}
 	minOutput := policy.Quality.MinPassiveOutputTokens
 	verdict := classifyFinal(sig, policy.Quality, required, minOutput, record.Stream)
-	if errApply := p.ApplyVerdict(nil, record.AuthID, verdict, "passive", ""); errApply != nil {
+	if errApply := p.ApplyVerdict(context.Background(), record.AuthID, verdict, "passive", ""); errApply != nil {
 		_ = p.recordInternalError(record.AuthID, errApply)
 	}
 }
@@ -214,23 +214,6 @@ func sanitizeError(errValue error) string {
 		text = text[:512]
 	}
 	return text
-}
-
-func headerHas(header http.Header, key, value string) bool {
-	if header == nil {
-		return false
-	}
-	for headerKey, items := range header {
-		if !strings.EqualFold(headerKey, key) {
-			continue
-		}
-		for _, item := range items {
-			if strings.EqualFold(strings.TrimSpace(item), value) {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func jsonError(code, message string) []byte {

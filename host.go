@@ -56,8 +56,7 @@ func (p *Plugin) saveAuth(name string, raw json.RawMessage) (pluginapi.HostAuthS
 	return response, nil
 }
 
-func (p *Plugin) executeModel(ctx context.Context, req pluginapi.HostModelExecutionRequest, callbackID string) (pluginapi.HostModelExecutionResponse, error) {
-	_ = ctx
+func (p *Plugin) executeModel(_ context.Context, req pluginapi.HostModelExecutionRequest, callbackID string) (pluginapi.HostModelExecutionResponse, error) {
 	result, errCall := hostCall(pluginabi.MethodHostModelExecute, hostModelExecutionRequest{HostModelExecutionRequest: req, HostCallbackID: callbackID})
 	if errCall != nil {
 		return pluginapi.HostModelExecutionResponse{}, errCall
@@ -69,8 +68,7 @@ func (p *Plugin) executeModel(ctx context.Context, req pluginapi.HostModelExecut
 	return response, nil
 }
 
-func (p *Plugin) executeModelStream(ctx context.Context, req pluginapi.HostModelExecutionRequest, callbackID string) (pluginapi.HostModelStreamResponse, error) {
-	_ = ctx
+func (p *Plugin) executeModelStream(_ context.Context, req pluginapi.HostModelExecutionRequest, callbackID string) (pluginapi.HostModelStreamResponse, error) {
 	result, errCall := hostCall(pluginabi.MethodHostModelExecuteStream, hostModelExecutionRequest{HostModelExecutionRequest: req, HostCallbackID: callbackID})
 	if errCall != nil {
 		return pluginapi.HostModelStreamResponse{}, errCall
@@ -86,8 +84,7 @@ func (p *Plugin) executeModelStream(ctx context.Context, req pluginapi.HostModel
 	return response, nil
 }
 
-func (p *Plugin) readModelStream(ctx context.Context, streamID string) (pluginapi.HostModelStreamReadResponse, error) {
-	_ = ctx
+func (p *Plugin) readModelStream(_ context.Context, streamID string) (pluginapi.HostModelStreamReadResponse, error) {
 	result, errCall := hostCall(pluginabi.MethodHostModelStreamRead, pluginapi.HostModelStreamReadRequest{StreamID: streamID})
 	if errCall != nil {
 		return pluginapi.HostModelStreamReadResponse{}, errCall

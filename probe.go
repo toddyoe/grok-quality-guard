@@ -51,7 +51,7 @@ func (p *Plugin) runDueProbes(ctx context.Context) error {
 	return nil
 }
 
-func (p *Plugin) probeDue(ctx context.Context, authID string, force bool) (bool, error) {
+func (p *Plugin) probeDue(authID string, force bool) (bool, error) {
 	if force {
 		return true, nil
 	}
@@ -88,7 +88,7 @@ func (p *Plugin) ProbeAccount(ctx context.Context, authID string, force bool, ca
 	if strings.TrimSpace(authID) == "" {
 		return fmt.Errorf("auth_id is required")
 	}
-	due, errDue := p.probeDue(ctx, authID, force)
+	due, errDue := p.probeDue(authID, force)
 	if errDue != nil || !due {
 		return errDue
 	}
@@ -155,7 +155,7 @@ func (p *Plugin) ProbeAccount(ctx context.Context, authID string, force bool, ca
 	}
 	defer p.closeModelStream(stream.StreamID)
 	if stream.StatusCode < 200 || stream.StatusCode >= 300 {
-		return p.handleProbeFailure(authID, raw, response, reEnabled, ClassProbeError, fmt.Errorf("probe upstream status %d", stream.StatusCode))
+		return p.handleProbeFailure(authID, raw, response, reEnabled, classifyProbeStatus(stream.StatusCode), fmt.Errorf("probe upstream status %d", stream.StatusCode))
 	}
 	analyzer := NewStreamAnalyzer()
 	var bufferBytes int64
@@ -188,7 +188,7 @@ func (p *Plugin) ProbeAccount(ctx context.Context, authID string, force bool, ca
 	}
 	sig := analyzer.Finalize(terminal)
 	sig.FirstTokenMS = 0
-	verdict := classifyFinal(sig, qualityCfg, true, qualityCfg.MinPassiveOutputTokens, true)
+	verdict := classifyFinal(sig, qualityCfg, qualityCfg.ThinkingGuard, qualityCfg.MinPassiveOutputTokens, true)
 	markerOK := strings.Contains(sig.VisibleText, probeMarker)
 	if verdict.Class == ClassNone && markerOK && sig.VisibleTokens >= qualityCfg.MinPassiveOutputTokens {
 		if errSuccess := p.markProbeSuccess(authID, raw, response, sig); errSuccess != nil {
@@ -209,6 +209,7 @@ func (p *Plugin) markProbeSuccess(authID string, raw map[string]json.RawMessage,
 	if meta.Managed {
 		meta.DisableKind = ""
 		meta.CooldownUntil = ""
+		meta.StrikeMissingThinking = false
 		if errMeta := setGuardMeta(raw, meta); errMeta != nil {
 			return errMeta
 		}
@@ -229,7 +230,10 @@ func (p *Plugin) markProbeSuccess(authID string, raw map[string]json.RawMessage,
 		account.CooldownUntil = time.Time{}
 		account.ProbeBackoffUntil = time.Time{}
 		account.DisableKind = ""
-		account.QualityStrikeMissingThinking = meta.StrikeMissingThinking
+		account.QualityStrikeMissingThinking = false
+		account.SoftStrikes = 0
+		account.ErrorStrikes = 0
+		account.ThinkingStrikes = 0
 		account.Metrics = Metrics{
 			FirstTokenMS:    sig.FirstTokenMS,
 			DurationMS:      sig.DurationMS,
@@ -246,54 +250,20 @@ func (p *Plugin) markProbeSuccess(authID string, raw map[string]json.RawMessage,
 }
 
 func (p *Plugin) handleProbeFailure(authID string, raw map[string]json.RawMessage, response pluginapi.HostAuthGetResponse, reEnabled bool, class string, errProbe error) error {
-	_ = response
-	p.mu.RLock()
-	policy := p.policy
-	p.mu.RUnlock()
 	if errProbe != nil {
 		_ = p.recordInternalError(authID, errProbe)
 	}
-	previousState, _ := p.stateAccount(authID)
-	backoff := nextProbeBackoff(policy.Probe, previousState)
-	now := time.Now().UTC()
-	meta := guardMeta(raw)
-	if reEnabled || (meta.Managed && meta.DisableKind != "") {
-		kind := DisableKindCooldown
-		duration := cooldownForClass(class, policy.Quality)
-		allowPermanent := policy.AutoAction != "cooldown_only"
-		switch class {
-		case ClassMissingThinking:
-			if allowPermanent && meta.StrikeMissingThinking {
-				kind = DisableKindPermanent
-				duration = 0
-			}
-		case ClassEmptyStream:
-			duration = policy.Quality.EmptyStreamCooldown.Duration
-		case ClassProbeError, ClassProxyError:
-			duration = backoff
-		}
-		if duration <= 0 && kind == DisableKindCooldown {
-			duration = policy.Quality.MissingThinkingCooldown.Duration
-		}
-		if errDisable := p.applyGuardDisableLocked(context.Background(), authID, kind, duration, class, "probe", allowPermanent && class == ClassMissingThinking); errDisable != nil {
-			return errDisable
-		}
-	}
-	return p.stateStore().Update(func(state *State) error {
-		account := p.ensureStateAccount(state, authID, "", "")
-		switch account.State {
-		case StateCooling, StateDisabledByGuard, StateExternallyDisabled:
-		default:
-			account.State = StateSuspect
-		}
-		account.LastProbeAt = now
-		account.ProbeBackoffUntil = now.Add(backoff)
-		if class != "" {
-			account.LastReason = class
-		}
-		p.recordEvent(state, authID, class, "probe", "failed", sanitizeError(errProbe))
-		return nil
-	})
+	_, errApply := p.applyVerdictLocked(
+		context.Background(),
+		authID,
+		QualityVerdict{Class: class},
+		"probe",
+		"",
+		raw,
+		response,
+		reEnabled,
+	)
+	return errApply
 }
 func (p *Plugin) saveAuthDisabled(name string, raw map[string]json.RawMessage, disabled bool) error {
 	setRawBool(raw, "disabled", disabled)

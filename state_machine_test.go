@@ -7,13 +7,16 @@ import (
 	"time"
 )
 
-func TestSuccessfulVerdictKeepsMissingThinkingStrike(t *testing.T) {
-	entries, auths := singleGrokAuth(t, "auth-1", "alice@example.com", nil)
+func TestSuccessfulVerdictResetsAllStrikes(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
 	host := newMockHostCall(entries, auths)
 	plugin := newTestPlugin(t, host, nil)
 	if err := plugin.updateStateAccount("auth-1", func(account *AccountState) error {
-		account.State = StateHealthy
+		account.State = StateSuspect
 		account.QualityStrikeMissingThinking = true
+		account.SoftStrikes = 2
+		account.ErrorStrikes = 2
+		account.ThinkingStrikes = 2
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -25,8 +28,8 @@ func TestSuccessfulVerdictKeepsMissingThinkingStrike(t *testing.T) {
 	if !ok {
 		t.Fatal("account state missing")
 	}
-	if !account.QualityStrikeMissingThinking {
-		t.Fatal("successful request cleared the missing-thinking strike")
+	if account.QualityStrikeMissingThinking || account.SoftStrikes != 0 || account.ErrorStrikes != 0 || account.ThinkingStrikes != 0 {
+		t.Fatalf("healthy observation did not reset strikes: %#v", account)
 	}
 }
 
@@ -88,7 +91,7 @@ func TestRecoveryProbeMissingThinkingAfterStrikeBecomesPermanent(t *testing.T) {
 		},
 	})
 	host := newMockHostCall(entries, auths)
-	plugin := newTestPlugin(t, host, nil)
+	plugin := newTestPlugin(t, host, func(cfg *Config) { cfg.AutoAction = "cooldown_then_disable" })
 	_, response, raw, errResolve := plugin.resolveAuth(context.Background(), "auth-1")
 	if errResolve != nil {
 		t.Fatal(errResolve)

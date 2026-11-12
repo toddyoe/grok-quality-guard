@@ -50,25 +50,6 @@ func cloneRawMap(input map[string]json.RawMessage) map[string]json.RawMessage {
 	return output
 }
 
-func (m *mockHostCall) setAuth(name string, raw json.RawMessage) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.auths[name] = append(json.RawMessage(nil), raw...)
-	for i := range m.entries {
-		if m.entries[i].Name == name {
-			var decoded struct {
-				Disabled bool   `json:"disabled"`
-				Email    string `json:"email"`
-			}
-			_ = json.Unmarshal(raw, &decoded)
-			m.entries[i].Disabled = decoded.Disabled
-			if decoded.Email != "" {
-				m.entries[i].Email = decoded.Email
-			}
-		}
-	}
-}
-
 func (m *mockHostCall) scriptStream(authID string, reads ...pluginapi.HostModelStreamReadResponse) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -234,6 +215,7 @@ func newTestPlugin(t *testing.T, host *mockHostCall, mutate func(*Config)) *Plug
 	if errConfigure := plugin.Configure(rawConfig); errConfigure != nil {
 		t.Fatalf("configure plugin: %v", errConfigure)
 	}
+	t.Cleanup(plugin.Shutdown)
 	if errRefresh := plugin.RefreshCatalog(context.Background()); errRefresh != nil {
 		t.Fatalf("refresh catalog: %v", errRefresh)
 	}

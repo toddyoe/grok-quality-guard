@@ -69,6 +69,10 @@ type Plugin struct {
 
 	modelStreamsMu sync.Mutex
 	modelStreams   map[string]struct{}
+
+	tasksMu sync.Mutex
+	tasks   map[string]*taskRecord
+	taskWG  sync.WaitGroup
 }
 
 func NewPlugin() *Plugin {
@@ -80,6 +84,7 @@ func NewPlugin() *Plugin {
 		probeSkip:     make(map[string]time.Time),
 		recentSuccess: make(map[string]time.Time),
 		modelStreams:  make(map[string]struct{}),
+		tasks:         make(map[string]*taskRecord),
 	}
 }
 
@@ -196,6 +201,7 @@ func (p *Plugin) Quiesce() {
 	p.quiescing = true
 	p.stopWorkersLocked()
 	p.mu.Unlock()
+	p.cancelTasks()
 	p.closeAllModelStreams()
 }
 
@@ -203,10 +209,12 @@ func (p *Plugin) Shutdown() {
 	p.mu.Lock()
 	p.stopWorkersLocked()
 	p.mu.Unlock()
+	p.cancelTasks()
 	p.closeAllModelStreams()
 	done := make(chan struct{})
 	go func() {
 		p.wg.Wait()
+		p.taskWG.Wait()
 		close(done)
 	}()
 	select {
@@ -239,8 +247,7 @@ func (p *Plugin) refreshLoop(ctx context.Context) {
 	}
 }
 
-func (p *Plugin) RefreshCatalog(ctx context.Context) error {
-	_ = ctx
+func (p *Plugin) RefreshCatalog(_ context.Context) error {
 	entries, errList := p.listAuths()
 	if errList != nil {
 		return errList

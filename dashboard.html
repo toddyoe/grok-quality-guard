@@ -521,6 +521,7 @@ body.drawer-open { overflow: hidden; }
                   <div class="field"><label for="p_auto_action">自动处置</label><select id="p_auto_action"><option value="cooldown_only">冷却</option><option value="observe">仅观察</option><option value="cooldown_then_disable">冷却后永久禁用</option></select><span class="hint">默认只观察，不写入 OAuth 文件</span></div>
                   <div class="field"><label for="p_model_prefixes">模型前缀</label><input id="p_model_prefixes" type="text" autocomplete="off" placeholder="grok-"><span class="hint">用于识别不含 grok 的自定义模型别名；标准 grok-* 名称会自动识别</span></div>
                   <div class="field"><label for="p_events_limit">事件保留上限</label><input id="p_events_limit" type="number" min="1" max="10000"><span class="hint">超过上限时裁剪最旧事件</span></div>
+                  <div class="field full"><label for="p_state_file">状态文件路径</label><input id="p_state_file" type="text" readonly><span class="hint">由 YAML 的 state_file 配置；Docker 部署必须把该目录挂载为持久卷</span></div>
                 </div>
               </div>
               <div class="form-section">
@@ -528,6 +529,12 @@ body.drawer-open { overflow: hidden; }
                 <div class="field-grid">
                   <div class="field"><label for="p_soft_tps">软 TPS 阈值</label><input id="p_soft_tps" type="number" min="1" step="0.1"><span class="hint">达到后标记为可疑</span></div>
                   <div class="field"><label for="p_hard_tps">硬 TPS 阈值</label><input id="p_hard_tps" type="number" min="1" step="0.1"><span class="hint">必须大于软阈值</span></div>
+                  <div class="field"><label for="p_consecutive_soft">连续软阈值次数</label><input id="p_consecutive_soft" type="number" min="1"><span class="hint">达到次数后才进入处置或交叉验证</span></div>
+                  <div class="field"><label for="p_consecutive_errors">连续错误次数</label><input id="p_consecutive_errors" type="number" min="1"><span class="hint">探测或代理错误累计达到次数后处置</span></div>
+                  <div class="field"><label for="p_consecutive_missing_thinking">连续缺少思考次数</label><input id="p_consecutive_missing_thinking" type="number" min="1"><span class="hint">对齐旧插件 consecutive_missing_thinking，默认 1</span></div>
+                  <label class="check-card"><input id="p_thinking_guard" type="checkbox"><span class="check-copy"><span class="check-title">启用缺少思考检测</span><span class="check-desc">关闭后只保留 TPS 与空流等质量检查</span></span></label>
+                  <label class="check-card"><input id="p_soft_cross_verify" type="checkbox"><span class="check-copy"><span class="check-title">软阈值交叉验证</span><span class="check-desc">连续软 TPS 达到阈值后先异步主动探测，再决定是否处置</span></span></label>
+                  <label class="check-card"><input id="p_thinking_cross_verify" type="checkbox"><span class="check-copy"><span class="check-title">缺思考交叉验证</span><span class="check-desc">连续缺少思考达到阈值后先异步主动探测，再决定是否处置</span></span></label>
                   <div class="field"><label for="p_min_generation_ms">最小生成窗口</label><input id="p_min_generation_ms" type="number" min="1"><span class="hint">单位：毫秒</span></div>
                   <div class="field"><label for="p_min_passive_output">被动审计最小输出 Token</label><input id="p_min_passive_output" type="number" min="1"></div>
                   <div class="field"><label for="p_min_encrypted_bytes">加密思考最小字节</label><input id="p_min_encrypted_bytes" type="number" min="1"></div>
@@ -660,17 +667,19 @@ const REASON_LABELS = {
   missing_thinking: '缺少真实思考', buffered_burst: '短窗口突发', cipher_drool: '密文倾倒',
   fake_encrypted_dump: '伪造加密思考', fast_reasoning_ratio_dump: '异常推理占比',
   soft_tps: '软 TPS 超限', hard_tps: '硬 TPS 超限', empty_stream: '空流',
-  probe_error: '探测错误', proxy_error: '代理错误', manual: '手动操作'
+  probe_error: '探测错误', proxy_error: '代理错误', ignored: '非质量错误', manual: '手动操作'
 };
 const ACTION_LABELS = {
   observe: '被动观测', probe: '主动探测', guard_disable: '自动处置', external_disable: '外部禁用',
   restore: '恢复账号', resin_bind: '绑定租约', resin_rotate: '轮换租约', resin_clear: '清除代理',
-  resin_config_save: '保存 Resin 配置', transparent_attempt: '透明重试', internal_error: '内部错误'
+  resin_config_save: '保存 Resin 配置', transparent_attempt: '透明重试', internal_error: '内部错误',
+  cross_verify_schedule: '调度交叉验证', 'quality.cross_verify': '交叉验证'
 };
 const RESULT_LABELS = {
   recorded: '已记录', healthy: '通过', failed: '失败', restored: '已恢复',
   external_left_disabled: '保持外部禁用', bound: '已绑定', rotated: '已轮换', cleared: '已清除', local_mode: '本地模式',
-  validated: '已验证', cooldown: '已冷却', permanent: '永久禁用', error: '错误'
+  validated: '已验证', cooldown: '已冷却', permanent: '永久禁用', error: '错误', ignored: '已忽略',
+  pending: '累计中', threshold_reached: '达到阈值', scheduled: '已调度'
 };
 const esc = (value) => String(value == null ? '' : value).replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
 const icon = (name) => '<svg class="icon" aria-hidden="true"><use href="#i-' + name + '"></use></svg>';
@@ -736,7 +745,23 @@ async function api(action, params) {
   }
   return payload.data;
 }
-function setTab(name, updateHash) {
+async function waitForTask(value, label) {
+  let task = value;
+  if (!task || !task.task_id) return value;
+  const deadline = Date.now() + 30 * 60 * 1000;
+  let lastProgress = '';
+  while (task.status === 'queued' || task.status === 'running') {
+    if (Date.now() > deadline) throw new Error((label || '任务') + '等待超时，可稍后在事件日志查看结果');
+    if (task.progress && task.progress !== lastProgress) {
+      lastProgress = task.progress;
+      toast((label || '任务') + '：' + task.progress);
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 1000));
+    task = await api('tasks.get', { task_id: task.task_id });
+  }
+  if (task.status === 'failed') throw new Error(task.error || ((label || '任务') + '执行失败'));
+  return task.result;
+}function setTab(name, updateHash) {
   const allowed = ['overview', 'accounts', 'resin', 'events', 'settings'];
   if (!allowed.includes(name)) name = 'overview';
   state.activeTab = name;
@@ -927,12 +952,15 @@ function renderOverview() {
     return '<div class="bar-row"><span class="bar-label">' + esc(stateLabel(key)) + '</span><div class="bar-track"><div class="bar-fill ' + esc(stateTone(key)) + '" style="width:' + width + '%"></div></div><span class="bar-value">' + value + '</span></div>';
   }).join('');
   document.getElementById('recentEvents').innerHTML = state.events.slice(0, 6).map(recentEventHTML).join('') || '<div class="empty"><svg class="icon"><use href="#i-terminal"></use></svg><div>暂无质量事件</div></div>';
+  const quality = policy.quality || {};
   const policyHTML = [
-    summaryItem('软 / 硬 TPS', esc(num(policy.quality && policy.quality.soft_tps, 1) + ' / ' + num(policy.quality && policy.quality.hard_tps, 1))),
+    summaryItem('软 / 硬 TPS', esc(num(quality.soft_tps, 1) + ' / ' + num(quality.hard_tps, 1))),
+    summaryItem('连续阈值', esc('软 ' + num(quality.consecutive_soft || 2) + ' / 错误 ' + num(quality.consecutive_errors || 2) + ' / 缺思考 ' + num(quality.consecutive_missing_thinking || 1))),
     summaryItem('自动处置', esc(autoActionLabel(policy.auto_action))),
-    summaryItem('缺少思考冷却', esc(policy.quality && policy.quality.missing_thinking_cooldown || '-')),
+    summaryItem('缺少思考冷却', esc(quality.missing_thinking_cooldown || '-')),
+    summaryItem('思考检测 / 交叉验证', esc((quality.thinking_guard !== false ? '开启' : '关闭') + ' / ' + ((quality.soft_cross_verify || quality.thinking_cross_verify) ? '部分开启' : '关闭'))),
     summaryItem('探测模型', esc(policy.probe && policy.probe.model || '-')),
-    summaryItem('透明保护', esc(policy.transparent_guard ? '已启用' : '未启用')),
+    summaryItem('状态文件', esc(overview.state_file || '-')),
     summaryItem('事件保留', esc(num(policy.events_limit || 0)))
   ].join('');
   document.getElementById('policySummary').innerHTML = policyHTML;
@@ -977,7 +1005,12 @@ function accountRow(account) {
   const cooldown = account.cooldown_until ? '冷却至 ' + esc(formatFullTime(account.cooldown_until)) : '无冷却';
   const probe = account.probe_backoff_until ? '探测退避至 ' + esc(formatFullTime(account.probe_backoff_until)) : '可立即探测';
   const strike = account.strike_missing_thinking ? badge('思考命中', 'warn') : '';
-  return '<tr><td><div class="account-name" title="' + esc(account.display_full || account.display || account.label || '未命名账号') + '">' + esc(account.display || account.label || '未命名账号') + '</div><div class="subline" title="' + esc(account.auth_id) + '">' + esc(account.auth_id_display || account.auth_id) + '</div></td><td><div>' + badge(stateLabel(account.state), stateTone(account.state)) + ' ' + strike + '</div><div class="subtle-line">' + esc(account.state === 'externally_disabled' ? '外部禁用' : '') + '</div></td><td><div>' + esc(reasonLabel(account.last_reason)) + '</div><div class="subline">' + esc(formatTime(account.last_observed_at)) + '</div></td><td><div class="metric-inline"><strong>' + esc(num(account.tps, 1)) + '</strong><span class="muted">TPS</span></div><div class="subline">输出 ' + esc(num(account.output_tokens)) + ' · 推理 ' + esc(num(account.reasoning_tokens)) + ' · 密文 ' + esc(formatBytes(account.encrypted_bytes)) + '</div></td><td>' + resin + resinDetail + '</td><td><div>' + cooldown + '</div><div class="subline">' + probe + '</div></td><td><div class="actions"><button class="btn btn-xs" type="button" data-account-action="accounts.probe" data-auth="' + authID + '">' + icon('play') + '检测</button><button class="btn btn-xs" type="button" data-open-account="' + authID + '">' + icon('eye') + '详情</button></div></td></tr>';
+  const strikes = [];
+  if (account.soft_strikes) strikes.push('软 ' + account.soft_strikes);
+  if (account.error_strikes) strikes.push('错 ' + account.error_strikes);
+  if (account.thinking_strikes) strikes.push('思 ' + account.thinking_strikes);
+  const strikeBadge = strikes.length ? badge('连续 ' + strikes.join(' / '), 'warn') : '';
+  return '<tr><td><div class="account-name" title="' + esc(account.display_full || account.display || account.label || '未命名账号') + '">' + esc(account.display || account.label || '未命名账号') + '</div><div class="subline" title="' + esc(account.auth_id) + '">' + esc(account.auth_id_display || account.auth_id) + '</div></td><td><div>' + badge(stateLabel(account.state), stateTone(account.state)) + ' ' + strike + ' ' + strikeBadge + '</div><div class="subtle-line">' + esc(account.state === 'externally_disabled' ? '外部禁用' : '') + '</div></td><td><div>' + esc(reasonLabel(account.last_reason)) + '</div><div class="subline">' + esc(formatTime(account.last_observed_at)) + '</div></td><td><div class="metric-inline"><strong>' + esc(num(account.tps, 1)) + '</strong><span class="muted">TPS</span></div><div class="subline">输出 ' + esc(num(account.output_tokens)) + ' · 推理 ' + esc(num(account.reasoning_tokens)) + ' · 密文 ' + esc(formatBytes(account.encrypted_bytes)) + '</div></td><td>' + resin + resinDetail + '</td><td><div>' + cooldown + '</div><div class="subline">' + probe + '</div></td><td><div class="actions"><button class="btn btn-xs" type="button" data-account-action="accounts.probe" data-auth="' + authID + '">' + icon('play') + '检测</button><button class="btn btn-xs" type="button" data-open-account="' + authID + '">' + icon('eye') + '详情</button></div></td></tr>';
 }
 function leaseStatus(account) {
   if (account.resin_managed || account.proxy_status === 'bound') return 'bound';
@@ -1130,8 +1163,15 @@ function populatePolicyForm() {
   setValue('p_auto_action', policy.auto_action || 'observe');
   setValue('p_model_prefixes', (policy.model_prefixes || ['grok-']).join(', '));
   setValue('p_events_limit', policy.events_limit || 1000);
+  setValue('p_state_file', (state.overview && state.overview.state_file) || '-');
   setValue('p_soft_tps', quality.soft_tps || 500);
   setValue('p_hard_tps', quality.hard_tps || 1000);
+  setValue('p_consecutive_soft', quality.consecutive_soft || 2);
+  setValue('p_consecutive_errors', quality.consecutive_errors || 2);
+  setValue('p_consecutive_missing_thinking', quality.consecutive_missing_thinking || 1);
+  setChecked('p_thinking_guard', quality.thinking_guard !== false);
+  setChecked('p_soft_cross_verify', quality.soft_cross_verify === true);
+  setChecked('p_thinking_cross_verify', quality.thinking_cross_verify === true);
   setValue('p_min_generation_ms', quality.min_generation_ms || 1000);
   setValue('p_min_passive_output', quality.min_passive_output_tokens || 32);
   setValue('p_min_hold_output', quality.min_hold_output_tokens || 8);
@@ -1163,6 +1203,12 @@ function collectPolicy() {
   policy.quality = policy.quality || {};
   policy.quality.soft_tps = numberValue('p_soft_tps', 500);
   policy.quality.hard_tps = numberValue('p_hard_tps', 1000);
+  policy.quality.consecutive_soft = numberValue('p_consecutive_soft', 2);
+  policy.quality.consecutive_errors = numberValue('p_consecutive_errors', 2);
+  policy.quality.consecutive_missing_thinking = numberValue('p_consecutive_missing_thinking', 1);
+  policy.quality.thinking_guard = document.getElementById('p_thinking_guard').checked;
+  policy.quality.soft_cross_verify = document.getElementById('p_soft_cross_verify').checked;
+  policy.quality.thinking_cross_verify = document.getElementById('p_thinking_cross_verify').checked;
   policy.quality.min_generation_ms = numberValue('p_min_generation_ms', 1000);
   policy.quality.min_passive_output_tokens = numberValue('p_min_passive_output', 32);
   policy.quality.min_hold_output_tokens = numberValue('p_min_hold_output', 8);
@@ -1258,7 +1304,8 @@ async function validateResin(button, save) {
   document.getElementById('resinValidateState').textContent = input.local_only ? '保存中' : '验证中';
   document.getElementById('resinValidateState').className = 'badge warn';
   try {
-    const result = await api(save ? 'resin.config.save' : 'resin.config.validate', input);
+    const task = await api(save ? 'resin.config.save' : 'resin.config.validate', input);
+    const result = await waitForTask(task, save ? '验证并保存 Resin 配置' : '验证 Resin 配置');
     if (result && result.platform) setValue('r_platform', result.platform);
     if (result && result.local_only) {
       document.getElementById('resinStatus').textContent = save ? '本地轮换模式已保存' : '本地轮换模式无需验证';
@@ -1327,6 +1374,7 @@ function renderDrawer(account) {
       '<div class="detail-cell"><div class="detail-label">输出 / 推理</div><div class="detail-value">' + esc(num(account.output_tokens)) + ' / ' + esc(num(account.reasoning_tokens)) + '</div></div>',
       '<div class="detail-cell"><div class="detail-label">可见 Token</div><div class="detail-value">' + esc(num(account.visible_tokens)) + '</div></div>',
       '<div class="detail-cell"><div class="detail-label">加密思考</div><div class="detail-value">' + esc(formatBytes(account.encrypted_bytes)) + '</div></div>',
+      '<div class="detail-cell"><div class="detail-label">连续计数</div><div class="detail-value">软 ' + esc(num(account.soft_strikes || 0)) + ' / 错 ' + esc(num(account.error_strikes || 0)) + ' / 思 ' + esc(num(account.thinking_strikes || 0)) + '</div></div>',
     '</div></div>',
     '<div class="drawer-section"><h3>账号信息</h3><div class="detail-grid">',
       '<div class="detail-cell"><div class="detail-label">认证 ID</div><div class="detail-value mono">' + esc(account.auth_id_display || account.auth_id) + '</div></div>',
@@ -1354,20 +1402,21 @@ async function runAccountAction(action, authID, button) {
   if (action === 'accounts.cooldown' && !window.confirm('确认将该账号冷却 12 小时？')) return;
   setBusy(button, true);
   try {
-    if (action === 'accounts.probe') toast('正在执行主动探测，最长等待 90 秒…');
+    const isProbe = action === 'accounts.probe';
+    if (isProbe) toast('主动探测任务已提交，后台执行中…');
     const params = { auth_id: authID };
-    if (action === 'accounts.probe') params.force = true;
+    if (isProbe) params.force = true;
     if (action === 'accounts.cooldown') params.duration = '12h';
     if (action === 'accounts.disable') params.reason = 'manual';
-    await api(action, params);
-    toast('操作完成', 'success');
+    const result = await api(action, params);
+    if (isProbe) await waitForTask(result, '主动探测');
+    toast(isProbe ? '主动探测完成' : '操作完成', 'success');
     closeDrawer();
     await refreshAll(true);
   } catch (error) { toast(error.message, 'error'); }
   finally { setBusy(button, false); }
-}
-function resinBatchSummary(results, action) {
-  const items = Array.isArray(results) ? results : [];
+}function resinBatchSummary(results, action) {
+  const items = Array.isArray(results) ? results : ((results && Array.isArray(results.items)) ? results.items : []);
   const conflicts = items.filter((item) => item && item.conflict).length;
   const failed = items.filter((item) => item && item.error && !item.conflict).length;
   const skipped = items.filter((item) => item && item.skipped).length;
@@ -1380,8 +1429,7 @@ function resinBatchSummary(results, action) {
   const firstError = items.find((item) => item && item.error && !item.conflict);
   if (firstError) message += '：' + firstError.error;
   return { message: message, tone: failed > 0 ? 'error' : 'success' };
-}
-async function runSelectedResinAction(action, button) {
+}async function runSelectedResinAction(action, button) {
   const selected = selectedLeaseAccounts();
   if (!selected.length) return;
   const managed = selected.filter((account) => account.resin_managed).length;
@@ -1399,7 +1447,9 @@ async function runSelectedResinAction(action, button) {
   if (!window.confirm(message)) return;
   setBusy(button, true);
   try {
-    const results = await api(action, { auth_ids: selected.map((account) => account.auth_id) });
+    const task = await api(action, { auth_ids: selected.map((account) => account.auth_id) });
+    toast('批量任务已提交，后台执行中…');
+    const results = await waitForTask(task, action === 'resin.clear' ? '批量清除代理' : '批量绑定 Resin');
     const summary = resinBatchSummary(results, action);
     state.leaseSelection.clear();
     toast(summary.message, summary.tone);
@@ -1409,8 +1459,7 @@ async function runSelectedResinAction(action, button) {
   } finally {
     setBusy(button, false);
   }
-}
-async function runResinAction(action, authID, button) {
+}async function runResinAction(action, authID, button) {
   if (!authID) return;
   const resin = state.resin || {};
   const localMode = Boolean(resin.local_only && resin.enabled);
@@ -1431,7 +1480,10 @@ async function runResinAction(action, authID, button) {
   }
   setBusy(button, true);
   try {
-    await api(action, { auth_id: authID });
+    const task = await api(action, { auth_id: authID });
+    const label = action === 'resin.rotate' ? '轮换代理租约' : (action === 'resin.clear' ? '清除账号代理' : '绑定 Resin 租约');
+    toast(label + '任务已提交，后台执行中…');
+    await waitForTask(task, label);
     if (action === 'resin.rotate') toast(localMode ? '代理已本地轮换' : '租约已轮换', 'success');
     else if (action === 'resin.clear') toast(localMode ? '代理已清除，远端租约未处理' : '代理已清除', 'success');
     else toast('租约已绑定', 'success');
@@ -1439,8 +1491,7 @@ async function runResinAction(action, authID, button) {
     await refreshAll(true);
   } catch (error) { toast(error.message, 'error'); }
   finally { setBusy(button, false); }
-}
-document.querySelectorAll('.tabs [data-tab]').forEach((button) => button.addEventListener('click', () => setTab(button.dataset.tab)));
+}document.querySelectorAll('.tabs [data-tab]').forEach((button) => button.addEventListener('click', () => setTab(button.dataset.tab)));
 document.querySelectorAll('[data-settings-tab]').forEach((button) => button.addEventListener('click', () => setSettingsTab(button.dataset.settingsTab)));
 document.querySelectorAll('[data-goto-tab]').forEach((button) => button.addEventListener('click', () => setTab(button.dataset.gotoTab)));
 document.querySelectorAll('[data-open-settings]').forEach((button) => button.addEventListener('click', () => openSettings(button.dataset.openSettings)));
@@ -1527,7 +1578,9 @@ document.getElementById('bindUnboundBtn').addEventListener('click', async (event
   const button = event.currentTarget;
   setBusy(button, true);
   try {
-    const result = await api('resin.bind_unbound', { dry_run: false });
+    const task = await api('resin.bind_unbound', { dry_run: false });
+    toast('批量绑定任务已提交，后台执行中…');
+    const result = await waitForTask(task, '批量绑定未绑定账号');
     state.leaseSelection.clear();
     toast('已处理 ' + Number(result && result.count || 0) + ' 个账号', 'success');
     await refreshAll(true);

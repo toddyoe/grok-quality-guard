@@ -147,6 +147,12 @@ plugins:
       quality:
         soft_tps: 500
         hard_tps: 1000
+        consecutive_soft: 2
+        consecutive_errors: 2
+        consecutive_missing_thinking: 1
+        thinking_guard: true
+        soft_cross_verify: false
+        thinking_cross_verify: false
         min_generation_ms: 1000
         min_passive_output_tokens: 32
         min_hold_output_tokens: 8
@@ -179,7 +185,7 @@ plugins:
         proxy_template: "socks5h://{platform}.{account}:{proxy_token}@resin:2260"
         auto_rotate_after_quality_failure: true
 
-      state_file: ""
+      state_file: "/CLIProxyAPI/plugin-data/grok-quality-guard/state.json"
       events_limit: 1000
 ```
 
@@ -190,6 +196,15 @@ plugins:
 - `auto_action: cooldown_then_disable`：首次确认异常时写入临时 `disabled=true`，冷却到期后执行恢复探测；再次确认 missing-thinking 时永久禁用
 
 插件只操作自己写入的 guard-owned 状态，不自动恢复管理员在插件外禁用的 auth。
+
+连续阈值与旧 grok2api/egress guard 策略对齐：
+
+- `consecutive_soft`：连续软 TPS 样本达到次数后才进入处置；默认 `2`
+- `consecutive_errors`：连续传输/代理错误达到次数后才进入处置；401/403、额度、限流和上游 5xx 等非质量错误只记录为 `ignored`，不计入 strike；默认 `2`
+- `consecutive_missing_thinking`：连续缺少真实思考达到次数后才进入处置；默认 `1`
+- `thinking_guard=false`：跳过缺少思考判定，只保留 TPS、空流等其他质量检查
+- `soft_cross_verify=true` 或 `thinking_cross_verify=true`：被动样本达到阈值后先启动后台主动探测，由探测结果确认后再处置；默认关闭
+- 任一健康样本会清零 `soft_strikes`、`error_strikes`、`thinking_strikes`，与旧插件的连续计数语义一致
 
 ### 透明保护
 
@@ -288,33 +303,57 @@ curl -X POST \
 | `overview` | 汇总账号、状态、Resin 和最近异常 |
 | `accounts.list` | 分页账号列表 |
 | `accounts.get` | 账号详情 |
-| `accounts.probe` | 手动执行固定 prompt 探测 |
+| `accounts.probe` | 提交异步固定 prompt 探测任务 |
 | `accounts.cooldown` | 手动冷却 |
 | `accounts.disable` | 手动永久禁用 |
 | `accounts.restore` | 恢复 guard-owned 账号并清除 strike |
-| `resin.bind` | 显式绑定单个或多个 auth；仅 API 模式可用 |
-| `resin.bind_unbound` | API 模式下批量绑定未绑定账号 |
-| `resin.rotate` | API 模式删除旧租约并重绑；本地模式只改写已有代理用户名 |
-| `resin.clear` | 清除单个或多个 auth 的代理；API 模式先删除管理租约，本地模式不处理远端租约 |
+| `resin.bind` | 提交异步绑定任务；仅 API 模式可用 |
+| `resin.bind_unbound` | 提交异步批量绑定任务 |
+| `resin.rotate` | 提交异步轮换任务；本地模式只改写已有代理用户名 |
+| `resin.clear` | 提交异步清除任务；API 模式先删除管理租约，本地模式不处理远端租约 |
 | `resin.config.get` | 查看脱敏的 Resin 配置与 Secret 是否已设置 |
-| `resin.config.validate` | API 模式验证 Admin API、Admin Token、平台和 Proxy Token；本地模式直接返回本地配置 |
-| `resin.config.save` | API 模式再次验证后持久化；本地模式直接持久化本地轮换配置 |
+| `resin.config.validate` | 提交异步 Resin 配置验证任务 |
+| `resin.config.save` | 提交异步验证并保存任务 |
 | `policy.get` | 查看运行时策略 |
 | `policy.update` | 校验并持久化策略 |
 | `policy.reset` | 重置为 YAML 初始值 |
 | `events.list` | 查看质量事件日志 |
+| `tasks.get` | 查询异步任务状态、结果和错误 |
+| `tasks.list` | 列出最近异步任务 |
+
+主动探测、Resin 配置验证/保存、Resin 绑定/清除/轮换和批量绑定都是长耗时操作，会立即返回 `202 Accepted` 与 `task_id`，不会占住 oh-my-cpa 的 15 秒管理请求超时。调用方应轮询：
+
+```json
+{"action":"tasks.get","params":{"task_id":"<task_id>"}}
+```
+
+任务状态为 `queued`、`running`、`succeeded` 或 `failed`。失败时 `error` 包含脱敏后的原因，`error_status` 保留可用的上游 HTTP 状态。内嵌管理页已经自动轮询并展示进度。
 
 API 只接受 POST，并由 CPA management 层完成认证。插件不要求自定义 Header 或请求体 UI 标记，避免管理网关剥离 Header 时页面请求失败。响应中的 email、proxy URL、token 和密码均会脱敏；账号列表同时提供 `auth_id_display` 供展示，操作 API 使用稳定的 `auth_id` 作为标识。`proxy_url` 可能内嵌 Proxy Token，因此管理页只显示 `scheme://host`，不会展示完整凭据。
 
-## 状态文件
+## 状态文件与 Docker 持久化
 
-默认路径：
+默认路径按顺序选择第一个可写位置：
 
 ```text
+/CLIProxyAPI/plugin-data/grok-quality-guard/state.json
+plugin-data/grok-quality-guard/state.json
 <UserConfigDir>/cliproxyapi/grok-quality-guard/state.json
+<temp>/grok-quality-guard/state.json
 ```
 
-可通过 `state_file` 覆盖。状态文件使用版本化 schema、原子替换写入，Unix 权限为目录 `0700`、文件 `0600`。策略首次从 YAML 初始化，之后管理页修改会持久化到 state；`policy.reset` 会恢复为当前 YAML 的默认值。通过管理页保存的 Resin 配置和 API 模式 token 也存储在本地 state 中，API 与页面只返回是否已设置的布尔标记。
+Docker 部署必须把第一项所在目录挂载为宿主持久卷，否则容器重建后策略、账号状态、事件、Resin 配置和凭据仍会丢失：
+
+```yaml
+services:
+  cliproxyapi:
+    volumes:
+      - ./plugin-data/grok-quality-guard:/CLIProxyAPI/plugin-data/grok-quality-guard
+```
+
+如果已经挂载了 `/CLIProxyAPI/plugins`，也可以显式把 `state_file` 指向该持久目录下的文件。显式配置的 `state_file` 不会被自动替换；路径不可写时插件会报错，而不是静默改写到临时目录。
+
+状态文件使用版本化 schema、原子替换写入，Unix 权限为目录 `0700`、文件 `0600`。策略首次从 YAML 初始化，之后管理页修改会持久化到 state；`policy.reset` 会恢复为当前 YAML 的默认值。通过管理页保存的 Resin 配置和 API 模式 token 也存储在 state 中，API 与页面只返回是否已设置的布尔标记。管理页设置区会显示当前实际使用的状态文件路径。
 
 ## 开发与测试
 

@@ -39,6 +39,9 @@ type AccountState struct {
 	LastProbeAt                  time.Time  `json:"last_probe_at,omitempty"`
 	CooldownUntil                time.Time  `json:"cooldown_until,omitempty"`
 	QualityStrikeMissingThinking bool       `json:"quality_strike_missing_thinking"`
+	SoftStrikes                  int        `json:"soft_strikes,omitempty"`
+	ErrorStrikes                 int        `json:"error_strikes,omitempty"`
+	ThinkingStrikes              int        `json:"thinking_strikes,omitempty"`
 	ProbeBackoffUntil            time.Time  `json:"probe_backoff_until,omitempty"`
 	DisableKind                  string     `json:"disable_kind,omitempty"`
 	PreviousDisabled             bool       `json:"previous_disabled,omitempty"`
