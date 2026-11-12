@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -44,11 +45,19 @@ func (p *Plugin) runDueProbes(ctx context.Context) error {
 	if !policy.PassiveGuard && !policy.TransparentGuard {
 		return nil
 	}
-	for _, account := range p.catalogSnapshot() {
-		if errProbe := p.ProbeAccount(ctx, account.ID, false, ""); errProbe != nil {
-			_ = p.recordInternalError(account.ID, errProbe)
-		}
+	accounts := p.catalogSnapshot()
+	var wg sync.WaitGroup
+	for _, account := range accounts {
+		authID := account.ID
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if errProbe := p.ProbeAccount(ctx, authID, false, ""); errProbe != nil && (ctx == nil || ctx.Err() == nil) {
+				_ = p.recordInternalError(authID, errProbe)
+			}
+		}()
 	}
+	wg.Wait()
 	return nil
 }
 
@@ -89,12 +98,26 @@ func (p *Plugin) ProbeAccount(ctx context.Context, authID string, force bool, ca
 	if strings.TrimSpace(authID) == "" {
 		return fmt.Errorf("auth_id is required")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if errCtx := ctx.Err(); errCtx != nil {
+		return errCtx
+	}
 	due, errDue := p.probeDue(authID, force)
 	if errDue != nil || !due {
 		return errDue
 	}
-	p.probeMu.Lock()
-	defer p.probeMu.Unlock()
+	// Reserve the account before taking a concurrency slot so a second probe for
+	// the same account waits without occupying another slot
+	if errBegin := p.beginAccountProbe(ctx, authID); errBegin != nil {
+		return errBegin
+	}
+	defer p.endAccountProbe(authID)
+	if errSlot := p.acquireProbeSlot(ctx); errSlot != nil {
+		return errSlot
+	}
+	defer p.releaseProbeSlot()
 
 	lock := p.accountLock(authID)
 	lock.Lock()
@@ -346,4 +369,106 @@ func nextProbeBackoff(cfg ProbeConfig, previous AccountState) time.Duration {
 		backoff = maxBackoff
 	}
 	return backoff
+}
+
+func (p *Plugin) probeConcurrency() int {
+	if p == nil {
+		return 1
+	}
+	p.mu.RLock()
+	limit := p.policy.Probe.Concurrency
+	p.mu.RUnlock()
+	if limit <= 0 {
+		return 1
+	}
+	return limit
+}
+
+func (p *Plugin) beginAccountProbe(ctx context.Context, authID string) error {
+	p.probeGate.Lock()
+	defer p.probeGate.Unlock()
+	for {
+		if _, busy := p.probing[authID]; !busy {
+			if p.probing == nil {
+				p.probing = make(map[string]struct{})
+			}
+			p.probing[authID] = struct{}{}
+			return nil
+		}
+		if errWait := p.waitProbeLocked(ctx); errWait != nil {
+			return errWait
+		}
+	}
+}
+
+func (p *Plugin) endAccountProbe(authID string) {
+	if p == nil {
+		return
+	}
+	p.probeGate.Lock()
+	delete(p.probing, authID)
+	p.probeCond.Broadcast()
+	p.probeGate.Unlock()
+}
+
+func (p *Plugin) acquireProbeSlot(ctx context.Context) error {
+	for {
+		limit := p.probeConcurrency()
+		p.probeGate.Lock()
+		if p.probeActive < limit {
+			if errCtx := ctx.Err(); errCtx != nil {
+				p.probeGate.Unlock()
+				return errCtx
+			}
+			p.probeActive++
+			p.probeGate.Unlock()
+			return nil
+		}
+		errWait := p.waitProbeLocked(ctx)
+		p.probeGate.Unlock()
+		if errWait != nil {
+			return errWait
+		}
+	}
+}
+
+func (p *Plugin) releaseProbeSlot() {
+	if p == nil {
+		return
+	}
+	p.probeGate.Lock()
+	if p.probeActive > 0 {
+		p.probeActive--
+	}
+	p.probeCond.Broadcast()
+	p.probeGate.Unlock()
+}
+
+func (p *Plugin) wakeProbeWaiters() {
+	if p == nil || p.probeCond == nil {
+		return
+	}
+	p.probeGate.Lock()
+	p.probeCond.Broadcast()
+	p.probeGate.Unlock()
+}
+
+// waitProbeLocked waits until a probe slot or account reservation changes.
+// Caller must hold probeGate.
+func (p *Plugin) waitProbeLocked(ctx context.Context) error {
+	if ctx == nil {
+		p.probeCond.Wait()
+		return nil
+	}
+	if errCtx := ctx.Err(); errCtx != nil {
+		return errCtx
+	}
+	stop := context.AfterFunc(ctx, func() {
+		p.probeGate.Lock()
+		p.probeCond.Broadcast()
+		p.probeGate.Unlock()
+	})
+	p.probeCond.Wait()
+	stop()
+	return ctx.Err()
 }

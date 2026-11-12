@@ -62,7 +62,11 @@ type Plugin struct {
 	pendingMu sync.Mutex
 	pending   map[string]*PendingObservation
 
-	probeMu     sync.Mutex
+	probeGate   sync.Mutex
+	probeCond   *sync.Cond
+	probeActive int
+	probing     map[string]struct{}
+
 	probeSkipMu sync.Mutex
 	probeSkip   map[string]time.Time
 
@@ -78,7 +82,7 @@ type Plugin struct {
 }
 
 func NewPlugin() *Plugin {
-	return &Plugin{
+	plugin := &Plugin{
 		cfg:           DefaultConfig(),
 		policy:        PolicyFromConfig(DefaultConfig()),
 		accountLocks:  make(map[string]*sync.Mutex),
@@ -87,7 +91,10 @@ func NewPlugin() *Plugin {
 		recentSuccess: make(map[string]time.Time),
 		modelStreams:  make(map[string]struct{}),
 		tasks:         make(map[string]*taskRecord),
+		probing:       make(map[string]struct{}),
 	}
+	plugin.probeCond = sync.NewCond(&plugin.probeGate)
+	return plugin
 }
 
 func (p *Plugin) markRecentSuccess(authID string) {

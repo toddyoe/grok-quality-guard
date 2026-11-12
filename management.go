@@ -89,7 +89,7 @@ func (p *Plugin) HandleManagement(request []byte) ([]byte, error) {
 		action.Params = map[string]any{}
 	}
 	ctx := context.Background()
-	data, status, errAction := p.handleAction(ctx, action, req.HostCallbackID)
+	data, status, errAction := p.handleAction(ctx, action)
 	if errAction != nil {
 		if status == 0 {
 			status = http.StatusBadRequest
@@ -102,7 +102,7 @@ func (p *Plugin) HandleManagement(request []byte) ([]byte, error) {
 	return okEnvelope(managementResponse{StatusCode: status, Headers: jsonHeaders(), Body: jsonOK(data)})
 }
 
-func (p *Plugin) handleAction(ctx context.Context, action actionRequest, callbackID string) (any, int, error) {
+func (p *Plugin) handleAction(ctx context.Context, action actionRequest) (any, int, error) {
 	switch strings.ToLower(strings.TrimSpace(action.Action)) {
 	case "overview":
 		return p.actionOverview(ctx)
@@ -111,7 +111,7 @@ func (p *Plugin) handleAction(ctx context.Context, action actionRequest, callbac
 	case "accounts.get":
 		return p.actionAccountGet(ctx, action.Params)
 	case "accounts.probe":
-		return p.actionProbe(ctx, action.Params, callbackID)
+		return p.actionProbe(ctx, action.Params)
 	case "accounts.cooldown":
 		return p.actionCooldown(ctx, action.Params)
 	case "accounts.disable":
@@ -291,7 +291,7 @@ func (p *Plugin) actionAccountGet(ctx context.Context, params map[string]any) (a
 	return view, http.StatusOK, nil
 }
 
-func (p *Plugin) actionProbe(ctx context.Context, params map[string]any, callbackID string) (any, int, error) {
+func (p *Plugin) actionProbe(ctx context.Context, params map[string]any) (any, int, error) {
 	authID := strings.TrimSpace(asString(params["auth_id"]))
 	if authID == "" {
 		return nil, http.StatusBadRequest, fmt.Errorf("auth_id is required")
@@ -471,6 +471,7 @@ func (p *Plugin) actionPolicyUpdate(params map[string]any) (any, int, error) {
 	p.cfg.Resin.AutoRotateAfterQualityFailure = normalized.ResinAutoRotateAfterQualityFail
 	p.cfg.EventsLimit = normalized.EventsLimit
 	p.mu.Unlock()
+	p.wakeProbeWaiters()
 	return normalized, http.StatusOK, nil
 }
 
@@ -504,6 +505,7 @@ func (p *Plugin) actionPolicyReset() (any, int, error) {
 	p.cfg.Resin.AutoRotateAfterQualityFailure = normalized.ResinAutoRotateAfterQualityFail
 	p.cfg.EventsLimit = normalized.EventsLimit
 	p.mu.Unlock()
+	p.wakeProbeWaiters()
 	return normalized, http.StatusOK, nil
 }
 

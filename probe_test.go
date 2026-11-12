@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
@@ -202,4 +204,190 @@ func TestProbeTransportFailureRecordsInternalError(t *testing.T) {
 	if probeErrors != 1 {
 		t.Fatalf("transport failure probe events = %d, events=%#v", probeErrors, state.Events)
 	}
+}
+
+func ageAccountsForProbe(t *testing.T, plugin *Plugin) {
+	t.Helper()
+	errUpdate := plugin.stateStore().Update(func(state *State) error {
+		for _, account := range state.Accounts {
+			if account == nil {
+				continue
+			}
+			account.FirstSeenAt = time.Now().UTC().Add(-time.Minute)
+			if account.State == "" || account.State == StateUnknown || account.State == StateExternallyDisabled {
+				account.State = StateSuspect
+				account.ProbeBackoffUntil = time.Time{}
+			}
+		}
+		return nil
+	})
+	if errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+}
+
+func installStreamHold(entered chan<- string, release <-chan struct{}) {
+	inner := hostCall
+	hostCall = func(method string, payload any) (json.RawMessage, error) {
+		if method == pluginabi.MethodHostModelExecuteStream {
+			encoded, errMarshal := json.Marshal(payload)
+			if errMarshal != nil {
+				return nil, errMarshal
+			}
+			var req hostModelExecutionRequest
+			if errUnmarshal := json.Unmarshal(encoded, &req); errUnmarshal != nil {
+				return nil, errUnmarshal
+			}
+			entered <- req.AuthID
+			<-release
+		}
+		return inner(method, payload)
+	}
+}
+
+func waitForProbeEntries(t *testing.T, entered <-chan string, count int) []string {
+	t.Helper()
+	got := make([]string, 0, count)
+	timeout := time.After(3 * time.Second)
+	for len(got) < count {
+		select {
+		case id := <-entered:
+			got = append(got, id)
+		case <-timeout:
+			t.Fatalf("started probes = %#v, want %d", got, count)
+		}
+	}
+	return got
+}
+
+func assertNoProbeEntry(t *testing.T, entered <-chan string) {
+	t.Helper()
+	select {
+	case id := <-entered:
+		t.Fatalf("unexpected probe start for %s", id)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestProbeConcurrencyRunsDistinctAccountsTogether(t *testing.T) {
+	entries, auths := twoGrokAuths(t)
+	host := newMockHostCall(entries, auths)
+	host.scriptStream("auth-1", pluginapi.HostModelStreamReadResponse{Done: true})
+	host.scriptStream("auth-2", pluginapi.HostModelStreamReadResponse{Done: true})
+	plugin := newTestPlugin(t, host, func(cfg *Config) {
+		cfg.Probe.Concurrency = 2
+	})
+	ageAccountsForProbe(t, plugin)
+	entered := make(chan string, 4)
+	release := make(chan struct{})
+	installStreamHold(entered, release)
+	done := make(chan error, 1)
+	go func() {
+		done <- plugin.runDueProbes(context.Background())
+	}()
+	got := waitForProbeEntries(t, entered, 2)
+	if len(uniqueStrings(got)) != 2 {
+		t.Fatalf("concurrent probes = %#v", got)
+	}
+	close(release)
+	select {
+	case errRun := <-done:
+		if errRun != nil {
+			t.Fatal(errRun)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runDueProbes did not finish")
+	}
+}
+
+func TestProbeConcurrencyLimitsParallelAccounts(t *testing.T) {
+	entries, auths := twoGrokAuths(t)
+	host := newMockHostCall(entries, auths)
+	host.scriptStream("auth-1", pluginapi.HostModelStreamReadResponse{Done: true})
+	host.scriptStream("auth-2", pluginapi.HostModelStreamReadResponse{Done: true})
+	plugin := newTestPlugin(t, host, func(cfg *Config) {
+		cfg.Probe.Concurrency = 1
+	})
+	ageAccountsForProbe(t, plugin)
+	entered := make(chan string, 4)
+	release := make(chan struct{})
+	installStreamHold(entered, release)
+	done := make(chan error, 1)
+	go func() {
+		done <- plugin.runDueProbes(context.Background())
+	}()
+	first := waitForProbeEntries(t, entered, 1)
+	assertNoProbeEntry(t, entered)
+	close(release)
+	second := waitForProbeEntries(t, entered, 1)
+	if first[0] == second[0] {
+		t.Fatalf("serialized probes hit %s twice before the other account", first[0])
+	}
+	select {
+	case errRun := <-done:
+		if errRun != nil {
+			t.Fatal(errRun)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runDueProbes did not finish")
+	}
+}
+
+func TestProbeSameAccountDoesNotTakeSecondSlot(t *testing.T) {
+	entries, auths := twoGrokAuths(t)
+	host := newMockHostCall(entries, auths)
+	host.scriptStream("auth-1", pluginapi.HostModelStreamReadResponse{Done: true})
+	host.scriptStream("auth-2", pluginapi.HostModelStreamReadResponse{Done: true})
+	plugin := newTestPlugin(t, host, func(cfg *Config) {
+		cfg.Probe.Concurrency = 2
+	})
+	entered := make(chan string, 4)
+	release := make(chan struct{})
+	installStreamHold(entered, release)
+	errCh := make(chan error, 3)
+	start := func(authID string) {
+		go func() {
+			errCh <- plugin.ProbeAccount(context.Background(), authID, true, "")
+		}()
+	}
+	start("auth-1")
+	start("auth-1")
+	start("auth-2")
+	got := waitForProbeEntries(t, entered, 2)
+	seen := map[string]int{}
+	for _, id := range got {
+		seen[id]++
+	}
+	if seen["auth-1"] != 1 || seen["auth-2"] != 1 {
+		t.Fatalf("in-flight probes = %#v, want one auth-1 and one auth-2", got)
+	}
+	assertNoProbeEntry(t, entered)
+	close(release)
+	replay := waitForProbeEntries(t, entered, 1)
+	if replay[0] != "auth-1" {
+		t.Fatalf("queued same-account probe started as %s", replay[0])
+	}
+	for i := 0; i < 3; i++ {
+		select {
+		case errProbe := <-errCh:
+			if errProbe != nil {
+				t.Fatal(errProbe)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("probe did not finish")
+		}
+	}
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }

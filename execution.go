@@ -799,31 +799,6 @@ func classifyTransportError(errValue error) string {
 	return ClassProbeError
 }
 
-func isImmediateWithholdClass(class string) bool {
-	switch class {
-	case ClassBufferedBurst, ClassCipherDrool, ClassFakeEncryptedDump, ClassFastReasoningRatio:
-		return true
-	default:
-		return false
-	}
-}
-
-func shouldReleaseBeforeTerminal(sig Signals, verdict QualityVerdict, reasoningNeeded bool, minOutput int64) bool {
-	if isImmediateWithholdClass(verdict.Class) {
-		return false
-	}
-	if sig.SemanticOutput {
-		return true
-	}
-	if sig.HasThinking && sig.FirstVisible && sig.VisibleFlushMS >= 2000 {
-		return true
-	}
-	if !reasoningNeeded && sig.VisibleTokens >= minOutput && sig.FirstVisible && sig.VisibleFlushMS >= 2000 {
-		return true
-	}
-	return false
-}
-
 func sseHeaders() http.Header {
 	return http.Header{
 		"Content-Type":  []string{"text/event-stream"},
