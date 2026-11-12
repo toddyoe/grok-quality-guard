@@ -176,7 +176,8 @@ func (p *Plugin) ProbeAccount(ctx context.Context, authID string, force bool, ca
 		ProxyURL:       strings.TrimSpace(authRawString(raw, "proxy_url")),
 	}, callbackID)
 	if errStream != nil {
-		return p.handleProbeFailure(authID, raw, response, reEnabled, QualityVerdict{Class: classifyTransportError(errStream), Reason: "probe transport error"}, errStream)
+		class, reason := classifyTransportFailure(errStream)
+		return p.handleProbeFailure(authID, raw, response, reEnabled, QualityVerdict{Class: class, Reason: reason}, errStream)
 	}
 	defer p.closeModelStream(stream.StreamID)
 	if stream.StatusCode < 200 || stream.StatusCode >= 300 {
@@ -196,7 +197,8 @@ func (p *Plugin) ProbeAccount(ctx context.Context, authID string, force bool, ca
 		}
 		read, errRead := p.readModelStreamContext(probeCtx, stream.StreamID)
 		if errRead != nil {
-			return p.handleProbeFailure(authID, raw, response, reEnabled, QualityVerdict{Class: classifyTransportError(errRead), Reason: "probe stream read error"}, errRead)
+			class, reason := classifyTransportFailure(errRead)
+			return p.handleProbeFailure(authID, raw, response, reEnabled, QualityVerdict{Class: class, Reason: reason}, errRead)
 		}
 		if len(read.Payload) > 0 {
 			bufferBytes += int64(len(read.Payload))
@@ -207,7 +209,8 @@ func (p *Plugin) ProbeAccount(ctx context.Context, authID string, force bool, ca
 		}
 		if read.Error != "" {
 			readErr := fmt.Errorf("%s", read.Error)
-			return p.handleProbeFailure(authID, raw, response, reEnabled, QualityVerdict{Class: classifyTransportError(readErr), Reason: "probe stream error"}, readErr)
+			class, reason := classifyTransportFailure(readErr)
+			return p.handleProbeFailure(authID, raw, response, reEnabled, QualityVerdict{Class: class, Reason: reason}, readErr)
 		}
 		if read.Done {
 			terminal = true

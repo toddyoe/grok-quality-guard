@@ -870,20 +870,28 @@ func (p *Plugin) readModelStreamErrorBody(ctx context.Context, streamID string) 
 	return body
 }
 
-func classifyTransportError(errValue error) string {
+func classifyTransportFailure(errValue error) (string, string) {
 	if errValue == nil {
-		return ClassProbeError
+		return ClassProbeError, "probe transport error"
 	}
 	text := strings.ToLower(errValue.Error())
 	if strings.Contains(text, "proxy") || strings.Contains(text, "resin") || strings.Contains(text, "socks") {
-		return ClassProxyError
+		return ClassProxyError, "probe transport error"
+	}
+	if isQuotaExhaustionText(text) {
+		return ClassQuotaExhausted, "host_call_failed: quota exhausted"
 	}
 	for _, marker := range []string{"invalid token", "expired", "no auth", "quota", "rate limit", "ratelimit", "too many requests", "permission denied", "forbidden", "unauthorized"} {
 		if strings.Contains(text, marker) {
-			return ClassIgnored
+			return ClassIgnored, "probe transport error"
 		}
 	}
-	return ClassProbeError
+	return ClassProbeError, "probe transport error"
+}
+
+func classifyTransportError(errValue error) string {
+	class, _ := classifyTransportFailure(errValue)
+	return class
 }
 
 func sseHeaders() http.Header {
