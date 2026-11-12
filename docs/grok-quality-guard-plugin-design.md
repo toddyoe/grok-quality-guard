@@ -1293,6 +1293,7 @@ Content-Type: application/json
 | `policy.get` | 无 | 返回运行时策略 |
 | `policy.update` | `policy` | 校验并持久化策略 |
 | `policy.reset` | 无 | 重置为 YAML 默认值 |
+| `state_file.update` | `state_file` | 迁移并切换状态文件路径；目标文件必须不存在 |
 | `events.list` | `limit`、`cursor`、`auth_id` | 事件列表 |
 | `tasks.get` | `task_id` | 查询异步任务状态、结果和错误 |
 | `tasks.list` | `limit` | 列出最近异步任务 |
@@ -1378,7 +1379,8 @@ YAML 始终决定以下部署级字段：
 
 - `enabled`
 - `priority`
-- `state_file`
+
+`state_file` 是状态文件的启动引导路径。管理页可以通过 `state_file.update` 迁移状态并在引导路径旁写入 `<state_file>.location` 指针；指针存在时，插件重启后使用其指向的实际状态文件。修改 YAML 的 `state_file` 会切换到新的引导位置，旧指针不再参与解析。
 
 Resin 配置采用“YAML 初始化，管理页验证后保存并优先使用”的规则：
 
@@ -1434,7 +1436,7 @@ plugin-data/grok-quality-guard/state.json
 <temp>/grok-quality-guard/state.json
 ```
 
-Docker 部署必须将 `/CLIProxyAPI/plugin-data/grok-quality-guard` 挂载为宿主持久卷，否则容器重建后 state 会丢失。也允许通过 `state_file` 显式覆盖；显式路径不可写时不会静默替换。目录权限 `0700`，文件权限 `0600`。
+Docker 部署必须将 `/CLIProxyAPI/plugin-data/grok-quality-guard` 挂载为宿主持久卷，否则容器重建后 state 会丢失。也允许通过 `state_file` 显式覆盖；显式路径不可写时不会静默替换。管理页可编辑实际状态文件路径；切换时先完整写入目标文件，再更新引导路径旁的 `<state_file>.location` 指针。目标文件已存在时拒绝覆盖。目录权限 `0700`，文件权限 `0600`。
 
 ### 12.2 Schema
 

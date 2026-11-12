@@ -115,7 +115,10 @@ func TestManagementResourceAndActionAccess(t *testing.T) {
 	if strings.Contains(string(response.Body), "X-Grok-Quality-Guard-UI") {
 		t.Fatal("dashboard still depends on the custom UI header")
 	}
-	for _, expected := range []string{"概览", "账号质量", "Resin 租约", "事件日志", "设置", "24 小时统计", "resin.config.get", "resin.clear", "leaseSelectAll", "clearSelectedBtn", "accountsPager", "leasesPager", "eventsPager", "selectFilteredBtn", "selectAllAccountsBtn", "全选当前筛选", "全选所有账号", "选择本页全部账号", "r_local_only", "本地轮换", `type="password"`} {
+	if strings.Contains(string(response.Body), "对齐旧插件") {
+		t.Fatal("dashboard should describe the setting semantically instead of referencing the old plugin")
+	}
+	for _, expected := range []string{"概览", "账号质量", "Resin 租约", "事件日志", "设置", "24 小时统计", "resin.config.get", "resin.clear", "leaseSelectAll", "clearSelectedBtn", "accountsPager", "leasesPager", "eventsPager", "selectFilteredBtn", "selectAllAccountsBtn", "全选当前筛选", "全选所有账号", "选择本页全部账号", "r_local_only", "本地轮换", "state_file.update", "id=\"p_state_file\" type=\"text\"", "summary-value truncate", "连续检测到缺少真实思考的响应达到该次数后触发处置或交叉验证", `type="password"`} {
 		if !strings.Contains(string(response.Body), expected) {
 			t.Fatalf("dashboard is missing %q", expected)
 		}

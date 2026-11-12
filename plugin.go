@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -38,17 +39,18 @@ type PendingObservation struct {
 }
 
 type Plugin struct {
-	mu            sync.RWMutex
-	cfg           Config
-	policy        Policy
-	yamlPolicy    Policy
-	yamlRevision  string
-	store         *StateStore
-	ctx           context.Context
-	cancel        context.CancelFunc
-	wg            sync.WaitGroup
-	workersActive bool
-	quiescing     bool
+	mu                 sync.RWMutex
+	cfg                Config
+	policy             Policy
+	yamlPolicy         Policy
+	yamlRevision       string
+	store              *StateStore
+	stateBootstrapPath string
+	ctx                context.Context
+	cancel             context.CancelFunc
+	wg                 sync.WaitGroup
+	workersActive      bool
+	quiescing          bool
 
 	catalogMu sync.RWMutex
 	catalog   []Account
@@ -121,22 +123,31 @@ func (p *Plugin) Configure(raw []byte) error {
 		return errDecode
 	}
 	revision := configRevision(raw)
+	bootstrapPath := configuredStatePath(cfg.StateFile)
+	activePath := bootstrapPath
+	if override, errPointer := readStatePathPointer(bootstrapPath); errPointer != nil {
+		return errPointer
+	} else if strings.TrimSpace(override) != "" {
+		normalized, errNormalize := normalizeStatePath(override)
+		if errNormalize != nil {
+			return fmt.Errorf("state path pointer is invalid: %w", errNormalize)
+		}
+		activePath = normalized
+	}
 	p.mu.Lock()
 	oldPath := ""
 	if p.store != nil {
 		oldPath = p.store.Path()
 	}
-	path := strings.TrimSpace(cfg.StateFile)
-	if path == "" {
-		path = defaultStatePath()
-	}
-	if p.store == nil || oldPath != path {
-		p.store = NewStateStore(path)
+	if p.store == nil || oldPath != activePath || p.stateBootstrapPath != bootstrapPath {
+		p.store = NewStateStore(activePath)
 		if errLoad := p.store.Load(PolicyFromConfig(cfg), revision); errLoad != nil {
 			p.mu.Unlock()
 			return errLoad
 		}
 	}
+	p.stateBootstrapPath = bootstrapPath
+	cfg.StateFile = activePath
 	p.cfg = cfg
 	p.yamlPolicy = PolicyFromConfig(cfg)
 	p.yamlRevision = revision
@@ -166,6 +177,41 @@ func (p *Plugin) Configure(raw []byte) error {
 	}
 	p.mu.Unlock()
 	return nil
+}
+
+// UpdateStatePath moves the live state file and records a durable pointer next
+// to the YAML/bootstrap path so the new location survives plugin restarts.
+func (p *Plugin) UpdateStatePath(value string) (string, error) {
+	target, errNormalize := normalizeStatePath(value)
+	if errNormalize != nil {
+		return "", errNormalize
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	store := p.store
+	if store == nil {
+		return "", errors.New("state store is not initialized")
+	}
+	oldPath := store.Path()
+	if normalizedOldPath, errOld := normalizeStatePath(oldPath); errOld == nil && normalizedOldPath == target {
+		p.cfg.StateFile = target
+		return target, nil
+	}
+	bootstrapPath := strings.TrimSpace(p.stateBootstrapPath)
+	if bootstrapPath == "" {
+		bootstrapPath = oldPath
+	}
+	if errSwitch := store.SetPath(target); errSwitch != nil {
+		return "", errSwitch
+	}
+	if errPointer := writeStatePathPointer(bootstrapPath, target); errPointer != nil {
+		if errRestore := store.setPath(oldPath, true); errRestore != nil {
+			return "", errors.Join(errPointer, fmt.Errorf("restore previous state path: %w", errRestore))
+		}
+		return "", errPointer
+	}
+	p.cfg.StateFile = target
+	return target, nil
 }
 
 func (p *Plugin) startWorkersLocked() {

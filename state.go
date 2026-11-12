@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 )
@@ -85,7 +86,132 @@ func (s *StateStore) Path() string {
 	if s == nil {
 		return ""
 	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.path
+}
+
+// SetPath moves the live state to a new file without losing concurrent updates.
+// It refuses to overwrite an existing file unless the caller explicitly restores
+// a previously active path after a failed pointer update.
+func (s *StateStore) SetPath(path string) error {
+	return s.setPath(path, false)
+}
+
+func (s *StateStore) setPath(path string, overwrite bool) error {
+	if s == nil {
+		return errors.New("state store is nil")
+	}
+	path = filepath.Clean(strings.TrimSpace(path))
+	if path == "" || path == "." {
+		return fmt.Errorf("%w: state path is empty", os.ErrInvalid)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if path == s.path {
+		return nil
+	}
+	if info, errStat := os.Stat(path); errStat == nil {
+		if info.IsDir() {
+			return fmt.Errorf("%w: state path is a directory", os.ErrInvalid)
+		}
+		if !overwrite {
+			return fmt.Errorf("%w: state file already exists: %s", os.ErrExist, path)
+		}
+	} else if !errors.Is(errStat, os.ErrNotExist) {
+		return fmt.Errorf("inspect state file: %w", errStat)
+	}
+	oldPath := s.path
+	oldUpdatedAt := s.state.UpdatedAt
+	s.path = path
+	s.state.UpdatedAt = time.Now().UTC()
+	if errSave := s.saveLocked(); errSave != nil {
+		s.path = oldPath
+		s.state.UpdatedAt = oldUpdatedAt
+		return errSave
+	}
+	return nil
+}
+
+func configuredStatePath(value string) string {
+	if path := strings.TrimSpace(value); path != "" {
+		return filepath.Clean(path)
+	}
+	return defaultStatePath()
+}
+
+func normalizeStatePath(value string) (string, error) {
+	path := strings.TrimSpace(value)
+	if path == "" {
+		return "", fmt.Errorf("%w: state_file is required", os.ErrInvalid)
+	}
+	absolute, errAbsolute := filepath.Abs(path)
+	if errAbsolute != nil {
+		return "", fmt.Errorf("%w: invalid state_file: %v", os.ErrInvalid, errAbsolute)
+	}
+	absolute = filepath.Clean(absolute)
+	if info, errStat := os.Stat(absolute); errStat == nil && info.IsDir() {
+		return "", fmt.Errorf("%w: state_file must point to a file", os.ErrInvalid)
+	} else if errStat != nil && !errors.Is(errStat, os.ErrNotExist) {
+		return "", fmt.Errorf("inspect state_file: %w", errStat)
+	}
+	return absolute, nil
+}
+
+func statePathPointerPath(bootstrapPath string) string {
+	return filepath.Clean(bootstrapPath) + ".location"
+}
+
+func readStatePathPointer(bootstrapPath string) (string, error) {
+	pointerPath := statePathPointerPath(bootstrapPath)
+	raw, errRead := os.ReadFile(pointerPath)
+	if errRead != nil {
+		if errors.Is(errRead, os.ErrNotExist) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read state path pointer: %w", errRead)
+	}
+	return strings.TrimSpace(string(raw)), nil
+}
+
+func writeStatePathPointer(bootstrapPath, activePath string) error {
+	pointerPath := statePathPointerPath(bootstrapPath)
+	if filepath.Clean(bootstrapPath) == filepath.Clean(activePath) {
+		if errRemove := os.Remove(pointerPath); errRemove != nil && !errors.Is(errRemove, os.ErrNotExist) {
+			return fmt.Errorf("remove state path pointer: %w", errRemove)
+		}
+		return nil
+	}
+	dir := filepath.Dir(pointerPath)
+	if errMkdir := os.MkdirAll(dir, 0o700); errMkdir != nil {
+		return fmt.Errorf("create state path pointer directory: %w", errMkdir)
+	}
+	temp, errTemp := os.CreateTemp(dir, ".state-location-*.tmp")
+	if errTemp != nil {
+		return fmt.Errorf("create state path pointer temp file: %w", errTemp)
+	}
+	tempName := temp.Name()
+	defer os.Remove(tempName)
+	if _, errWrite := temp.WriteString(filepath.Clean(activePath) + "\n"); errWrite != nil {
+		_ = temp.Close()
+		return fmt.Errorf("write state path pointer: %w", errWrite)
+	}
+	if errSync := temp.Sync(); errSync != nil {
+		_ = temp.Close()
+		return fmt.Errorf("sync state path pointer: %w", errSync)
+	}
+	if errClose := temp.Close(); errClose != nil {
+		return fmt.Errorf("close state path pointer: %w", errClose)
+	}
+	if errRename := os.Rename(tempName, pointerPath); errRename != nil {
+		if errRemove := os.Remove(pointerPath); errRemove != nil && !errors.Is(errRemove, os.ErrNotExist) {
+			return fmt.Errorf("replace state path pointer: %w", errRename)
+		}
+		if errRetry := os.Rename(tempName, pointerPath); errRetry != nil {
+			return fmt.Errorf("replace state path pointer: %w", errRetry)
+		}
+	}
+	return nil
 }
 
 func (s *StateStore) Load(defaultPolicy Policy, revision string) error {

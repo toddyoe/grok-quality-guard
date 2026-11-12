@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -134,6 +136,8 @@ func (p *Plugin) handleAction(ctx context.Context, action actionRequest, callbac
 		return p.actionPolicyUpdate(action.Params)
 	case "policy.reset":
 		return p.actionPolicyReset()
+	case "state_file.update":
+		return p.actionStateFileUpdate(action.Params)
 	case "events.list":
 		return p.actionEventsList(action.Params)
 	case "tasks.get":
@@ -498,6 +502,25 @@ func (p *Plugin) actionPolicyReset() (any, int, error) {
 	p.cfg.EventsLimit = normalized.EventsLimit
 	p.mu.Unlock()
 	return normalized, http.StatusOK, nil
+}
+
+func (p *Plugin) actionStateFileUpdate(params map[string]any) (any, int, error) {
+	stateFile := strings.TrimSpace(asString(params["state_file"]))
+	if stateFile == "" {
+		return nil, http.StatusBadRequest, fmt.Errorf("state_file is required")
+	}
+	activePath, errUpdate := p.UpdateStatePath(stateFile)
+	if errUpdate != nil {
+		switch {
+		case errors.Is(errUpdate, os.ErrInvalid):
+			return nil, http.StatusBadRequest, errUpdate
+		case errors.Is(errUpdate, os.ErrExist):
+			return nil, http.StatusConflict, errUpdate
+		default:
+			return nil, http.StatusInternalServerError, errUpdate
+		}
+	}
+	return map[string]any{"state_file": activePath}, http.StatusOK, nil
 }
 
 func (p *Plugin) actionTaskGet(params map[string]any) (any, int, error) {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -160,5 +161,84 @@ func TestStateStorePersistsResinSettings(t *testing.T) {
 	}
 	if !settings.ValidatedAt.Equal(validatedAt) {
 		t.Fatalf("validated_at mismatch: got %s want %s", settings.ValidatedAt, validatedAt)
+	}
+}
+func TestUpdateStatePathPersistsPointerAcrossRestart(t *testing.T) {
+	root := t.TempDir()
+	bootstrapPath := filepath.Join(root, "bootstrap", "state.json")
+	movedPath := filepath.Join(root, "moved", "state.json")
+	cfg := DefaultConfig()
+	cfg.Enabled = false
+	cfg.StateFile = bootstrapPath
+	rawConfig, errMarshal := json.Marshal(cfg)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	first := NewPlugin()
+	if errConfigure := first.Configure(rawConfig); errConfigure != nil {
+		t.Fatal(errConfigure)
+	}
+	t.Cleanup(first.Shutdown)
+	if errUpdate := first.stateStore().Update(func(state *State) error {
+		state.Events = append(state.Events, Event{Time: time.Now().UTC(), Action: "before_move", Result: "recorded"})
+		return nil
+	}); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+	activePath, errMove := first.UpdateStatePath(movedPath)
+	if errMove != nil {
+		t.Fatal(errMove)
+	}
+	if activePath != movedPath {
+		t.Fatalf("active path = %q, want %q", activePath, movedPath)
+	}
+	if _, errStat := os.Stat(movedPath); errStat != nil {
+		t.Fatalf("moved state file not found: %v", errStat)
+	}
+	if _, errStat := os.Stat(statePathPointerPath(bootstrapPath)); errStat != nil {
+		t.Fatalf("state path pointer not found: %v", errStat)
+	}
+
+	second := NewPlugin()
+	if errConfigure := second.Configure(rawConfig); errConfigure != nil {
+		t.Fatal(errConfigure)
+	}
+	t.Cleanup(second.Shutdown)
+	if second.stateStore().Path() != movedPath {
+		t.Fatalf("reloaded active path = %q, want %q", second.stateStore().Path(), movedPath)
+	}
+	state := second.stateStore().Snapshot()
+	if len(state.Events) != 1 || state.Events[0].Action != "before_move" {
+		t.Fatalf("moved state was not reloaded: %#v", state.Events)
+	}
+}
+
+func TestUpdateStatePathRejectsExistingTarget(t *testing.T) {
+	root := t.TempDir()
+	bootstrapPath := filepath.Join(root, "bootstrap", "state.json")
+	targetPath := filepath.Join(root, "target", "state.json")
+	cfg := DefaultConfig()
+	cfg.Enabled = false
+	cfg.StateFile = bootstrapPath
+	rawConfig, errMarshal := json.Marshal(cfg)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	plugin := NewPlugin()
+	if errConfigure := plugin.Configure(rawConfig); errConfigure != nil {
+		t.Fatal(errConfigure)
+	}
+	t.Cleanup(plugin.Shutdown)
+	if errMkdir := os.MkdirAll(filepath.Dir(targetPath), 0o700); errMkdir != nil {
+		t.Fatal(errMkdir)
+	}
+	if errWrite := os.WriteFile(targetPath, []byte("existing"), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	if _, errMove := plugin.UpdateStatePath(targetPath); !errors.Is(errMove, os.ErrExist) {
+		t.Fatalf("UpdateStatePath() error = %v, want os.ErrExist", errMove)
+	}
+	if plugin.stateStore().Path() != bootstrapPath {
+		t.Fatalf("active path changed after rejected move: %q", plugin.stateStore().Path())
 	}
 }

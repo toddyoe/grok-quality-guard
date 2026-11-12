@@ -317,6 +317,7 @@ curl -X POST \
 | `policy.get` | 查看运行时策略 |
 | `policy.update` | 校验并持久化策略 |
 | `policy.reset` | 重置为 YAML 初始值 |
+| `state_file.update` | 迁移并切换状态文件路径；目标文件必须不存在 |
 | `events.list` | 查看质量事件日志 |
 | `tasks.get` | 查询异步任务状态、结果和错误 |
 | `tasks.list` | 列出最近异步任务 |
@@ -351,7 +352,9 @@ services:
       - ./plugin-data/grok-quality-guard:/CLIProxyAPI/plugin-data/grok-quality-guard
 ```
 
-如果已经挂载了 `/CLIProxyAPI/plugins`，也可以显式把 `state_file` 指向该持久目录下的文件。显式配置的 `state_file` 不会被自动替换；路径不可写时插件会报错，而不是静默改写到临时目录。
+如果已经挂载了 `/CLIProxyAPI/plugins`，也可以显式把 `state_file` 指向该持久目录下的文件。显式配置的 `state_file` 是启动引导路径；路径不可写时插件会报错，而不是静默改写到临时目录。
+
+管理页“设置 / 守护策略”中的状态文件路径可以直接编辑。保存新路径时，插件会把当前完整 state 写入目标文件并立即切换；为避免覆盖已有数据，目标文件必须尚不存在。引导路径旁会生成 `<state_file>.location` 指针文件，使插件重启后继续使用新路径。修改 YAML 中的 `state_file` 会产生新的引导位置，因此可以借此重新指定路径；如要回退到旧引导文件，需要先删除对应指针文件。
 
 状态文件使用版本化 schema、原子替换写入，Unix 权限为目录 `0700`、文件 `0600`。策略首次从 YAML 初始化，之后管理页修改会持久化到 state；`policy.reset` 会恢复为当前 YAML 的默认值。通过管理页保存的 Resin 配置和 API 模式 token 也存储在 state 中，API 与页面只返回是否已设置的布尔标记。管理页设置区会显示当前实际使用的状态文件路径。
 
