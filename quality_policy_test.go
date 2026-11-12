@@ -94,8 +94,8 @@ func TestConsecutiveMissingThinkingThreshold(t *testing.T) {
 }
 
 func TestNonQualityProbeStatusDoesNotConsumeErrorStrikes(t *testing.T) {
-	if class := classifyProbeStatus(401); class != ClassIgnored {
-		t.Fatalf("401 classified as %q, want %q", class, ClassIgnored)
+	if class := classifyProbeStatus(401); class != ClassCredentialInvalid {
+		t.Fatalf("401 classified as %q, want %q", class, ClassCredentialInvalid)
 	}
 	if class := classifyProbeStatus(500); class != ClassIgnored {
 		t.Fatalf("500 classified as %q, want %q", class, ClassIgnored)

@@ -15,14 +15,20 @@ const (
 	StateSuspect            = "suspect"
 	StateDegraded           = "degraded"
 	StateCooling            = "cooling"
+	StateQuotaExhausted     = "quota_exhausted"
+	StateCredentialInvalid  = "credential_invalid"
 	StateDisabledByGuard    = "disabled_by_guard"
 	StateExternallyDisabled = "externally_disabled"
 )
 
 const (
-	DisableKindCooldown  = "cooldown"
-	DisableKindPermanent = "permanent"
+	DisableKindCooldown          = "cooldown"
+	DisableKindQuota             = "quota_exhausted"
+	DisableKindCredentialInvalid = "credential_invalid"
+	DisableKindPermanent         = "permanent"
 )
+
+const quotaExhaustedCooldown = 24 * time.Hour
 
 const probeHeader = "X-Grok-Quality-Probe"
 
@@ -65,10 +71,14 @@ func isConfirmedClass(class string) bool {
 }
 
 func cooldownForClass(class string, cfg QualityConfig) time.Duration {
-	if class == ClassEmptyStream {
+	switch class {
+	case ClassEmptyStream:
 		return cfg.EmptyStreamCooldown.Duration
+	case ClassQuotaExhausted:
+		return quotaExhaustedCooldown
+	default:
+		return cfg.MissingThinkingCooldown.Duration
 	}
-	return cfg.MissingThinkingCooldown.Duration
 }
 
 func authRawString(raw map[string]json.RawMessage, key string) string {
@@ -223,12 +233,48 @@ func isGrokAuth(raw map[string]json.RawMessage) bool {
 	return false
 }
 
+func isCooldownState(state string) bool {
+	return state == StateCooling || state == StateQuotaExhausted
+}
+
+func isIsolatedState(state string) bool {
+	switch state {
+	case StateCooling, StateQuotaExhausted, StateCredentialInvalid, StateDisabledByGuard, StateExternallyDisabled:
+		return true
+	default:
+		return false
+	}
+}
+
+func stateForDisableKind(kind string) string {
+	switch kind {
+	case DisableKindCooldown:
+		return StateCooling
+	case DisableKindQuota:
+		return StateQuotaExhausted
+	case DisableKindCredentialInvalid:
+		return StateCredentialInvalid
+	case DisableKindPermanent:
+		return StateDisabledByGuard
+	default:
+		return StateCooling
+	}
+}
+
+func isAccountStatusClass(class string) bool {
+	return class == ClassCredentialInvalid || class == ClassQuotaExhausted
+}
+
 func authDisabledState(raw map[string]json.RawMessage) string {
 	meta := guardMeta(raw)
 	if authDisabled(raw) {
 		switch meta.DisableKind {
 		case DisableKindCooldown:
 			return StateCooling
+		case DisableKindQuota:
+			return StateQuotaExhausted
+		case DisableKindCredentialInvalid:
+			return StateCredentialInvalid
 		case DisableKindPermanent:
 			return StateDisabledByGuard
 		default:

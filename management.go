@@ -390,7 +390,7 @@ func (p *Plugin) actionProbe(ctx context.Context, params map[string]any) (any, i
 
 func (p *Plugin) restoreBeforeManualProbe(ctx context.Context, authID, stateBefore string) error {
 	switch stateBefore {
-	case StateCooling, StateDisabledByGuard:
+	case StateCooling, StateQuotaExhausted, StateCredentialInvalid, StateDisabledByGuard:
 		return p.ManualRestore(ctx, authID)
 	default:
 		return nil

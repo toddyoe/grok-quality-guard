@@ -1657,6 +1657,8 @@
                 <option value="suspect">可疑</option>
                 <option value="degraded">降智</option>
                 <option value="cooling">冷却中</option>
+                <option value="quota_exhausted">额度耗尽</option>
+                <option value="credential_invalid">凭据失效</option>
                 <option value="disabled_by_guard">已隔离</option>
                 <option value="externally_disabled">外部禁用</option>
                 <option value="unknown">待检测</option>
@@ -2086,10 +2088,12 @@
     let toastTimer = 0;
     const STATE_LABELS = {
       unknown: '待检测', healthy: '健康', suspect: '可疑', degraded: '降智', cooling: '冷却中',
+      quota_exhausted: '额度耗尽', credential_invalid: '凭据失效',
       disabled_by_guard: '已隔离', externally_disabled: '外部禁用'
     };
     const STATE_TONES = {
       unknown: '', healthy: 'good', suspect: 'warn', degraded: 'bad', cooling: 'warn',
+      quota_exhausted: 'warn', credential_invalid: 'bad',
       disabled_by_guard: 'bad', externally_disabled: ''
     };
     const REASON_LABELS = {
@@ -2098,7 +2102,8 @@
       soft_tps: '软 TPS 超限', hard_tps: '硬 TPS 超限', empty_stream: '空流',
       insufficient_output_tokens: '输出不足', insufficient_generation_window: '生成窗口不足',
       expected_marker_missing: '探测标记缺失', probe_error: '探测错误', proxy_error: '代理错误',
-      ignored: '非质量错误', manual: '手动操作'
+      ignored: '非质量错误', manual: '手动操作', credential_invalid: '凭据失效',
+      quota_exhausted: '额度耗尽'
     };
     const REASON_DETAIL_LABELS = {
       'expected marker missing': '探测标记缺失',
@@ -2138,7 +2143,9 @@
       'host model stream bridge is unavailable': '宿主模型流桥接不可用',
       'host plugin callback instance is closed': '宿主插件回调实例已关闭',
       'host model stream closed during startup': '宿主模型流在启动时关闭',
-      'host.model.execute_stream returned an empty stream_id': '宿主模型流返回了空流 ID'
+      'host.model.execute_stream returned an empty stream_id': '宿主模型流返回了空流 ID',
+      'credential rejected': '凭据被拒绝', quota_exhausted: '额度耗尽',
+      'proxy authentication required': '代理认证失败', 'quota exhausted': '额度耗尽'
     };
     const ACTION_LABELS = {
       observe: '被动观测', probe: '主动探测', guard_disable: '自动处置', external_disable: '外部禁用',
@@ -2150,6 +2157,7 @@
       recorded: '已记录', healthy: '通过', failed: '失败', restored: '已恢复',
       external_left_disabled: '保持外部禁用', bound: '已绑定', rotated: '已轮换', cleared: '已清除', local_mode: '本地模式',
       validated: '已验证', cooldown: '已冷却', permanent: '永久禁用', error: '错误', ignored: '已忽略',
+      quota_exhausted: '额度耗尽', credential_invalid: '凭据失效', actioned: '已处置',
       pending: '累计中', threshold_reached: '达到阈值', scheduled: '已调度'
     };
     const esc = (value) => String(value == null ? '' : value).replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
@@ -2167,7 +2175,9 @@
       if (!text) return '';
       if (REASON_LABELS[text]) return REASON_LABELS[text];
       if (REASON_DETAIL_LABELS[text]) return REASON_DETAIL_LABELS[text];
-      let match = text.match(/^upstream status (\d+)$/i);
+      let match = text.match(/^upstream status (\d+) \((.+)\)$/i);
+      if (match) return '上游状态：' + match[1] + ' · ' + reasonText(match[2]);
+      match = text.match(/^upstream status (\d+)$/i);
       if (match) return '上游状态：' + match[1];
       match = text.match(/^probe upstream status (\d+)$/i);
       if (match) return '探测上游状态：' + match[1];
@@ -2530,7 +2540,7 @@
         statCard('power', num(actions), '自动处置', '冷却或永久禁用'),
         statCard('rotate', num(rotations), '租约轮换', 'Resin 账号重新绑定')
       ].join('');
-      const order = ['healthy', 'suspect', 'degraded', 'cooling', 'disabled_by_guard', 'externally_disabled', 'unknown'];
+      const order = ['healthy', 'suspect', 'degraded', 'cooling', 'quota_exhausted', 'credential_invalid', 'disabled_by_guard', 'externally_disabled', 'unknown'];
       const sum = order.reduce((totalCount, key) => totalCount + Number(states[key] || 0), 0);
       document.getElementById('qualityBars').innerHTML = order.map((key) => {
         const value = Number(states[key] || 0);
@@ -3128,7 +3138,7 @@
         toast('当前没有需要检测的非健康账号', 'success');
         return;
       }
-      if (!window.confirm('确认立即检测所有 ' + count + ' 个非健康状态账号？\n检测会发起真实模型请求并可能产生额度消耗；外部禁用账号会跳过，插件冷却或隔离账号会先自动恢复再检测。')) return;
+      if (!window.confirm('确认立即检测所有 ' + count + ' 个非健康状态账号？\n检测会发起真实模型请求并可能产生额度消耗；外部禁用账号会跳过，插件冷却、额度耗尽或凭据失效账号会先自动恢复再检测。')) return;
       setBusy(button, true);
       try {
         const task = await api('accounts.probe_non_healthy');
@@ -3161,7 +3171,7 @@
         toast('当前没有需要恢复的非健康账号', 'success');
         return;
       }
-      if (!window.confirm('确认恢复所有 ' + count + ' 个非健康状态账号？\n已由插件冷却或隔离的账号会重新启用；外部禁用账号只会清理插件状态，不会修改 OAuth 的 disabled 标记。')) return;
+      if (!window.confirm('确认恢复所有 ' + count + ' 个非健康状态账号？\n已由插件冷却、额度耗尽、凭据失效或隔离的账号会重新启用；外部禁用账号只会清理插件状态，不会修改 OAuth 的 disabled 标记。')) return;
       setBusy(button, true);
       try {
         const task = await api('accounts.restore_non_healthy');

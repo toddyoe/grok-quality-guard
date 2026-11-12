@@ -22,6 +22,8 @@ const (
 	ClassEmptyStream               = "empty_stream"
 	ClassProbeError                = "probe_error"
 	ClassProxyError                = "proxy_error"
+	ClassCredentialInvalid         = "credential_invalid"
+	ClassQuotaExhausted            = "quota_exhausted"
 	ClassIgnored                   = "ignored"
 	ClassInsufficientOutput        = "insufficient_output_tokens"
 	ClassInsufficientGeneration    = "insufficient_generation_window"

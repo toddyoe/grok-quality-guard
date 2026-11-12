@@ -73,7 +73,7 @@ func (p *Plugin) applyVerdictLocked(
 		if raw != nil && reEnabled {
 			meta := guardMeta(raw)
 			if meta.Managed {
-				account.State = StateCooling
+				account.State = stateForDisableKind(meta.DisableKind)
 				account.DisableKind = meta.DisableKind
 				if until, errUntil := time.Parse(time.RFC3339, strings.TrimSpace(meta.CooldownUntil)); errUntil == nil {
 					account.CooldownUntil = until
@@ -84,7 +84,7 @@ func (p *Plugin) applyVerdictLocked(
 		account.LastAttempt = &AttemptEvidence{
 			At: now, Source: source, Class: verdict.Class, Reason: verdict.Reason,
 		}
-		if verdict.Class != ClassIgnored && !isProbeErrorClass(verdict.Class) {
+		if verdict.Class != ClassIgnored && !isProbeErrorClass(verdict.Class) && !isAccountStatusClass(verdict.Class) {
 			account.Metrics = Metrics{
 				FirstTokenMS:    sig.FirstTokenMS,
 				DurationMS:      sig.DurationMS,
@@ -106,12 +106,7 @@ func (p *Plugin) applyVerdictLocked(
 		}
 
 		preserveIsolation := func() bool {
-			switch account.State {
-			case StateCooling, StateDisabledByGuard, StateExternallyDisabled:
-				return true
-			default:
-				return false
-			}
+			return isIsolatedState(account.State)
 		}
 		eventAction := "observe"
 		if source == "probe" {
@@ -191,6 +186,13 @@ func (p *Plugin) applyVerdictLocked(
 				}
 			}
 
+		case ClassCredentialInvalid, ClassQuotaExhausted:
+			account.SoftStrikes = 0
+			account.ErrorStrikes = 0
+			account.ThinkingStrikes = 0
+			outcome.Actioned = true
+			eventResult = "actioned"
+
 		case ClassIgnored:
 			eventClass = ""
 			eventResult = "ignored"
@@ -256,6 +258,19 @@ func (p *Plugin) applyVerdictLocked(
 
 	if verdict.Class == ClassNone {
 		p.markRecentSuccess(authID)
+	}
+
+	if isAccountStatusClass(verdict.Class) {
+		if raw == nil {
+			_, resolvedResponse, resolvedRaw, errResolve := p.resolveAuth(ctx, authID)
+			if errResolve != nil {
+				return outcome, errResolve
+			}
+			response = resolvedResponse
+			raw = resolvedRaw
+		}
+		_, errAction := p.applyAutoCooldownWithAuthLocked(ctx, authID, verdict, source, raw, response, false, true)
+		return outcome, errAction
 	}
 
 	if outcome.CrossVerify {
@@ -370,25 +385,34 @@ func (p *Plugin) applyAutoCooldownWithAuthLocked(
 ) (bool, error) {
 	account, _ := p.stateAccount(authID)
 	now := time.Now().UTC()
-	if !force && account.State == StateCooling && now.Before(account.CooldownUntil) {
+	if !force && isCooldownState(account.State) && now.Before(account.CooldownUntil) {
 		return false, nil
 	}
-	if account.State == StateDisabledByGuard || account.State == StateExternallyDisabled {
+	if account.State == StateDisabledByGuard || account.State == StateExternallyDisabled || account.State == StateCredentialInvalid {
 		return false, nil
 	}
 	p.mu.RLock()
 	policy := p.policy
 	p.mu.RUnlock()
-	duration := cooldownForClass(verdict.Class, policy.Quality)
-	if isProbeErrorClass(verdict.Class) {
-		duration = nextProbeBackoff(policy.Probe, account)
-	}
-	if duration <= 0 {
-		duration = policy.Quality.MissingThinkingCooldown.Duration
-	}
 	kind := DisableKindCooldown
+	duration := cooldownForClass(verdict.Class, policy.Quality)
+	switch verdict.Class {
+	case ClassCredentialInvalid:
+		kind = DisableKindCredentialInvalid
+		duration = 0
+	case ClassQuotaExhausted:
+		kind = DisableKindQuota
+		duration = quotaExhaustedCooldown
+	default:
+		if isProbeErrorClass(verdict.Class) {
+			duration = nextProbeBackoff(policy.Probe, account)
+		}
+		if duration <= 0 {
+			duration = policy.Quality.MissingThinkingCooldown.Duration
+		}
+	}
 	allowPermanent := policy.AutoAction == "cooldown_then_disable"
-	if allowPermanent && verdict.Class == ClassMissingThinking && previousMissingStrike {
+	if allowPermanent && kind == DisableKindCooldown && verdict.Class == ClassMissingThinking && previousMissingStrike {
 		kind = DisableKindPermanent
 		duration = 0
 	}
@@ -419,7 +443,7 @@ func (p *Plugin) holdProbeRecoveryLocked(
 	if !meta.Managed || authDisabled(raw) {
 		return nil
 	}
-	if meta.DisableKind == DisableKindPermanent {
+	if meta.DisableKind == DisableKindPermanent || meta.DisableKind == DisableKindCredentialInvalid {
 		return nil
 	}
 	p.mu.RLock()
@@ -480,7 +504,7 @@ func (p *Plugin) saveGuardDisableLocked(
 	}
 	meta.DisableKind = kind
 	var until time.Time
-	if kind == DisableKindCooldown {
+	if kind == DisableKindCooldown || kind == DisableKindQuota {
 		if duration <= 0 {
 			p.mu.RLock()
 			duration = p.policy.Quality.MissingThinkingCooldown.Duration
@@ -504,10 +528,17 @@ func (p *Plugin) saveGuardDisableLocked(
 	}
 	return p.stateStore().Update(func(state *State) error {
 		account := p.ensureStateAccount(state, authID, "", "")
-		if kind == DisableKindCooldown {
+		switch kind {
+		case DisableKindCooldown:
 			account.State = StateCooling
 			account.CooldownUntil = until
-		} else {
+		case DisableKindQuota:
+			account.State = StateQuotaExhausted
+			account.CooldownUntil = until
+		case DisableKindCredentialInvalid:
+			account.State = StateCredentialInvalid
+			account.CooldownUntil = time.Time{}
+		default:
 			account.State = StateDisabledByGuard
 			account.CooldownUntil = time.Time{}
 		}
@@ -620,7 +651,7 @@ func (p *Plugin) Reconcile(ctx context.Context) error {
 		if stateAccount == nil {
 			continue
 		}
-		if stateAccount.State != StateCooling && stateAccount.State != StateDisabledByGuard && stateAccount.State != StateUnknown && stateAccount.State != StateExternallyDisabled {
+		if !isIsolatedState(stateAccount.State) && stateAccount.State != StateUnknown {
 			continue
 		}
 		if legacyMarkerParseFailure(stateAccount) && p.releaseLegacyProbeCooldown(ctx, authID) {
@@ -729,9 +760,17 @@ func (p *Plugin) reconcileAccount(ctx context.Context, authID, currentState stri
 		_ = p.updateStateAccount(authID, func(account *AccountState) error {
 			account.State = StateDisabledByGuard
 			account.DisableKind = DisableKindPermanent
+			account.CooldownUntil = time.Time{}
 			return nil
 		})
-	case DisableKindCooldown:
+	case DisableKindCredentialInvalid:
+		_ = p.updateStateAccount(authID, func(account *AccountState) error {
+			account.State = StateCredentialInvalid
+			account.DisableKind = DisableKindCredentialInvalid
+			account.CooldownUntil = time.Time{}
+			return nil
+		})
+	case DisableKindCooldown, DisableKindQuota:
 		if !authDisabled(raw) {
 			if errDisable := p.saveAuthDisabled(response.Name, raw, true); errDisable != nil {
 				return
@@ -740,10 +779,10 @@ func (p *Plugin) reconcileAccount(ctx context.Context, authID, currentState stri
 		until, _ := time.Parse(time.RFC3339, strings.TrimSpace(meta.CooldownUntil))
 		_ = p.updateStateAccount(authID, func(account *AccountState) error {
 			if account.State != StateDisabledByGuard {
-				account.State = StateCooling
+				account.State = stateForDisableKind(meta.DisableKind)
 			}
 			account.CooldownUntil = until
-			account.DisableKind = DisableKindCooldown
+			account.DisableKind = meta.DisableKind
 			account.QualityStrikeMissingThinking = meta.StrikeMissingThinking
 			return nil
 		})

@@ -382,7 +382,7 @@ func (p *Plugin) syncCatalogState(accounts []Account) error {
 			}
 			if account.Disabled {
 				switch existing.State {
-				case StateCooling, StateDisabledByGuard:
+				case StateCooling, StateQuotaExhausted, StateCredentialInvalid, StateDisabledByGuard:
 				default:
 					existing.State = StateExternallyDisabled
 				}

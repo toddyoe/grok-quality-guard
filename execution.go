@@ -167,8 +167,8 @@ func (p *Plugin) transparentExecute(ctx context.Context, req rpcExecutorRequest)
 			if errAttempt == nil {
 				return result, nil
 			}
-			if class == ClassProbeError || class == ClassProxyError {
-				_ = p.ApplyVerdict(ctx, account.ID, QualityVerdict{Class: class}, "transparent", req.HostCallbackID)
+			if isProbeErrorClass(class) || isAccountStatusClass(class) {
+				_ = p.ApplyVerdict(ctx, account.ID, QualityVerdict{Class: class, Reason: sanitizeError(errAttempt)}, "transparent", req.HostCallbackID)
 			}
 			if result.Available {
 				last = result
@@ -233,8 +233,8 @@ func (p *Plugin) transparentExecuteBufferedStream(ctx context.Context, req rpcEx
 			if errAttempt == nil {
 				return result, nil
 			}
-			if class == ClassProbeError || class == ClassProxyError {
-				_ = p.ApplyVerdict(ctx, account.ID, QualityVerdict{Class: class}, "transparent", req.HostCallbackID)
+			if isProbeErrorClass(class) || isAccountStatusClass(class) {
+				_ = p.ApplyVerdict(ctx, account.ID, QualityVerdict{Class: class, Reason: sanitizeError(errAttempt)}, "transparent", req.HostCallbackID)
 			}
 			if result.Available {
 				last = result
@@ -267,7 +267,8 @@ func (p *Plugin) executeTransparentOnce(ctx context.Context, execution pluginapi
 		return transparentResult{}, classifyTransportError(errExecute), errExecute
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return transparentResult{}, ClassProbeError, fmt.Errorf("upstream status %d", response.StatusCode)
+		class, reason := classifyUpstreamStatus(response.StatusCode, response.Body)
+		return transparentResult{}, class, fmt.Errorf("%s", reason)
 	}
 	analyzer := NewStreamAnalyzerWithProtocol(execution.ExitProtocol)
 	analyzer.SetStreaming(false)
@@ -294,7 +295,8 @@ func (p *Plugin) executeTransparentBufferedAttempt(ctx context.Context, executio
 	}
 	defer p.closeModelStream(stream.StreamID)
 	if stream.StatusCode < 200 || stream.StatusCode >= 300 {
-		return transparentResult{}, ClassProbeError, fmt.Errorf("upstream status %d", stream.StatusCode)
+		class, reason := classifyUpstreamStatus(stream.StatusCode, p.readModelStreamErrorBody(ctx, stream.StreamID))
+		return transparentResult{}, class, fmt.Errorf("%s", reason)
 	}
 	analyzer := NewStreamAnalyzer()
 	chunks := make([]pluginapi.ExecutorStreamChunk, 0)
@@ -400,8 +402,8 @@ func (p *Plugin) runTransparentStreamBridge(ctx context.Context, req rpcExecutor
 				p.closePluginStream(streamID, "", "", 0)
 				return
 			}
-			if outcome.Class == ClassProbeError || outcome.Class == ClassProxyError {
-				_ = p.ApplyVerdict(ctx, account.ID, QualityVerdict{Class: outcome.Class}, "transparent", req.HostCallbackID)
+			if isProbeErrorClass(outcome.Class) || isAccountStatusClass(outcome.Class) {
+				_ = p.ApplyVerdict(ctx, account.ID, QualityVerdict{Class: outcome.Class, Reason: sanitizeError(outcome.Err)}, "transparent", req.HostCallbackID)
 			}
 			if outcome.Available {
 				last = outcome
@@ -443,7 +445,8 @@ func (p *Plugin) executeTransparentStreamAttempt(ctx context.Context, execution 
 		_ = p.closeModelStream(stream.StreamID)
 	}()
 	if stream.StatusCode < 200 || stream.StatusCode >= 300 {
-		return transparentStreamAttempt{Class: ClassProbeError, Err: fmt.Errorf("upstream status %d", stream.StatusCode)}
+		class, reason := classifyUpstreamStatus(stream.StatusCode, p.readModelStreamErrorBody(attemptCtx, stream.StreamID))
+		return transparentStreamAttempt{Class: class, Err: fmt.Errorf("%s", reason)}
 	}
 	analyzer := NewStreamAnalyzerWithProtocol(execution.ExitProtocol)
 	analyzer.SetEncryptedConfig(cfg.MinEncryptedBytes, cfg.EncryptedBytesPerReasoningToken)
@@ -688,11 +691,8 @@ func (p *Plugin) transparentCandidates(ctx context.Context) ([]Account, error) {
 			continue
 		}
 		stateAccount, okState := p.stateAccount(account.ID)
-		if okState {
-			switch stateAccount.State {
-			case StateCooling, StateDisabledByGuard, StateExternallyDisabled:
-				continue
-			}
+		if okState && isIsolatedState(stateAccount.State) {
+			continue
 		}
 		if p.isProbeAuth(account.ID) {
 			continue
@@ -765,8 +765,7 @@ func (p *Plugin) rotateAfterFailure(ctx context.Context, authID, class string) (
 		return false, nil
 	}
 	stateAccount, _ := p.stateAccount(authID)
-	switch stateAccount.State {
-	case StateCooling, StateDisabledByGuard, StateExternallyDisabled:
+	if isIsolatedState(stateAccount.State) {
 		return false, nil
 	}
 	if errRotate := p.RotateResin(ctx, authID); errRotate != nil {
@@ -776,11 +775,99 @@ func (p *Plugin) rotateAfterFailure(ctx context.Context, authID, class string) (
 	return true, nil
 }
 
+const maxUpstreamErrorBodyBytes = 64 << 10
+
 func classifyProbeStatus(status int) string {
-	if status == http.StatusProxyAuthRequired {
-		return ClassProxyError
+	class, _ := classifyUpstreamStatus(status, nil)
+	return class
+}
+
+func classifyUpstreamStatus(status int, body []byte) (string, string) {
+	switch status {
+	case http.StatusUnauthorized:
+		return ClassCredentialInvalid, "upstream status 401 (credential rejected)"
+	case http.StatusProxyAuthRequired:
+		return ClassProxyError, "upstream status 407 (proxy authentication required)"
+	case http.StatusPaymentRequired:
+		return ClassQuotaExhausted, "upstream status 402 (quota exhausted)"
 	}
-	return ClassIgnored
+	text := strings.ToLower(string(body))
+	if status == http.StatusForbidden || status == http.StatusTooManyRequests {
+		if isQuotaExhaustionText(text) {
+			return ClassQuotaExhausted, fmt.Sprintf("upstream status %d (quota exhausted)", status)
+		}
+		if status == http.StatusForbidden && isCredentialRejectionText(text) {
+			return ClassCredentialInvalid, "upstream status 403 (credential rejected)"
+		}
+	}
+	return ClassIgnored, fmt.Sprintf("upstream status %d", status)
+}
+
+func isQuotaExhaustionText(text string) bool {
+	for _, marker := range []string{
+		"subscription:free-usage-exhausted",
+		"used all the included free usage",
+		"usage limit reached",
+		"usage balance exhausted",
+		"run out of credits",
+		"out of credits",
+		"spending-limit",
+		"quota",
+		"tokens (actual/limit)",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isCredentialRejectionText(text string) bool {
+	for _, marker := range []string{"authentication", "unauthorized", "invalid token", "token expired"} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Plugin) readModelStreamErrorBody(ctx context.Context, streamID string) []byte {
+	if p == nil || strings.TrimSpace(streamID) == "" {
+		return nil
+	}
+	readCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	body := make([]byte, 0, 4096)
+	for len(body) < maxUpstreamErrorBodyBytes {
+		if readCtx.Err() != nil {
+			break
+		}
+		read, errRead := p.readModelStreamContext(readCtx, streamID)
+		if errRead != nil {
+			break
+		}
+		if len(read.Payload) > 0 {
+			remaining := maxUpstreamErrorBodyBytes - len(body)
+			if len(read.Payload) > remaining {
+				read.Payload = read.Payload[:remaining]
+			}
+			body = append(body, read.Payload...)
+		}
+		if read.Error != "" {
+			remaining := maxUpstreamErrorBodyBytes - len(body)
+			if remaining > 0 {
+				errorText := []byte(read.Error)
+				if len(errorText) > remaining {
+					errorText = errorText[:remaining]
+				}
+				body = append(body, errorText...)
+			}
+		}
+		if read.Done {
+			break
+		}
+	}
+	return body
 }
 
 func classifyTransportError(errValue error) string {

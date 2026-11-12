@@ -557,6 +557,8 @@ type QualityVerdict struct {
 | `suspect` | 有一次弱异常、探测错误或证据不完整 | 是，但降低优先级 |
 | `degraded` | 已确认质量异常，但未自动处置 | 是，仅 observe 模式 |
 | `cooling` | 已确认异常并处于冷却 | 否 |
+| `quota_exhausted` | 上游明确额度耗尽，进入 24 小时冷却 | 否 |
+| `credential_invalid` | 上游拒绝凭据，账号被禁用并等待重新认证 | 否 |
 | `disabled_by_guard` | 冷却后再次确认，或管理员显式禁用 | 否 |
 | `externally_disabled` | 初始就被管理员禁用，插件不得修改 | 否 |
 
@@ -592,6 +594,15 @@ cooling
   ├─ cooldown_then_disable + missing_thinking after cooldown -> disabled_by_guard
   └─ probe error -> cooling + backoff
 
+quota_exhausted
+  ├─ 24h cooldown -> automatic re-enable and recovery probe
+  ├─ probe pass -> healthy
+  └─ quota response again -> quota_exhausted
+
+credential_invalid
+  ├─ disabled=true until manual restore
+  └─ no automatic restore or probe
+
 disabled_by_guard
   ├─ manual restore -> unknown, clear guard strike
   └─ no automatic restore
@@ -601,10 +612,11 @@ disabled_by_guard
 
 `auto_action=observe`：
 
-- 只记录
-- 不修改 CPA auth
-- 不自动轮换 Resin
-- 不写 disabled
+- 质量异常只记录
+- 质量异常不修改 CPA auth
+- 质量异常不自动轮换 Resin
+- 质量异常不写 disabled
+- `credential_invalid` 和 `quota_exhausted` 仍直接处置，避免失效账号继续参与路由
 - 历史 anomaly 数量用于展示，不在切换到自动策略时追溯处罚
 
 `auto_action=cooldown_only`：
@@ -624,6 +636,8 @@ disabled_by_guard
 4. 恢复探测成功：恢复 `disabled=false`，清除 cooldown，状态 `healthy`，保留 `strike_missing_thinking=true`。
 5. 恢复探测再次确认 `missing_thinking`：写永久 `disabled=true`，`disable_kind=permanent`，状态 `disabled_by_guard`。
 6. 恢复探测网络错误：重新写回 cooldown，增加 backoff，不直接永久禁用。
+
+上游账号状态错误独立于质量 strike：`credential_invalid` 直接禁用并等待凭据更新；`quota_exhausted` 使用固定 24 小时冷却，因为 Grok 免费额度按滚动 24 小时窗口恢复。这两类处置不受 `auto_action: observe` 限制，避免失效凭据或耗尽额度继续参与路由。
 
 `missing_thinking` strike 语义：
 
@@ -983,7 +997,9 @@ CPA 不允许直接执行 disabled auth。恢复探测流程必须：
 - 空流：15m 冷却
 - probe 网络/超时/流不完整：`suspect` + backoff
 - 代理错误：`proxy_error`，冷却并在条件允许时轮换 Resin
-- 非 2xx：`probe_error`，不直接永久禁用
+- `401`：`credential_invalid`，直接写入 `disabled=true`，不自动探测
+- `402` 或包含免费额度/quota/credits 明确文案的 `403/429`：`quota_exhausted`，直接进入 24 小时冷却
+- 其他非 2xx：`ignored` 或 `probe_error`，不直接永久禁用
 
 ## 9. Resin 管理
 

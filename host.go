@@ -78,7 +78,10 @@ func (p *Plugin) executeModelStream(_ context.Context, req pluginapi.HostModelEx
 		return pluginapi.HostModelStreamResponse{}, fmt.Errorf("decode host.model.execute_stream result: %w", errUnmarshal)
 	}
 	if response.StreamID == "" {
-		return pluginapi.HostModelStreamResponse{}, fmt.Errorf("host.model.execute_stream returned an empty stream_id")
+		if response.StatusCode >= 200 && response.StatusCode < 300 {
+			return pluginapi.HostModelStreamResponse{}, fmt.Errorf("host.model.execute_stream returned an empty stream_id")
+		}
+		return response, nil
 	}
 	p.trackModelStream(response.StreamID)
 	return response, nil

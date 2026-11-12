@@ -74,9 +74,9 @@ func (p *Plugin) probeDue(authID string, force bool) (bool, error) {
 	}
 	now := time.Now().UTC()
 	switch stateAccount.State {
-	case StateHealthy, StateDisabledByGuard, StateExternallyDisabled:
+	case StateHealthy, StateDisabledByGuard, StateExternallyDisabled, StateCredentialInvalid:
 		return false, nil
-	case StateCooling:
+	case StateCooling, StateQuotaExhausted:
 		if stateAccount.CooldownUntil.IsZero() {
 			return true, nil
 		}
@@ -135,10 +135,10 @@ func (p *Plugin) ProbeAccount(ctx context.Context, authID string, force bool, ca
 	if wasDisabled && !meta.Managed {
 		return p.setStateExternal(authID, ClassProbeError)
 	}
-	if wasDisabled && meta.DisableKind == DisableKindPermanent {
+	if wasDisabled && (meta.DisableKind == DisableKindPermanent || meta.DisableKind == DisableKindCredentialInvalid) {
 		return nil
 	}
-	if wasDisabled && !force && meta.DisableKind == DisableKindCooldown {
+	if wasDisabled && !force && (meta.DisableKind == DisableKindCooldown || meta.DisableKind == DisableKindQuota) {
 		until, _ := time.Parse(time.RFC3339, strings.TrimSpace(meta.CooldownUntil))
 		if !until.IsZero() && time.Now().UTC().Before(until) {
 			return nil
@@ -180,7 +180,9 @@ func (p *Plugin) ProbeAccount(ctx context.Context, authID string, force bool, ca
 	}
 	defer p.closeModelStream(stream.StreamID)
 	if stream.StatusCode < 200 || stream.StatusCode >= 300 {
-		return p.handleProbeFailure(authID, raw, response, reEnabled, QualityVerdict{Class: classifyProbeStatus(stream.StatusCode), Reason: fmt.Sprintf("upstream status %d", stream.StatusCode)}, fmt.Errorf("probe upstream status %d", stream.StatusCode))
+		errorBody := p.readModelStreamErrorBody(probeCtx, stream.StreamID)
+		class, reason := classifyUpstreamStatus(stream.StatusCode, errorBody)
+		return p.handleProbeFailure(authID, raw, response, reEnabled, QualityVerdict{Class: class, Reason: reason}, fmt.Errorf("probe %s", reason))
 	}
 	analyzer := NewStreamAnalyzerWithProtocol(probeCfg.ExitProtocol)
 	analyzer.SetEncryptedConfig(qualityCfg.MinEncryptedBytes, qualityCfg.EncryptedBytesPerReasoningToken)

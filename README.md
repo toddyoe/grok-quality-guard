@@ -2,7 +2,7 @@
 
 > 面向 CLIProxyAPI v8 的 Grok / xAI 账号质量守卫插件。
 
-Grok Quality Guard 观测 Grok / xAI auth 的真实响应质量，识别 HTTP 200 但实际降智的输出，并提供账号级状态、冷却、恢复探测和可选的透明换号保护。插件默认采用只读观测，不会自动修改 auth。
+Grok Quality Guard 观测 Grok / xAI auth 的真实响应质量，识别 HTTP 200 但实际降智的输出，并提供账号级状态、冷却、恢复探测和可选的透明换号保护。质量异常默认只读观测；上游 401 凭据失效和明确额度耗尽仍会直接禁用或冷却账号。
 
 设计细节和完整状态机见 [插件设计文档](docs/grok-quality-guard-plugin-design.md)。
 
@@ -12,7 +12,7 @@ Grok Quality Guard 观测 Grok / xAI auth 的真实响应质量，识别 HTTP 20
 - 可选透明保护 `transparent_guard`：在首次向客户端 emit 前完成质量门，异常时关闭上游流并换号
 - 真实 thinking 证据判定，不使用空 reasoning stub 或单独的 `reasoning_tokens` 判断健康
 - 检测 `missing_thinking`、`buffered_burst`、`cipher_drool`、`fake_encrypted_dump`、`fast_reasoning_ratio_dump`、`soft_tps`、`hard_tps`、`empty_stream`、`probe_error`、`proxy_error`
-- 账号状态机：`unknown`、`healthy`、`suspect`、`degraded`、`cooling`、`disabled_by_guard`、`externally_disabled`
+- 账号状态机：`unknown`、`healthy`、`suspect`、`degraded`、`cooling`、`quota_exhausted`、`credential_invalid`、`disabled_by_guard`、`externally_disabled`
 - 首次确认异常可配置为只观察或临时冷却，冷却到期通过固定 prompt 恢复探测
 - Resin 账号级租约绑定、显式轮换、批量绑定和代理清除；无 API 时可仅本地改写已有代理用户名
 - 内嵌中文化管理页，按概览、账号质量、Resin 租约、事件日志和设置分 Tab，账号、租约与事件列表支持分页
@@ -159,7 +159,7 @@ plugins:
       enabled: true
       priority: 10
 
-      # 默认只观测，不修改 auth
+      # 质量异常默认只观测；401/额度耗尽仍直接处置
       passive_guard: true
       transparent_guard: false
       auto_action: observe
@@ -214,7 +214,7 @@ plugins:
 
 ### 自动处置
 
-- `auto_action: observe`：只记录事件和状态，不修改 auth，不自动轮换 Resin
+- `auto_action: observe`：质量异常只记录事件和状态，不修改 auth，不自动轮换 Resin；上游 401 凭据拒绝和明确的额度耗尽仍会直接执行账号处置
 - `auto_action: cooldown_only`：首次确认异常时写入临时 `disabled=true`；冷却到期后执行恢复探测，仍异常则重新进入冷却，永不自动永久禁用
 - `auto_action: cooldown_then_disable`：首次确认异常时写入临时 `disabled=true`，冷却到期后执行恢复探测；再次确认 missing-thinking 时永久禁用
 
@@ -223,7 +223,9 @@ plugins:
 连续阈值与旧 grok2api/egress guard 策略对齐：
 
 - `consecutive_soft`：连续软 TPS 样本达到次数后才进入处置；默认 `2`
-- `consecutive_errors`：连续传输/代理错误达到次数后才进入处置；401/403、额度、限流和上游 5xx 等非质量错误只记录为 `ignored`，不计入 strike；默认 `2`
+- `consecutive_errors`：连续传输/代理错误达到次数后才进入处置；上游 5xx、普通限流和无法确认的 403/429 只记录为 `ignored`，不计入 strike；默认 `2`
+- 上游 `401` 标记为 `credential_invalid`，写入 `disabled=true` 并等待管理员更新凭据后手动恢复
+- 上游 `402`、包含 free usage/quota/credits 等明确额度耗尽文案的 `403/429` 标记为 `quota_exhausted`，写入 24 小时冷却；到期后自动恢复探测
 - `consecutive_missing_thinking`：连续缺少真实思考达到次数后才进入处置；默认 `1`
 - `thinking_guard=false`：跳过缺少思考判定，只保留 TPS、空流等其他质量检查
 - `fail_closed=true`：生成窗口小于 `min_generation_ms` 且速度达到 `soft_tps` 时判定为 `buffered_burst`；窗口不足但速度不高时判定为 `insufficient_generation_window`
