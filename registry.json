@@ -8,6 +8,7 @@
       "author": "grok-quality-guard contributors",
       "version": "0.0.8",
       "repository": "https://github.com/toddyoe/grok-quality-guard",
+      "logo": "https://raw.githubusercontent.com/toddyoe/grok-quality-guard/main/assets/logo.png",
       "homepage": "https://github.com/toddyoe/grok-quality-guard#readme",
       "tags": [
         "grok",

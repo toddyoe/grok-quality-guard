@@ -274,6 +274,7 @@ jobs:
               "author": os.environ["PLUGIN_AUTHOR"],
               "version": version,
               "repository": f"https://github.com/{repo}",
+              "logo": f"https://raw.githubusercontent.com/{repo}/{os.environ['DEFAULT_BRANCH']}/assets/logo.png",
               "homepage": f"https://github.com/{repo}#readme",
               "tags": ["grok", "xai", "quality", "resin", "management"],
               "install": {"type": "github-release"},

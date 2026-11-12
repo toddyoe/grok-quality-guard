@@ -107,7 +107,7 @@ func TestManagementResourceAndActionAccess(t *testing.T) {
 	if response.StatusCode != http.StatusOK || !strings.Contains(string(response.Body), "/plugins/grok-quality-guard/api") {
 		t.Fatalf("unexpected dashboard response: status=%d body=%s", response.StatusCode, response.Body)
 	}
-	for _, removed := range []string{"proxy_url", "代理（脱敏）", "选择全部筛选结果", " 代理", "代理 ", "const strikeBadge = strikes.length", "badge('连续 ' + strikes.join"} {
+	for _, removed := range []string{"proxy_url", "代理（脱敏）", "选择全部筛选结果", " 代理", "代理 ", "const strikeBadge = strikes.length", "badge('连续 ' + strikes.join", "id=\"refreshBtn\""} {
 		if strings.Contains(string(response.Body), removed) {
 			t.Fatalf("dashboard still contains legacy label %q", removed)
 		}
@@ -118,7 +118,7 @@ func TestManagementResourceAndActionAccess(t *testing.T) {
 	if strings.Contains(string(response.Body), "对齐旧插件") {
 		t.Fatal("dashboard should describe the setting semantically instead of referencing the old plugin")
 	}
-	for _, expected := range []string{"概览", "账号质量", "Resin 租约", "事件日志", "设置", "24 小时统计", "resin.config.get", "resin.clear", "leaseSelectAll", "clearSelectedBtn", "accountsPager", "leasesPager", "eventsPager", "selectFilteredBtn", "selectAllAccountsBtn", "全选当前筛选", "全选所有账号", "选择本页全部账号", "r_local_only", "本地轮换", "state_file.update", "id=\"p_state_file\" type=\"text\"", "summary-value truncate", "连续检测到缺少真实思考的响应达到该次数后触发处置或交叉验证", `type="password"`, "const REASON_DETAIL_LABELS", "'expected marker missing': '探测标记缺失'", "真实思考：", "终止：", "解析失败：", "<td class=\"nowrap\">"} {
+	for _, expected := range []string{"概览", "账号质量", "Resin 租约", "事件日志", "设置", "24 小时统计", "resin.config.get", "resin.clear", "leaseSelectAll", "clearSelectedBtn", "accountsPager", "leasesPager", "eventsPager", "selectFilteredBtn", "selectAllAccountsBtn", "全选当前筛选", "全选所有账号", "选择本页全部账号", "r_local_only", "本地轮换", "state_file.update", "id=\"p_state_file\" type=\"text\"", "summary-value truncate", "连续检测到缺少真实思考的响应达到该次数后触发处置或交叉验证", `type="password"`, "const REASON_DETAIL_LABELS", "'expected marker missing': '探测标记缺失'", "真实思考：", "终止：", "解析失败：", "<td class=\"nowrap\">", "actions-cell", "includeTime: false", "accountRefreshBtn", "leaseRefreshBtn", "eventRefreshBtn", "accountProbeAllBtn", "accounts.probe_non_healthy", "accountRestoreAllBtn", "accounts.restore_non_healthy"} {
 		if !strings.Contains(string(response.Body), expected) {
 			t.Fatalf("dashboard is missing %q", expected)
 		}
@@ -266,6 +266,176 @@ func TestManualActionsUpdateState(t *testing.T) {
 	account, _ = plugin.stateAccount("auth-1")
 	if account.State != StateUnknown || !account.CooldownUntil.IsZero() {
 		t.Fatalf("unexpected restored state: %#v", account)
+	}
+}
+
+func TestRestoreNonHealthyBatchManagement(t *testing.T) {
+	entriesHealthy, authsHealthy := singleGrokAuth(t, "auth-healthy", "[EMAIL]", nil)
+	entriesDegraded, authsDegraded := singleGrokAuth(t, "auth-degraded", "[EMAIL]", nil)
+	entriesExternal, authsExternal := singleGrokAuth(t, "auth-external", "[EMAIL]", map[string]any{"disabled": true})
+	entries := append(entriesHealthy, entriesDegraded...)
+	entries = append(entries, entriesExternal...)
+	auths := make(map[string]json.RawMessage, len(authsHealthy)+len(authsDegraded)+len(authsExternal))
+	for key, value := range authsHealthy {
+		auths[key] = value
+	}
+	for key, value := range authsDegraded {
+		auths[key] = value
+	}
+	for key, value := range authsExternal {
+		auths[key] = value
+	}
+	host := newMockHostCall(entries, auths)
+	plugin := newTestPlugin(t, host, nil)
+	if errUpdate := plugin.stateStore().Update(func(state *State) error {
+		state.Accounts["auth-healthy"].State = StateHealthy
+		state.Accounts["auth-degraded"].State = StateDegraded
+		state.Accounts["auth-degraded"].CooldownUntil = time.Now().UTC().Add(time.Hour)
+		state.Accounts["auth-external"].State = StateExternallyDisabled
+		return nil
+	}); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+
+	body, errMarshal := json.Marshal(actionRequest{Action: "accounts.restore_non_healthy"})
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	response := callManagementForTest(t, plugin, http.MethodPost, "/plugins/grok-quality-guard/api", http.Header{"Content-Type": []string{"application/json"}}, body)
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("restore batch status = %d body=%s", response.StatusCode, response.Body)
+	}
+	var envelope struct {
+		Data Task `json:"data"`
+	}
+	if errUnmarshal := json.Unmarshal(response.Body, &envelope); errUnmarshal != nil {
+		t.Fatalf("decode restore task: %v", errUnmarshal)
+	}
+	if envelope.Data.Kind != "accounts.restore_non_healthy" {
+		t.Fatalf("unexpected task kind: %q", envelope.Data.Kind)
+	}
+	task := waitTaskForTest(t, plugin, envelope.Data.ID)
+	if task.Status != taskStatusSucceeded {
+		t.Fatalf("restore batch task failed: %#v", task)
+	}
+	encodedResult, errMarshal := json.Marshal(task.Result)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	var result restoreBatchResult
+	if errUnmarshal := json.Unmarshal(encodedResult, &result); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if result.Count != 2 || result.Restored != 1 || result.ExternalLeftDisabled != 1 || result.Failed != 0 {
+		t.Fatalf("unexpected restore summary: %#v", result)
+	}
+	statuses := make(map[string]string, len(result.Items))
+	for _, item := range result.Items {
+		statuses[item.AuthID] = item.Status
+	}
+	if statuses["auth-degraded"] != "restored" || statuses["auth-external"] != "external_left_disabled" {
+		t.Fatalf("unexpected restore items: %#v", result.Items)
+	}
+	state := plugin.stateStore().Snapshot()
+	if state.Accounts["auth-healthy"].State != StateHealthy {
+		t.Fatalf("healthy account was modified: %#v", state.Accounts["auth-healthy"])
+	}
+	if state.Accounts["auth-degraded"].State != StateUnknown || !state.Accounts["auth-degraded"].CooldownUntil.IsZero() {
+		t.Fatalf("degraded account was not restored: %#v", state.Accounts["auth-degraded"])
+	}
+	if state.Accounts["auth-external"].State != StateUnknown {
+		t.Fatalf("external account guard state was not cleared: %#v", state.Accounts["auth-external"])
+	}
+	if _, saved := host.saves["auth-external"]; saved {
+		t.Fatal("external disabled auth must not be modified")
+	}
+}
+
+func TestProbeNonHealthyBatchManagement(t *testing.T) {
+	entriesHealthy, authsHealthy := singleGrokAuth(t, "auth-healthy", "[EMAIL]", nil)
+	entriesSuspect, authsSuspect := singleGrokAuth(t, "auth-suspect", "[EMAIL]", nil)
+	entriesExternal, authsExternal := singleGrokAuth(t, "auth-external", "[EMAIL]", map[string]any{"disabled": true})
+	entries := append(entriesHealthy, entriesSuspect...)
+	entries = append(entries, entriesExternal...)
+	auths := make(map[string]json.RawMessage, len(authsHealthy)+len(authsSuspect)+len(authsExternal))
+	for key, value := range authsHealthy {
+		auths[key] = value
+	}
+	for key, value := range authsSuspect {
+		auths[key] = value
+	}
+	for key, value := range authsExternal {
+		auths[key] = value
+	}
+	host := newMockHostCall(entries, auths)
+	visible := strings.Repeat("reliable systems need careful design. ", 10) + "\\nQUALITY_OK"
+	host.scriptStream("auth-suspect", []pluginapi.HostModelStreamReadResponse{
+		streamData("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"plan carefully\"}}]}\n\n"),
+		streamData("data: {\"choices\":[{\"delta\":{\"content\":\"" + visible + "\"}}]}\n\n"),
+		streamData("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":120,\"completion_tokens_details\":{\"reasoning_tokens\":1}}}\n\n"),
+		{Done: true},
+	}...)
+	plugin := newTestPlugin(t, host, func(cfg *Config) {
+		cfg.Quality.SoftTPS = 1e9
+		cfg.Quality.HardTPS = 2e9
+	})
+	if errUpdate := plugin.stateStore().Update(func(state *State) error {
+		state.Accounts["auth-healthy"].State = StateHealthy
+		state.Accounts["auth-suspect"].State = StateSuspect
+		state.Accounts["auth-external"].State = StateExternallyDisabled
+		return nil
+	}); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+
+	body, errMarshal := json.Marshal(actionRequest{Action: "accounts.probe_non_healthy"})
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	response := callManagementForTest(t, plugin, http.MethodPost, "/plugins/grok-quality-guard/api", http.Header{"Content-Type": []string{"application/json"}}, body)
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("probe batch status = %d body=%s", response.StatusCode, response.Body)
+	}
+	var envelope struct {
+		Data Task `json:"data"`
+	}
+	if errUnmarshal := json.Unmarshal(response.Body, &envelope); errUnmarshal != nil {
+		t.Fatalf("decode probe task: %v", errUnmarshal)
+	}
+	if envelope.Data.Kind != "accounts.probe_non_healthy" {
+		t.Fatalf("unexpected task kind: %q", envelope.Data.Kind)
+	}
+	task := waitTaskForTest(t, plugin, envelope.Data.ID)
+	if task.Status != taskStatusSucceeded {
+		t.Fatalf("probe batch task failed: %#v", task)
+	}
+	encodedResult, errMarshal := json.Marshal(task.Result)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	var result probeBatchResult
+	if errUnmarshal := json.Unmarshal(encodedResult, &result); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if result.Count != 2 || result.Probed != 1 || result.Skipped != 1 || result.Failed != 0 {
+		t.Fatalf("unexpected probe summary: %#v", result)
+	}
+	statuses := make(map[string]string, len(result.Items))
+	for _, item := range result.Items {
+		statuses[item.AuthID] = item.Status
+	}
+	if statuses["auth-suspect"] != "probed" || statuses["auth-external"] != "skipped" {
+		t.Fatalf("unexpected probe items: %#v", result.Items)
+	}
+	state := plugin.stateStore().Snapshot()
+	if state.Accounts["auth-healthy"].State != StateHealthy {
+		t.Fatalf("healthy account was modified: %#v", state.Accounts["auth-healthy"])
+	}
+	if state.Accounts["auth-suspect"].State != StateHealthy {
+		t.Fatalf("suspect account was not probed to healthy: %#v", state.Accounts["auth-suspect"])
+	}
+	if state.Accounts["auth-external"].State != StateExternallyDisabled {
+		t.Fatalf("external account should be skipped: %#v", state.Accounts["auth-external"])
 	}
 }
 

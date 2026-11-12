@@ -923,7 +923,13 @@
       align-items: center;
       justify-content: flex-end;
       gap: 5px;
-      flex-wrap: wrap;
+      flex-wrap: nowrap;
+      white-space: nowrap;
+    }
+
+    .actions-cell {
+      width: 1%;
+      white-space: nowrap;
     }
 
     .empty {
@@ -1541,9 +1547,6 @@
       </div>
       <div class="head-actions">
         <span class="sync-label" id="syncLabel">等待同步</span>
-        <button class="btn" id="refreshBtn" type="button"><svg class="icon">
-            <use href="#i-refresh"></use>
-          </svg>刷新</button>
       </div>
     </header>
     <nav class="tabs" role="tablist" aria-label="质量守护功能">
@@ -1658,6 +1661,12 @@
                 <option value="externally_disabled">外部禁用</option>
                 <option value="unknown">待检测</option>
               </select>
+              <button class="btn btn-xs" type="button" id="accountProbeAllBtn" title="检测所有非健康状态账号" disabled><svg class="icon">
+                  <use href="#i-play"></use>
+                </svg>检测全部</button>
+              <button class="btn btn-xs" type="button" id="accountRestoreAllBtn" title="恢复所有非健康状态账号" disabled><svg class="icon">
+                  <use href="#i-check"></use>
+                </svg>恢复所有</button>
             </div>
             <div class="toolbar-right">
               <span class="muted" id="accountsNote"></span>
@@ -2176,13 +2185,14 @@
       if (text === 'permanent_eligible=false') return '永久禁用候选：否';
       return reasonText(text);
     }).filter(Boolean).join(' · ');
-    const attemptLabel = (attempt) => {
+    const attemptLabel = (attempt, options) => {
       if (!attempt) return '暂无尝试';
+      const settings = options || {};
       const prefix = attempt.source ? sourceLabel(attempt.source) + ' · ' : '';
       const verdict = attempt.class ? reasonLabel(attempt.class) : '通过';
       const reason = reasonText(attempt.reason);
-      const detail = reason && attempt.reason !== attempt.class && reason !== verdict ? ' · ' + reason : '';
-      const at = attempt.at ? ' · ' + formatFullTime(attempt.at) : '';
+      const detail = attempt.class && reason && attempt.reason !== attempt.class && reason !== verdict ? ' · ' + reason : '';
+      const at = settings.includeTime !== false && attempt.at ? ' · ' + formatFullTime(attempt.at) : '';
       return prefix + verdict + detail + at;
     };
     const actionLabel = (value) => ACTION_LABELS[value] || value || '系统记录';
@@ -2344,11 +2354,60 @@
       }
       return { items: Array.from(byID.values()), total: Math.max(total, byID.size), state_counts: stateCounts };
     }
+    function applyAccountListData(value) {
+      const data = value || {};
+      state.accounts = data.items || [];
+      state.accountsTotal = Number(data.total || state.accounts.length);
+      state.stateCounts = data.state_counts || {};
+    }
+    async function refreshSection(button, label, refresh) {
+      if (state.refreshing) return;
+      state.refreshing = true;
+      setBusy(button, true);
+      document.getElementById('syncLabel').textContent = '正在刷新' + label + '…';
+      try {
+        await refresh();
+        document.getElementById('syncLabel').textContent = '更新于 ' + formatTime(new Date().toISOString());
+        toast(label + '已刷新', 'success');
+      } catch (error) {
+        toast(error.message || (label + '刷新失败'), 'error');
+      } finally {
+        state.refreshing = false;
+        setBusy(button, false);
+      }
+    }
+    function refreshAccounts(button) {
+      return refreshSection(button, '账号质量', async () => {
+        const [overview, accounts] = await Promise.all([api('overview'), loadAllAccounts()]);
+        state.overview = overview || {};
+        applyAccountListData(accounts);
+        renderOverview();
+        renderAccounts();
+        renderResin();
+      });
+    }
+    function refreshResin(button) {
+      return refreshSection(button, 'Resin 租约', async () => {
+        const [overview, accounts, resin] = await Promise.all([api('overview'), loadAllAccounts(), api('resin.config.get')]);
+        state.overview = overview || {};
+        applyAccountListData(accounts);
+        state.resin = resin || {};
+        renderOverview();
+        renderAccounts();
+        renderResin();
+      });
+    }
+    function refreshEvents(button) {
+      return refreshSection(button, '事件日志', async () => {
+        const value = await api('events.list', { limit: 1000 });
+        state.events = (value && value.items) || [];
+        renderOverview();
+        renderEvents();
+      });
+    }
     async function refreshAll(silent) {
       if (state.refreshing) return;
       state.refreshing = true;
-      const refreshBtn = document.getElementById('refreshBtn');
-      setBusy(refreshBtn, true);
       document.getElementById('syncLabel').textContent = '正在同步…';
       const tasks = await Promise.allSettled([
         api('overview'),
@@ -2360,12 +2419,8 @@
       const errors = [];
       if (tasks[0].status === 'fulfilled') state.overview = tasks[0].value || {};
       else errors.push(tasks[0].reason);
-      if (tasks[1].status === 'fulfilled') {
-        const value = tasks[1].value || {};
-        state.accounts = value.items || [];
-        state.accountsTotal = Number(value.total || state.accounts.length);
-        state.stateCounts = value.state_counts || {};
-      } else errors.push(tasks[1].reason);
+      if (tasks[1].status === 'fulfilled') applyAccountListData(tasks[1].value);
+      else errors.push(tasks[1].reason);
       if (tasks[2].status === 'fulfilled') state.events = (tasks[2].value && tasks[2].value.items) || [];
       else errors.push(tasks[2].reason);
       if (tasks[3].status === 'fulfilled') state.policy = tasks[3].value || {};
@@ -2374,7 +2429,6 @@
       else errors.push(tasks[4].reason);
       renderAll();
       state.refreshing = false;
-      setBusy(refreshBtn, false);
       document.getElementById('syncLabel').textContent = '更新于 ' + formatTime(new Date().toISOString());
       if (errors.length) toast(errors[0].message || '部分数据加载失败', 'error');
       else if (!silent) toast('数据已刷新', 'success');
@@ -2513,7 +2567,24 @@
         return [account.display, account.display_full, account.email, account.label, account.auth_id, account.auth_id_display, account.resin_account].join(' ').toLowerCase().includes(query);
       });
     }
+    function nonHealthyAccountCount() {
+      return state.accounts.filter((account) => account.state !== 'healthy').length;
+    }
+    function syncAccountBatchButtons() {
+      const count = nonHealthyAccountCount();
+      const probeButton = document.getElementById('accountProbeAllBtn');
+      if (probeButton) {
+        probeButton.disabled = count === 0;
+        probeButton.title = count > 0 ? '检测全部 ' + count + ' 个非健康状态账号' : '当前没有需要检测的非健康账号';
+      }
+      const restoreButton = document.getElementById('accountRestoreAllBtn');
+      if (restoreButton) {
+        restoreButton.disabled = count === 0;
+        restoreButton.title = count > 0 ? '恢复全部 ' + count + ' 个非健康状态账号' : '当前没有需要恢复的非健康账号';
+      }
+    }
     function renderAccounts() {
+      syncAccountBatchButtons();
       const overview = state.overview || {};
       const states = overview.states || state.stateCounts || {};
       const bound = state.accounts.filter((account) => account.resin_managed).length;
@@ -2536,8 +2607,8 @@
       const resinDetail = account.resin_account ? '<div class="subline">' + esc(account.resin_account) + ' · 第 ' + esc(account.resin_generation || 0) + ' 代</div>' : '';
       const cooldown = account.cooldown_until ? '冷却至：' + esc(formatFullTime(account.cooldown_until)) : '无冷却';
       const probe = account.probe_backoff_until ? '探测退避至：' + esc(formatFullTime(account.probe_backoff_until)) : '可立即探测';
-      const attemptDetail = account.last_attempt ? '最近尝试：' + attemptLabel(account.last_attempt) : '最近观测：' + formatTime(account.last_observed_at);
-      return '<tr><td><div class="account-name" title="' + esc(account.display_full || account.display || account.label || '未命名账号') + '">' + esc(account.display || account.label || '未命名账号') + '</div><div class="subline" title="' + esc(account.auth_id) + '">' + esc(account.auth_id_display || account.auth_id) + '</div></td><td class="nowrap">' + badge(stateLabel(account.state), stateTone(account.state)) + '</td><td><div>' + esc(reasonLabel(account.last_reason)) + '</div><div class="subline">' + esc(attemptDetail) + '</div></td><td><div class="metric-inline"><strong>' + esc(num(account.tps, 1)) + '</strong><span class="muted">TPS</span></div><div class="subline">输出：' + esc(num(account.output_tokens)) + ' · 推理：' + esc(num(account.reasoning_tokens)) + ' · 密文：' + esc(formatBytes(account.encrypted_bytes)) + '</div></td><td>' + resin + resinDetail + '</td><td><div>' + cooldown + '</div><div class="subline">' + probe + '</div></td><td><div class="actions"><button class="btn btn-xs" type="button" data-account-action="accounts.probe" data-auth="' + authID + '">' + icon('play') + '检测</button><button class="btn btn-xs" type="button" data-open-account="' + authID + '">' + icon('eye') + '详情</button></div></td></tr>';
+      const attemptDetail = account.last_attempt ? '最近尝试：' + attemptLabel(account.last_attempt, { includeTime: false }) : '最近观测：' + formatTime(account.last_observed_at);
+      return '<tr><td><div class="account-name" title="' + esc(account.display_full || account.display || account.label || '未命名账号') + '">' + esc(account.display || account.label || '未命名账号') + '</div><div class="subline" title="' + esc(account.auth_id) + '">' + esc(account.auth_id_display || account.auth_id) + '</div></td><td class="nowrap">' + badge(stateLabel(account.state), stateTone(account.state)) + '</td><td><div>' + esc(reasonLabel(account.last_reason)) + '</div><div class="subline">' + esc(attemptDetail) + '</div></td><td><div class="metric-inline"><strong>' + esc(num(account.tps, 1)) + '</strong><span class="muted">TPS</span></div><div class="subline">输出：' + esc(num(account.output_tokens)) + ' · 推理：' + esc(num(account.reasoning_tokens)) + ' · 密文：' + esc(formatBytes(account.encrypted_bytes)) + '</div></td><td>' + resin + resinDetail + '</td><td><div>' + cooldown + '</div><div class="subline">' + probe + '</div></td><td class="actions-cell"><div class="actions"><button class="btn btn-xs" type="button" data-account-action="accounts.probe" data-auth="' + authID + '">' + icon('play') + '检测</button><button class="btn btn-xs" type="button" data-open-account="' + authID + '">' + icon('eye') + '详情</button></div></td></tr>';
     }
     function leaseStatus(account) {
       if (account.resin_managed || account.proxy_status === 'bound') return 'bound';
@@ -2651,7 +2722,7 @@
       const proxy = account.proxy ? '<div class="mono">' + esc(account.proxy) + '</div>' : '<span class="subtle">-</span>';
       return '<tr><td class="select-cell"><input type="checkbox" data-lease-select="' + authID + '" aria-label="选择账号" ' + (selected ? 'checked' : '') + '></td>' +
         '<td><div class="account-name" title="' + esc(account.display_full || account.display || account.label || '未命名账号') + '">' + esc(account.display || account.label || '未命名账号') + '</div><div class="subline" title="' + esc(account.auth_id) + '">' + esc(account.auth_id_display || account.auth_id) + '</div></td>' +
-        '<td>' + proxy + '</td><td class="mono">' + esc(account.resin_account || '-') + '</td><td class="mono">' + esc(account.resin_generation || 0) + '</td><td>' + statusBadge + '</td><td><div class="actions">' + actions + '</div></td></tr>';
+        '<td>' + proxy + '</td><td class="mono">' + esc(account.resin_account || '-') + '</td><td class="mono">' + esc(account.resin_generation || 0) + '</td><td>' + statusBadge + '</td><td class="actions-cell"><div class="actions">' + actions + '</div></td></tr>';
     }
     function eventMatches(event) {
       const query = state.eventQuery.toLowerCase().trim();
@@ -3046,10 +3117,76 @@
       buttons[next].focus();
       buttons[next].click();
     }));
-    document.getElementById('refreshBtn').addEventListener('click', () => refreshAll(false));
-    document.getElementById('accountRefreshBtn').addEventListener('click', () => refreshAll(false));
-    document.getElementById('leaseRefreshBtn').addEventListener('click', () => refreshAll(false));
-    document.getElementById('eventRefreshBtn').addEventListener('click', () => refreshAll(false));
+    document.getElementById('accountRefreshBtn').addEventListener('click', (event) => refreshAccounts(event.currentTarget));
+    document.getElementById('leaseRefreshBtn').addEventListener('click', (event) => refreshResin(event.currentTarget));
+    document.getElementById('eventRefreshBtn').addEventListener('click', (event) => refreshEvents(event.currentTarget));
+    document.getElementById('accountProbeAllBtn').addEventListener('click', async (event) => {
+      const button = event.currentTarget;
+      const count = nonHealthyAccountCount();
+      if (!count) {
+        syncAccountBatchButtons();
+        toast('当前没有需要检测的非健康账号', 'success');
+        return;
+      }
+      if (!window.confirm('确认立即检测所有 ' + count + ' 个非健康状态账号？\n检测会发起真实模型请求并可能产生额度消耗；外部禁用和已永久隔离账号会跳过。')) return;
+      setBusy(button, true);
+      try {
+        const task = await api('accounts.probe_non_healthy');
+        toast('检测任务已提交，后台执行中…');
+        const result = await waitForTask(task, '检测非健康账号');
+        const probed = Number(result && result.probed || 0);
+        const skipped = Number(result && result.skipped || 0);
+        const failed = Number(result && result.failed || 0);
+        let message = '已检测 ' + probed + ' 个账号';
+        if (skipped) message += '，跳过 ' + skipped + ' 个不可检测账号';
+        if (failed) {
+          message += '，' + failed + ' 个失败';
+          const firstError = Array.isArray(result && result.items) ? result.items.find((item) => item && item.error) : null;
+          if (firstError && firstError.error) message += '：' + firstError.error;
+        }
+        toast(message, failed > 0 ? 'error' : 'success');
+        await refreshAll(true);
+      } catch (error) {
+        toast(error.message, 'error');
+      } finally {
+        setBusy(button, false);
+        syncAccountBatchButtons();
+      }
+    });
+    document.getElementById('accountRestoreAllBtn').addEventListener('click', async (event) => {
+      const button = event.currentTarget;
+      const count = nonHealthyAccountCount();
+      if (!count) {
+        syncAccountBatchButtons();
+        toast('当前没有需要恢复的非健康账号', 'success');
+        return;
+      }
+      if (!window.confirm('确认恢复所有 ' + count + ' 个非健康状态账号？\n已由插件冷却或隔离的账号会重新启用；外部禁用账号只会清理插件状态，不会修改 OAuth 的 disabled 标记。')) return;
+      setBusy(button, true);
+      try {
+        const task = await api('accounts.restore_non_healthy');
+        toast('恢复任务已提交，后台执行中…');
+        const result = await waitForTask(task, '恢复非健康账号');
+        const restored = Number(result && result.restored || 0);
+        const external = Number(result && result.external_left_disabled || 0);
+        const failed = Number(result && result.failed || 0);
+        let message = restored > 0 ? ('已恢复 ' + restored + ' 个账号') : '没有账号被恢复';
+        if (external) message += '，' + external + ' 个外部禁用账号仅清理插件状态';
+        if (failed) {
+          message += '，' + failed + ' 个失败';
+          const firstError = Array.isArray(result && result.items) ? result.items.find((item) => item && item.error) : null;
+          if (firstError && firstError.error) message += '：' + firstError.error;
+        }
+        toast(message, failed > 0 ? 'error' : 'success');
+        await refreshAll(true);
+      } catch (error) {
+        toast(error.message, 'error');
+      } finally {
+        setBusy(button, false);
+        syncAccountBatchButtons();
+      }
+    });
+
     document.getElementById('accountSearch').addEventListener('input', (event) => { state.accountQuery = event.target.value; state.accountPage = 1; renderAccounts(); });
     document.getElementById('accountStateFilter').addEventListener('change', (event) => { state.accountState = event.target.value; state.accountPage = 1; renderAccounts(); });
     document.getElementById('leaseSearch').addEventListener('input', (event) => { state.leaseQuery = event.target.value; state.leasePage = 1; renderResin(); });
