@@ -162,7 +162,7 @@ func (p *Plugin) transparentExecute(ctx context.Context, req rpcExecutorRequest)
 				last = result
 			}
 			_ = p.recordAttemptError(account.ID, class, errAttempt)
-			if replayable && attempts < maxAttempts && !rotated {
+			if replayable && attempts < maxAttempts && !rotated && shouldRotateTransparentFailure(len(candidates), class) {
 				didRotate, errRotate := p.rotateAfterFailure(ctx, account.ID, class)
 				if errRotate == nil && didRotate {
 					rotated = true
@@ -219,7 +219,7 @@ func (p *Plugin) transparentExecuteBufferedStream(ctx context.Context, req rpcEx
 				last = result
 			}
 			_ = p.recordAttemptError(account.ID, class, errAttempt)
-			if replayable && attempts < maxAttempts && !rotated {
+			if replayable && attempts < maxAttempts && !rotated && shouldRotateTransparentFailure(len(candidates), class) {
 				didRotate, errRotate := p.rotateAfterFailure(ctx, account.ID, class)
 				if errRotate == nil && didRotate {
 					rotated = true
@@ -385,7 +385,7 @@ func (p *Plugin) runTransparentStreamBridge(ctx context.Context, req rpcExecutor
 				last = outcome
 			}
 			_ = p.recordAttemptError(account.ID, class, outcome.Err)
-			if replayable && attempts < maxAttempts && !rotated {
+			if replayable && attempts < maxAttempts && !rotated && shouldRotateTransparentFailure(len(candidates), class) {
 				didRotate, errRotate := p.rotateAfterFailure(ctx, account.ID, class)
 				if errRotate == nil && didRotate {
 					rotated = true
@@ -593,6 +593,12 @@ func transparentMaxAttempts(policy Policy, replayable bool) int {
 	return maxAttempts
 }
 
+func shouldRotateTransparentFailure(candidateCount int, class string) bool {
+	// Missing thinking is account-level evidence. Switch accounts first when an
+	// alternative exists; keep proxy rotation as the single-account fallback.
+	return class != ClassMissingThinking || candidateCount <= 1
+}
+
 func executorRequestInput(req rpcExecutorRequest) ([]byte, string, error) {
 	body := req.OriginalRequest
 	if len(body) == 0 {
@@ -675,13 +681,18 @@ func (p *Plugin) transparentCandidates(ctx context.Context) ([]Account, error) {
 			continue
 		}
 		stateAccount, okState := p.stateAccount(account.ID)
-		if okState && isIsolatedState(stateAccount.State) {
+		if okState && !isTransparentCandidateState(stateAccount.State) {
 			continue
 		}
 		candidates = append(candidates, account)
 	}
 	now := time.Now().UTC()
 	sort.SliceStable(candidates, func(i, j int) bool {
+		left := stateRank(p.stateAccountValue(candidates[i].ID))
+		right := stateRank(p.stateAccountValue(candidates[j].ID))
+		if left != right {
+			return left < right
+		}
 		leftRecent := p.recentSuccessAt(candidates[i].ID)
 		rightRecent := p.recentSuccessAt(candidates[j].ID)
 		leftRecent = recentWithin(leftRecent, now, time.Hour)
@@ -694,17 +705,21 @@ func (p *Plugin) transparentCandidates(ctx context.Context) ([]Account, error) {
 				return leftRecent.After(rightRecent)
 			}
 		}
-		left := stateRank(p.stateAccountValue(candidates[i].ID))
-		right := stateRank(p.stateAccountValue(candidates[j].ID))
-		if left != right {
-			return left < right
-		}
 		if candidates[i].Priority != candidates[j].Priority {
 			return candidates[i].Priority < candidates[j].Priority
 		}
 		return stableHash(candidates[i].ID, now.Unix()/3600) < stableHash(candidates[j].ID, now.Unix()/3600)
 	})
 	return candidates, nil
+}
+
+func isTransparentCandidateState(state string) bool {
+	switch state {
+	case "", StateHealthy, StateUnknown:
+		return true
+	default:
+		return false
+	}
 }
 
 func (p *Plugin) stateAccountValue(authID string) AccountState {

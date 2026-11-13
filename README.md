@@ -247,6 +247,8 @@ plugins:
 
 主动探测只按请求级证据忽略内部 probe usage，不会在探测窗口内按 AuthID 丢弃真实请求的 usage，也不会把该账号从透明候选集中排除。
 
+透明候选只使用 `healthy` / `unknown` 账号；已进入 `suspect` 或 `degraded` 的账号不会继续承接透明请求，直到主动探测或手动恢复。`missing_thinking` 被视为账号级证据：存在其他可用账号时立即切号，代理轮换只作为单账号池的兜底；所有候选都不可用时返回 `503 quality_degraded`。
+
 透明模式在首次向客户端 emit 前完成质量门。一旦开始 emit，插件不能回滚已经发送的内容；如果所有候选账号耗尽，默认返回 `503 quality_degraded`。可配置 `on_exhausted: fail_open` 在失败时返回最后一个已缓冲响应，但这会牺牲 fail-closed 语义。透明缓冲超过 `hold_max_buffer_bytes` 时也会 fail closed，不会把未完成质量判定的内容下发给客户端。
 
 ## Resin 与本地代理轮换

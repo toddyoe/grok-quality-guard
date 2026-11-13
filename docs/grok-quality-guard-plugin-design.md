@@ -723,23 +723,20 @@ Router 处理条件：
 过滤：
 
 - provider/type 必须为 xAI/Grok
-- 跳过 `cooling`
-
-主动探测标记只用于识别没有请求级 pending observation 的内部 probe usage，不得按 AuthID 过滤透明候选，也不得丢弃同一窗口内真实请求的 usage。
+- 只允许 `healthy` / `unknown`
+- 跳过 `suspect`、`degraded`、`cooling` 及其他隔离状态
 - 跳过 `disabled_by_guard`
 - 跳过 `externally_disabled`
 - 跳过 runtime unavailable
-- 跳过正在 probe 的账号
 - 跳过没有有效 access token 的账号
+
+主动探测标记只用于识别没有请求级 pending observation 的内部 probe usage，不得按 AuthID 过滤透明候选，也不得丢弃同一窗口内真实请求的 usage。
 
 排序：
 
-1. 当前会话最近成功账号优先，TTL 1h
-2. healthy
-3. unknown
-4. suspect
-5. degraded
-6. 同状态下按 auth priority、最近使用时间和稳定哈希轮转
+1. `healthy` 优先于 `unknown`
+2. 同状态下当前会话最近成功账号优先，TTL 1h
+3. 再按 auth priority 和稳定哈希轮转
 
 透明请求不得依赖 CPA 内置 auth selection 再次选号，必须显式传 `AuthID`。
 
@@ -842,18 +839,17 @@ host.stream.close(
 
 ### 6.8 Resin 轮换与当前请求
 
-仅对 `safeReplayRequest=true` 的请求执行以下轮换流程。不可安全重放请求只执行一次，不进入轮换或换号。
+仅对 `safeReplayRequest=true` 的请求执行换号或轮换。不可安全重放请求只执行一次，不进入轮换或换号。
 
-透明模式中检测到 `missing_thinking` 等质量异常后：
+`missing_thinking` 按账号级质量证据处理：
 
-1. 记录异常
-2. 如果代理轮换和自动轮换开启，API 模式使用已保存的平台名称改写新代理并异步排队删除旧租约，本地模式只改写已有代理用户名并写回
-3. 同一账号可用新代理重试一次
-4. 新代理仍异常则换下一个账号
-5. 每个请求对每个账号最多轮换一次
-6. 总上游尝试次数仍受 `max_attempts=6` 限制
+1. 记录异常并把该账号标为 `suspect` 或 `degraded`
+2. 如果还有其他透明候选，立即切换账号，不在当前账号上做代理轮换
+3. 只有单账号池才使用代理轮换作为兜底，同一账号最多轮换一次
+4. 轮换后仍异常则 fail closed；后续请求不会再次选择该账号
+5. 总上游尝试次数仍受 `max_attempts=6` 限制
 
-如果没有启用代理轮换，直接换下一个账号。
+其他质量异常仍可按代理轮换策略在同账号重试一次，再切换账号。所有后续透明请求都跳过 `suspect` / `degraded` 账号。
 
 ### 6.9 无法覆盖的场景
 

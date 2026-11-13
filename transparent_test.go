@@ -97,6 +97,32 @@ func TestTransparentCandidatesIncludeProbeMarkedAccount(t *testing.T) {
 	}
 }
 
+func TestTransparentCandidatesSkipQualitySuspectAccounts(t *testing.T) {
+	for _, state := range []string{StateSuspect, StateDegraded} {
+		t.Run(state, func(t *testing.T) {
+			entries, auths := twoGrokAuths(t)
+			host := newMockHostCall(entries, auths)
+			plugin := newTestPlugin(t, host, enableTransparentForTest)
+			if errUpdate := plugin.stateStore().Update(func(value *State) error {
+				plugin.ensureStateAccount(value, "auth-1", "", "").State = state
+				plugin.ensureStateAccount(value, "auth-2", "", "").State = StateHealthy
+				return nil
+			}); errUpdate != nil {
+				t.Fatal(errUpdate)
+			}
+			plugin.markRecentSuccess("auth-1")
+
+			candidates, errCandidates := plugin.transparentCandidates(context.Background())
+			if errCandidates != nil {
+				t.Fatal(errCandidates)
+			}
+			if len(candidates) != 1 || candidates[0].ID != "auth-2" {
+				t.Fatalf("quality-suspect account remained eligible: %#v", candidates)
+			}
+		})
+	}
+}
+
 func TestTransparentStreamFailsOverBeforeEmit(t *testing.T) {
 	entries, auths := twoGrokAuths(t)
 	host := newMockHostCall(entries, auths)
@@ -126,6 +152,75 @@ func TestTransparentStreamFailsOverBeforeEmit(t *testing.T) {
 	}
 	if goodState.State != StateHealthy {
 		t.Fatalf("good auth state = %q, want healthy", goodState.State)
+	}
+	if len(host.modelCalls) != 2 {
+		t.Fatalf("transparent request used %d attempts, want 2", len(host.modelCalls))
+	}
+	if host.modelCalls[0].AuthID == host.modelCalls[1].AuthID {
+		t.Fatalf("missing-thinking response was retried on the same account: %#v", host.modelCalls)
+	}
+}
+
+func TestTransparentMissingThinkingSwitchesAccountBeforeProxyRotation(t *testing.T) {
+	entries1, auths1 := singleGrokAuth(t, "auth-1", "[EMAIL]", map[string]any{
+		"proxy_url": "socks5h://Default.grok-alice-old1:proxy-secret@resin:2260",
+	})
+	entries2, auths2 := singleGrokAuth(t, "auth-2", "[EMAIL]", nil)
+	entries1[0].Priority = 1
+	entries2[0].Priority = 2
+	auths := make(map[string]json.RawMessage, len(auths1)+len(auths2))
+	for key, value := range auths1 {
+		auths[key] = value
+	}
+	for key, value := range auths2 {
+		auths[key] = value
+	}
+	host := newMockHostCall(append(entries1, entries2...), auths)
+	host.scriptStreamSequence("auth-1", badStreamScript(), badStreamScript())
+	host.scriptStream("auth-2", goodStreamScript()...)
+	plugin := newTestPlugin(t, host, func(cfg *Config) {
+		enableTransparentForTest(cfg)
+		cfg.Resin.Enabled = true
+		cfg.Resin.LocalOnly = true
+		cfg.Resin.AutoRotateAfterQualityFailure = true
+	})
+	seedResinState(t, plugin, "grok-alice-old1", 0)
+
+	plugin.runTransparentStreamBridge(context.Background(), streamRequestForTest(), "plugin-stream-account-switch")
+
+	if len(host.modelCalls) != 2 {
+		t.Fatalf("missing-thinking request used %d attempts, want account switch after first failure", len(host.modelCalls))
+	}
+	if host.modelCalls[0].AuthID == host.modelCalls[1].AuthID {
+		t.Fatalf("missing-thinking request retried the same account before switching: %#v", host.modelCalls)
+	}
+	for _, event := range plugin.stateStore().Snapshot().Events {
+		if event.Action == "resin_rotate" {
+			t.Fatalf("missing-thinking request rotated the same account before switching: %#v", event)
+		}
+	}
+}
+
+func TestTransparentStreamFailsClosedWhenAllCandidatesAreQualitySuspect(t *testing.T) {
+	entries, auths := twoGrokAuths(t)
+	host := newMockHostCall(entries, auths)
+	plugin := newTestPlugin(t, host, enableTransparentForTest)
+	if errUpdate := plugin.stateStore().Update(func(value *State) error {
+		plugin.ensureStateAccount(value, "auth-1", "", "").State = StateSuspect
+		plugin.ensureStateAccount(value, "auth-2", "", "").State = StateDegraded
+		return nil
+	}); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+
+	plugin.runTransparentStreamBridge(context.Background(), streamRequestForTest(), "plugin-stream-no-quality-candidates")
+
+	if len(host.modelCalls) != 0 {
+		t.Fatalf("quality-suspect accounts were reused: %#v", host.modelCalls)
+	}
+	detail := host.closes["plugin-stream-no-quality-candidates"]
+	if detail == nil || detail.Code != "quality_degraded" || detail.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("unexpected close detail: %#v", detail)
 	}
 }
 
