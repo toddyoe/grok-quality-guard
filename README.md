@@ -235,7 +235,7 @@ plugins:
 - `soft_cross_verify=true` 或 `thinking_cross_verify=true`：被动样本达到阈值后先启动后台主动探测，由探测结果确认后再处置；默认关闭
 - 任一健康样本会清零 `soft_strikes`、`error_strikes`、`thinking_strikes`，与旧插件的连续计数语义一致
 
-主动探测调度会先过滤出当前到期的非健康账号，再放入有界队列。`probe.queue_size` 默认 `10000`，最大 `1000000`；`probe.concurrency` 控制实际执行探测的 worker 数。`probe.unknown_jitter` 为 `unknown` 账号的首次探测增加稳定抖动，避免大量账号在同一时刻到期。
+主动探测调度会先过滤出当前到期的非健康账号，再放入有界队列。`probe.queue_size` 默认 `10000`，最大 `1000000`；`probe.concurrency` 控制探测以及批量账号操作实际使用的 worker 数。`probe.unknown_jitter` 为 `unknown` 账号的首次探测增加稳定抖动，避免大量账号在同一时刻到期。
 
 ### 透明保护
 
@@ -273,7 +273,7 @@ Resin 绑定必须由管理员显式触发，不会在首次启动时自动覆�
 3. 写回 auth 的 `proxy_url`
 4. 保留 access/refresh token 等所有非代理字段
 
-API 模式清除 `proxy_url` 时，插件管理的 Resin 租约会先调用 `DELETE /api/v1/platforms/{platform_id}/leases/{account}`，`204` 或 `404` 后才会清空 auth 中的 `proxy_url`。
+API 模式清除 `proxy_url` 时，插件管理的 Resin 租约会先调用 `DELETE /api/v1/platforms/{platform_id}/leases/{account}`，`204` 或 `404` 后才会清空 auth 中的 `proxy_url`。如果旧 state 缺少 Resin 租约字段，但 auth 代理端点与已保存的 Resin 代理模板一致，插件会从代理用户名反推租约 account，仍执行远端删除。
 
 ### 仅本地轮换
 
@@ -299,7 +299,8 @@ socks5h://Default.grok-alice-new1:proxy-secret@resin:2260
 
 本地模式不会调用任何 Resin API，也不会删除远端旧租约。本地清除只移除 auth 中的 `proxy_url`，同样不会处理远端租约。由于没有 API 可用，本地模式不能创建新的代理绑定；首次绑定仍必须使用 API 模式。
 
-Resin 没有“立即创建指定出口 IP 租约”的 API，插件不查询新 egress IP，也不保证轮换后一定使用不同出口 IP。批量清除会对每个选中账号执行同一套模式语义；+
+Resin 没有“立即创建指定出口 IP 租约”的 API，插件不查询新 egress IP，也不保证轮换后一定使用不同出口 IP。批量绑定、绑定全部未绑定和批量清除均作为异步任务执行，内部使用有界工作队列，队列容量与 worker 数沿用 `probe.queue_size` 和 `probe.concurrency`。
+
 ## 管理页与 API
 
 管理页：

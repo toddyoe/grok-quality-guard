@@ -973,7 +973,7 @@ QUALITY_OK
 
 - 扫描阶段一次性过滤出到期的非健康账号，再放入有界队列
 - 队列容量由 `probe.queue_size` 控制，默认 10000，最大 1000000
-- 全局并发由 `probe.concurrency` 控制，只启动与并发数相同的 probe goroutine
+- 单类探测或批量任务内部只启动与 `probe.concurrency` 相同数量的 worker
 - 同一账号同时最多 1 个 probe
 - `probe.unknown_jitter` 为首次探测增加稳定抖动，避免启动时全部到期
 - 队列按 auth ID 去重；worker 出队后再次检查 due 状态
@@ -1213,6 +1213,8 @@ API 模式的验证与保存都执行同一套服务端验证逻辑。`resin.con
 
 批量绑定通过 `resin.bind` 的 `auth_ids` 参数完成。已绑定账号保持原租约，非插件管理的外部代理返回冲突且不被覆盖。仅本地轮换模式禁用绑定操作。
 
+批量绑定、绑定全部未绑定、批量清除使用与主动探测相同的异步任务和有界工作队列模式。任务不会为每个账号单独启动一个不受控 goroutine，而是由固定数量 worker 从有界队列消费。
+
 批量清除通过 `resin.clear` 的 `auth_ids` 参数完成：
 
 1. API 模式下，插件管理的租约先按 `platform_id` 解析平台并调用 `DELETE /api/v1/platforms/{platform_id}/leases/{account}`
@@ -1221,6 +1223,8 @@ API 模式的验证与保存都执行同一套服务端验证逻辑。`resin.con
 4. 外部代理没有插件管理的租约，只移除 auth 中的 `proxy_url`，不删除外部代理服务
 5. 仅本地轮换模式只移除 auth 中的代理，不调用 Resin API，也不处理远端租约
 6. 任一账号失败只影响该账号，批量接口继续处理其他账号并在结果中返回逐项错误
+
+如果 state 中的 Resin 租约字段缺失，但 auth 的 `proxy_url` 端点与已保存的代理模板一致，插件会从代理用户名反推 account 并视为插件管理租约，确保清除代理时仍先删除远端租约。
 
 ## 10. 管理页与 JSON API
 
@@ -1280,6 +1284,7 @@ Action API 注册路径：
 - Tab 使用可键盘访问的按钮和 `aria-selected` 状态，并支持左右方向键切换
 - 图标使用内嵌 SVG，不使用 emoji
 - 遵守 `prefers-reduced-motion`
+- 危险和批量操作使用内嵌确认对话框，不使用 `window.confirm` 或浏览器原生弹窗；支持 Escape 取消、焦点恢复和键盘焦点循环
 
 ### 10.3 JSON API 协议
 
@@ -1337,10 +1342,10 @@ Content-Type: application/json
 | `accounts.disable` | `auth_id`、`reason` | 手动永久禁用 |
 | `accounts.restore` | `auth_id` | 恢复 guard-owned auth 并清除 strike |
 | `accounts.restore_selected` | `auth_ids` | 将有界队列中的选中账号恢复；健康账号跳过 |
-| `resin.bind` | `auth_id` 或 `auth_ids` | 提交异步绑定任务；仅本地轮换模式拒绝 |
-| `resin.bind_unbound` | `dry_run` | 提交异步批量绑定任务 |
+| `resin.bind` | `auth_id` 或 `auth_ids` | 提交有界队列异步绑定任务；仅本地轮换模式拒绝 |
+| `resin.bind_unbound` | `dry_run` | 提交有界队列异步批量绑定任务 |
 | `resin.rotate` | `auth_id` | 提交异步轮换任务；API 模式删除旧租约并重绑，本地模式只改写已有代理用户名 |
-| `resin.clear` | `auth_id` 或 `auth_ids` | 提交异步清除任务；API 模式删除插件管理的远端租约并清除代理，外部代理或本地模式只清除 auth 配置 |
+| `resin.clear` | `auth_id` 或 `auth_ids` | 提交有界队列异步清除任务；API 模式删除插件管理的远端租约并清除代理，外部代理或本地模式只清除 auth 配置 |
 | `resin.config.get` | 无 | 返回脱敏的 Resin 配置和 token 是否已设置 |
 | `resin.config.validate` | Resin 配置字段 | 提交异步验证任务 |
 | `resin.config.save` | Resin 配置字段 | 提交异步验证并保存任务 |
@@ -1446,7 +1451,7 @@ Resin 配置采用“YAML 初始化，管理页验证后保存并优先使用”
 - 管理页 `resin.config.save` 成功后，state 中的完整 Resin 配置优先；`local_only=true` 时不读取 API 凭据
 - 后续 YAML 修改不会静默覆盖已保存的 Resin 配置；管理员需在管理页重新保存，API 模式还需重新验证
 
-长时间运行的探测、Resin 配置验证/保存、绑定、清除、轮换和批量绑定通过插件内异步任务执行，管理 API 返回 `202 Accepted` 和 `task_id`，调用方通过 `tasks.get` 轮询。这样请求不会因为超过 oh-my-cpa 默认 15 秒管理超时而被网关转成 502。
+长时间运行的探测、Resin 配置验证/保存、绑定、清除、轮换和批量绑定通过插件内异步任务执行，管理 API 返回 `202 Accepted` 和 `task_id`，调用方通过 `tasks.get` 轮询。批量操作使用有界工作队列，避免按账号数量创建不受控 goroutine。这样请求不会因为超过 oh-my-cpa 默认 15 秒管理超时而被网关转成 502。
 
 运行时策略首次从 YAML 初始化到 state，之后由管理页修改：
 

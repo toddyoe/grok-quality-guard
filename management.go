@@ -207,14 +207,19 @@ func (p *Plugin) actionOverview(ctx context.Context) (any, int, error) {
 	resinBound := 0
 	resinUnbound := 0
 	resinConflicts := 0
+	resinCfg := p.ResinConfig()
 	for _, account := range p.catalogSnapshot() {
 		_, _, raw, errResolve := p.resolveAuth(ctx, account.ID)
 		if errResolve != nil {
 			continue
 		}
-		stateAccount := state.Accounts[account.ID]
+		var stateAccount AccountState
+		if stored := state.Accounts[account.ID]; stored != nil {
+			stateAccount = *stored
+		}
 		proxy := strings.TrimSpace(authRawString(raw, "proxy_url"))
-		if stateAccount != nil && stateAccount.Resin.Account != "" {
+		_, managed := managedResinBinding(raw, stateAccount, resinCfg)
+		if managed {
 			resinBound++
 		} else if proxy != "" {
 			resinConflicts++
@@ -597,15 +602,26 @@ func (p *Plugin) actionResinBind(_ context.Context, params map[string]any) (any,
 	if len(authIDs) == 0 {
 		return nil, http.StatusBadRequest, fmt.Errorf("auth_id or auth_ids is required")
 	}
+	if p.hasActiveTask("resin.bind", "") {
+		return nil, http.StatusConflict, fmt.Errorf("resin bind task is already running")
+	}
 	dryRun := boolFromParams(params, "dry_run")
 	task := p.startTask("resin.bind", authIDs, "正在绑定 Resin 代理", func(taskCtx context.Context) (any, error) {
-		results := make([]ResinBindResult, 0, len(authIDs))
-		for _, authID := range authIDs {
-			result, errBind := p.BindResin(taskCtx, authID, dryRun)
+		results := make([]ResinBindResult, len(authIDs))
+		indices := make([]int, len(authIDs))
+		for index := range authIDs {
+			indices[index] = index
+		}
+		errRun := runBoundedQueue(taskCtx, indices, p.probeQueueSize(), p.probeConcurrency(), func(jobCtx context.Context, index int) {
+			authID := authIDs[index]
+			result, errBind := p.BindResin(jobCtx, authID, dryRun)
 			if errBind != nil && result.Error == "" {
 				result.Error = sanitizeError(errBind)
 			}
-			results = append(results, result)
+			results[index] = result
+		})
+		if errRun != nil {
+			return nil, errRun
 		}
 		return map[string]any{"items": results, "count": len(results)}, nil
 	})
@@ -613,6 +629,9 @@ func (p *Plugin) actionResinBind(_ context.Context, params map[string]any) (any,
 }
 
 func (p *Plugin) actionResinBindUnbound(_ context.Context, params map[string]any) (any, int, error) {
+	if p.hasActiveTask("resin.bind_unbound", "") {
+		return nil, http.StatusConflict, fmt.Errorf("resin bind-unbound task is already running")
+	}
 	dryRun := boolFromParams(params, "dry_run")
 	task := p.startTask("resin.bind_unbound", nil, "正在批量绑定未绑定账号", func(taskCtx context.Context) (any, error) {
 		results, errBind := p.BindUnboundResin(taskCtx, dryRun)
@@ -629,14 +648,25 @@ func (p *Plugin) actionResinClear(_ context.Context, params map[string]any) (any
 	if len(authIDs) == 0 {
 		return nil, http.StatusBadRequest, fmt.Errorf("auth_id or auth_ids is required")
 	}
+	if p.hasActiveTask("resin.clear", "") {
+		return nil, http.StatusConflict, fmt.Errorf("resin clear task is already running")
+	}
 	task := p.startTask("resin.clear", authIDs, "正在清除账号代理", func(taskCtx context.Context) (any, error) {
-		results := make([]ResinClearResult, 0, len(authIDs))
-		for _, authID := range authIDs {
-			result, errClear := p.ClearResinProxy(taskCtx, authID)
+		results := make([]ResinClearResult, len(authIDs))
+		indices := make([]int, len(authIDs))
+		for index := range authIDs {
+			indices[index] = index
+		}
+		errRun := runBoundedQueue(taskCtx, indices, p.probeQueueSize(), p.probeConcurrency(), func(jobCtx context.Context, index int) {
+			authID := authIDs[index]
+			result, errClear := p.ClearResinProxy(jobCtx, authID)
 			if errClear != nil && result.Error == "" {
 				result.Error = sanitizeError(errClear)
 			}
-			results = append(results, result)
+			results[index] = result
+		})
+		if errRun != nil {
+			return nil, errRun
 		}
 		return map[string]any{"items": results, "count": len(results)}, nil
 	})
@@ -818,6 +848,7 @@ func (p *Plugin) accountView(ctx context.Context, account Account) (accountView,
 		return accountView{}, errResolve
 	}
 	stateAccount, _ := p.stateAccount(account.ID)
+	resinAccount, resinManaged := managedResinBinding(raw, stateAccount, p.ResinConfig())
 	displayFull := strings.TrimSpace(firstNonEmpty(account.Email, account.Label, account.ID))
 	displayLabel := strings.TrimSpace(account.Label)
 	if strings.Contains(displayLabel, "@") {
@@ -843,8 +874,8 @@ func (p *Plugin) accountView(ctx context.Context, account Account) (accountView,
 		SoftStrikes:           stateAccount.SoftStrikes,
 		ErrorStrikes:          stateAccount.ErrorStrikes,
 		ThinkingStrikes:       stateAccount.ThinkingStrikes,
-		ResinManaged:          stateAccount.Resin.Managed,
-		ResinAccount:          stateAccount.Resin.Account,
+		ResinManaged:          resinManaged,
+		ResinAccount:          resinAccount,
 		ResinGeneration:       stateAccount.Resin.Generation,
 		ProxyStatus:           "unbound",
 		Proxy:                 maskProxyURL(authRawString(raw, "proxy_url")),

@@ -1271,6 +1271,87 @@
       font-size: 11px;
     }
 
+    .confirm-backdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 80;
+      display: grid;
+      place-items: center;
+      padding: 20px;
+      background: rgba(0, 0, 0, .34);
+      backdrop-filter: blur(3px);
+    }
+
+    .confirm-card {
+      width: min(460px, 100%);
+      overflow: hidden;
+      border: 1px solid var(--line-strong);
+      border-radius: 12px;
+      background: var(--surface);
+      box-shadow: 0 24px 70px rgba(0, 0, 0, .22);
+      animation: confirm-in .16s ease-out;
+    }
+
+    @keyframes confirm-in {
+      from {
+        transform: translateY(8px) scale(.985);
+        opacity: .65;
+      }
+
+      to {
+        transform: none;
+        opacity: 1;
+      }
+    }
+
+    .confirm-main {
+      display: flex;
+      gap: 13px;
+      padding: 19px 19px 17px;
+    }
+
+    .confirm-icon {
+      display: grid;
+      flex: 0 0 auto;
+      place-items: center;
+      width: 36px;
+      height: 36px;
+      border: 1px solid color-mix(in srgb, var(--info) 28%, var(--line));
+      border-radius: 10px;
+      background: var(--info-soft);
+      color: var(--info);
+    }
+
+    .confirm-icon.danger {
+      border-color: color-mix(in srgb, var(--bad) 30%, var(--line));
+      background: var(--bad-soft);
+      color: var(--bad);
+    }
+
+    .confirm-title {
+      margin: 0;
+      font-size: 15px;
+      font-weight: 650;
+      letter-spacing: -.01em;
+    }
+
+    .confirm-detail {
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.65;
+      white-space: pre-line;
+    }
+
+    .confirm-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 7px;
+      padding: 12px 16px;
+      border-top: 1px solid var(--line);
+      background: var(--card);
+    }
+
     .toast {
       position: fixed;
       right: 20px;
@@ -1298,7 +1379,8 @@
       color: var(--bad);
     }
 
-    body.drawer-open {
+    body.drawer-open,
+    body.confirm-open {
       overflow: hidden;
     }
 
@@ -1930,9 +2012,9 @@
                         placeholder="90s"></div>
                     <div class="field"><label for="p_probe_max_output">探测最大输出 Token</label><input
                         id="p_probe_max_output" type="number" min="1"></div>
-                    <div class="field"><label for="p_probe_concurrency">探测并发</label><input id="p_probe_concurrency"
+                    <div class="field"><label for="p_probe_concurrency">探测/批量并发</label><input id="p_probe_concurrency"
                         type="number" min="1"></div>
-                    <div class="field"><label for="p_probe_queue_size">探测队列容量</label><input id="p_probe_queue_size"
+                    <div class="field"><label for="p_probe_queue_size">探测/批量队列容量</label><input id="p_probe_queue_size"
                         type="number" min="1" max="1000000"></div>
                     <div class="field"><label for="p_probe_unknown_delay">待检测延迟</label><input id="p_probe_unknown_delay"
                         type="text" placeholder="30s"></div>
@@ -2065,6 +2147,21 @@
       </div>
       <div class="drawer-body" id="drawerBody"></div>
     </aside>
+  </div>
+  <div class="confirm-backdrop" id="confirmDialog" hidden>
+    <section class="confirm-card" role="dialog" aria-modal="true" aria-labelledby="confirmTitle" aria-describedby="confirmDetail">
+      <div class="confirm-main">
+        <span class="confirm-icon" id="confirmIcon"><svg class="icon"><use id="confirmIconUse" href="#i-alert"></use></svg></span>
+        <div>
+          <h2 class="confirm-title" id="confirmTitle"></h2>
+          <p class="confirm-detail" id="confirmDetail"></p>
+        </div>
+      </div>
+      <div class="confirm-actions">
+        <button class="btn" type="button" id="confirmCancel">取消</button>
+        <button class="btn btn-primary" type="button" id="confirmAccept">确认</button>
+      </div>
+    </section>
   </div>
   <script>
     const API = '/v0/management/plugins/grok-quality-guard/api';
@@ -2286,6 +2383,45 @@
       el.hidden = false;
       window.clearTimeout(toastTimer);
       toastTimer = window.setTimeout(() => { el.hidden = true; }, 4200);
+    }
+    let confirmResolver = null;
+    let confirmPreviousFocus = null;
+    function confirmAction(options) {
+      const config = options || {};
+      const dialog = document.getElementById('confirmDialog');
+      const accept = document.getElementById('confirmAccept');
+      const cancel = document.getElementById('confirmCancel');
+      const detail = document.getElementById('confirmDetail');
+      if (!dialog.hidden) settleConfirm(false);
+      document.getElementById('confirmTitle').textContent = config.title || '确认操作';
+      const detailText = String(config.detail || '').trim();
+      detail.textContent = detailText;
+      detail.hidden = detailText === '';
+      accept.textContent = config.confirmLabel || '确认';
+      cancel.textContent = config.cancelLabel || '取消';
+      const danger = config.tone === 'danger';
+      accept.className = 'btn ' + (danger ? 'btn-danger' : 'btn-primary');
+      document.getElementById('confirmIcon').className = 'confirm-icon' + (danger ? ' danger' : '');
+      document.getElementById('confirmIconUse').setAttribute('href', '#i-' + (config.icon || 'alert'));
+      confirmPreviousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      dialog.hidden = false;
+      document.body.classList.add('confirm-open');
+      return new Promise((resolve) => {
+        confirmResolver = resolve;
+        window.setTimeout(() => (danger ? cancel : accept).focus(), 20);
+      });
+    }
+    function settleConfirm(accepted) {
+      const dialog = document.getElementById('confirmDialog');
+      if (!dialog || dialog.hidden) return;
+      dialog.hidden = true;
+      document.body.classList.remove('confirm-open');
+      const resolve = confirmResolver;
+      confirmResolver = null;
+      const previousFocus = confirmPreviousFocus;
+      confirmPreviousFocus = null;
+      if (previousFocus && typeof previousFocus.focus === 'function') previousFocus.focus();
+      if (resolve) resolve(Boolean(accepted));
     }
     function setBusy(button, busy) {
       if (!button) return;
@@ -2574,7 +2710,7 @@
         summaryItem('缺少思考冷却', esc(quality.missing_thinking_cooldown || '-')),
         summaryItem('思考检测 / 交叉验证', esc((quality.thinking_guard !== false ? '开启' : '关闭') + ' / ' + ((quality.soft_cross_verify || quality.thinking_cross_verify) ? '部分开启' : '关闭'))),
         summaryItem('探测模型', esc(policy.probe && policy.probe.model || '-')),
-        summaryItem('探测并发 / 队列', esc(num(policy.probe && policy.probe.concurrency || 1) + '-' + num(policy.probe && policy.probe.queue_size || 10000))),
+        summaryItem('任务并发 / 队列', esc(num(policy.probe && policy.probe.concurrency || 1) + '-' + num(policy.probe && policy.probe.queue_size || 10000))),
         summaryItem('状态文件', esc(overview.state_file || '-'), { truncate: true, title: overview.state_file || '-' }),
         summaryItem('事件保留', esc(num(policy.events_limit || 0)))
       ].join('');
@@ -2890,7 +3026,7 @@
       const policy = collectPolicy();
       const nextStateFile = valueOf('p_state_file');
       if (!(policy.quality.soft_tps < policy.quality.hard_tps)) { toast('软 TPS 阈值必须低于硬 TPS 阈值', 'error'); return; }
-      if (!(policy.probe.queue_size >= 1 && policy.probe.queue_size <= 1000000)) { toast('探测队列容量必须在 1 到 1000000 之间', 'error'); return; }
+      if (!(policy.probe.queue_size >= 1 && policy.probe.queue_size <= 1000000)) { toast('后台队列容量必须在 1 到 1000000 之间', 'error'); return; }
       if (!nextStateFile) { toast('状态文件路径不能为空', 'error'); return; }
       setBusy(button, true);
       document.getElementById('policyStatus').textContent = '正在保存策略…';
@@ -3066,8 +3202,25 @@
     }
     async function runAccountAction(action, authID, button) {
       if (!authID) return;
-      if (action === 'accounts.disable' && !window.confirm('确认永久禁用该账号？此操作会写入 OAuth 文件的 disabled=true')) return;
-      if (action === 'accounts.cooldown' && !window.confirm('确认将该账号冷却 12 小时？')) return;
+      if (action === 'accounts.disable') {
+        const confirmed = await confirmAction({
+          title: '永久禁用账号',
+          detail: '此操作会写入 OAuth 文件的 disabled=true，并立即影响 CPA 路由。',
+          confirmLabel: '永久禁用',
+          icon: 'power',
+          tone: 'danger'
+        });
+        if (!confirmed) return;
+      }
+      if (action === 'accounts.cooldown') {
+        const confirmed = await confirmAction({
+          title: '冷却账号 12 小时',
+          detail: '冷却期间该账号会被临时禁用，冷却结束后再进入恢复检测流程。',
+          confirmLabel: '开始冷却',
+          icon: 'clock'
+        });
+        if (!confirmed) return;
+      }
       setBusy(button, true);
       try {
         const isProbe = action === 'accounts.probe';
@@ -3104,15 +3257,26 @@
       const conflicts = selected.filter((account) => !account.resin_managed && account.proxy_status === 'conflict').length;
       const resin = state.resin || {};
       const localMode = Boolean(resin.local_only && resin.enabled);
-      let message;
+      let confirmation;
       if (action === 'resin.clear') {
-        message = localMode
-          ? ('确认清除所选 ' + selected.length + ' 个账号的代理？\n本地轮换模式不会调用 Resin API，也不会删除远端旧租约')
-          : ('确认清除所选 ' + selected.length + ' 个账号的代理？\n其中 ' + managed + ' 个插件管理的 Resin 租约会先删除远端租约，' + conflicts + ' 个外部代理只清除 OAuth 文件配置，不会删除外部代理服务');
+        confirmation = {
+          title: '清除所选代理',
+          detail: localMode
+            ? ('将清除 ' + selected.length + ' 个账号的代理配置。\n本地轮换模式不会调用 Resin API，也不会删除远端旧租约。')
+            : ('将清除 ' + selected.length + ' 个账号的代理配置。\n其中 ' + managed + ' 个插件管理的 Resin 租约会先删除远端租约，' + conflicts + ' 个外部代理只清除 OAuth 文件配置，不会删除外部代理服务。'),
+          confirmLabel: '清除代理',
+          icon: 'x',
+          tone: 'danger'
+        };
       } else {
-        message = '确认将所选 ' + selected.length + ' 个账号绑定到 Resin 租约？\n已绑定账号会保持当前租约，外部代理冲突账号不会被覆盖';
+        confirmation = {
+          title: '绑定所选账号',
+          detail: '将为所选 ' + selected.length + ' 个账号绑定 Resin 租约。\n已绑定账号会保持当前租约，外部代理冲突账号不会被覆盖。',
+          confirmLabel: '绑定租约',
+          icon: 'link'
+        };
       }
-      if (!window.confirm(message)) return;
+      if (!await confirmAction(confirmation)) return;
       setBusy(button, true);
       try {
         const task = await api(action, { auth_ids: selected.map((account) => account.auth_id) });
@@ -3132,19 +3296,31 @@
       const resin = state.resin || {};
       const localMode = Boolean(resin.local_only && resin.enabled);
       if (action === 'resin.rotate') {
-        const message = localMode
-          ? '本地轮换只修改 OAuth 文件中已有代理的用户名，不会调用 Resin API，也不会删除远端旧租约。确认继续？'
-          : '轮换会删除旧 Resin 租约并重新写入代理，确认继续？';
-        if (!window.confirm(message)) return;
+        const confirmed = await confirmAction({
+          title: '轮换代理租约',
+          detail: localMode
+            ? '本地轮换只修改 OAuth 文件中已有代理的用户名，不会调用 Resin API，也不会删除远端旧租约。'
+            : '轮换会删除旧 Resin 租约并重新写入代理，完成后 CPA 路由将使用新的租约账号。',
+          confirmLabel: localMode ? '本地轮换' : '轮换租约',
+          icon: 'rotate',
+          tone: 'danger'
+        });
+        if (!confirmed) return;
       }
       if (action === 'resin.clear') {
         const account = state.accounts.find((item) => item.auth_id === authID);
-        const message = localMode
-          ? '确认清除该账号的代理？本地轮换模式不会调用 Resin API，也不会删除远端旧租约'
-          : (account && account.resin_managed
-            ? '确认删除该账号的 Resin 远端租约并清除代理？此操作会立即影响 CPA 路由'
-            : '确认清除该账号的外部代理？不会删除外部代理服务，只会移除 OAuth 文件中的代理配置');
-        if (!window.confirm(message)) return;
+        const confirmed = await confirmAction({
+          title: '清除账号代理',
+          detail: localMode
+            ? '将清除该账号的代理配置。本地轮换模式不会调用 Resin API，也不会删除远端旧租约。'
+            : (account && account.resin_managed
+              ? '将先删除该账号的 Resin 远端租约，再清除代理配置。此操作会立即影响 CPA 路由。'
+              : '将清除该账号的外部代理配置。插件不会删除外部代理服务，只会移除 OAuth 文件中的代理设置。'),
+          confirmLabel: '清除代理',
+          icon: 'x',
+          tone: 'danger'
+        });
+        if (!confirmed) return;
       }
       setBusy(button, true);
       try {
@@ -3185,7 +3361,13 @@
         toast('请先勾选需要检测的账号', 'success');
         return;
       }
-      if (!window.confirm('确认立即检测当前已选 ' + count + ' 个账号？\n检测会发起真实模型请求并可能产生额度消耗；需要恢复的账号会在同一任务内先恢复再检测，外部禁用账号会跳过。')) return;
+      const probeConfirmed = await confirmAction({
+        title: '检测所选账号',
+        detail: '将立即检测 ' + count + ' 个账号。\n检测会发起真实模型请求并可能产生额度消耗；需要恢复的账号会在同一任务内先恢复再检测，外部禁用账号会跳过。',
+        confirmLabel: '开始检测',
+        icon: 'play'
+      });
+      if (!probeConfirmed) return;
       setBusy(button, true);
       try {
         const task = await api('accounts.probe_selected', { auth_ids: authIDs });
@@ -3222,7 +3404,13 @@
         toast('请先勾选需要恢复的账号', 'success');
         return;
       }
-      if (!window.confirm('确认恢复当前已选 ' + count + ' 个账号？\n已由插件冷却、额度耗尽、凭据失效或隔离的账号会重新启用；健康账号会跳过，外部禁用账号只会清理插件状态，不会修改 OAuth 的 disabled 标记。')) return;
+      const restoreConfirmed = await confirmAction({
+        title: '恢复所选账号',
+        detail: '将恢复当前已选 ' + count + ' 个账号。\n已由插件冷却、额度耗尽、凭据失效或隔离的账号会重新启用；健康账号会跳过，外部禁用账号只会清理插件状态，不会修改 OAuth 的 disabled 标记。',
+        confirmLabel: '恢复账号',
+        icon: 'check'
+      });
+      if (!restoreConfirmed) return;
       setBusy(button, true);
       try {
         const task = await api('accounts.restore_selected', { auth_ids: authIDs });
@@ -3282,15 +3470,29 @@
     });
     document.getElementById('accountSelectFilteredBtn').addEventListener('click', () => {
       const filtered = accountFilteredList();
-      if (!window.confirm('确认全选当前筛选结果中的 ' + filtered.length + ' 个账号？')) return;
-      filtered.forEach((account) => state.accountSelection.add(account.auth_id));
-      renderAccounts();
+      confirmAction({
+        title: '全选筛选结果',
+        detail: '将把当前筛选结果中的 ' + filtered.length + ' 个账号加入选择。',
+        confirmLabel: '全选账号',
+        icon: 'users'
+      }).then((confirmed) => {
+        if (!confirmed) return;
+        filtered.forEach((account) => state.accountSelection.add(account.auth_id));
+        renderAccounts();
+      });
     });
     document.getElementById('accountSelectAllBtn').addEventListener('click', () => {
       const all = state.accounts.length;
-      if (!window.confirm('确认全选全部 ' + all + ' 个账号？此操作会忽略当前搜索和筛选')) return;
-      state.accounts.forEach((account) => state.accountSelection.add(account.auth_id));
-      renderAccounts();
+      confirmAction({
+        title: '全选全部账号',
+        detail: '将选择全部 ' + all + ' 个账号，并忽略当前搜索和筛选条件。',
+        confirmLabel: '全选账号',
+        icon: 'users'
+      }).then((confirmed) => {
+        if (!confirmed) return;
+        state.accounts.forEach((account) => state.accountSelection.add(account.auth_id));
+        renderAccounts();
+      });
     });
     document.getElementById('accountClearSelectionBtn').addEventListener('click', () => {
       state.accountSelection.clear();
@@ -3326,21 +3528,35 @@
     });
     document.getElementById('selectFilteredBtn').addEventListener('click', () => {
       const filtered = leaseFilteredList();
-      if (!window.confirm('确认全选当前筛选结果中的 ' + filtered.length + ' 个账号？')) return;
-      filtered.forEach((account) => state.leaseSelection.add(account.auth_id));
-      document.querySelectorAll('#leaseRows [data-lease-select]').forEach((checkbox) => {
-        checkbox.checked = state.leaseSelection.has(checkbox.dataset.leaseSelect);
+      confirmAction({
+        title: '全选筛选结果',
+        detail: '将把当前筛选结果中的 ' + filtered.length + ' 个账号加入代理操作选择。',
+        confirmLabel: '全选账号',
+        icon: 'users'
+      }).then((confirmed) => {
+        if (!confirmed) return;
+        filtered.forEach((account) => state.leaseSelection.add(account.auth_id));
+        document.querySelectorAll('#leaseRows [data-lease-select]').forEach((checkbox) => {
+          checkbox.checked = state.leaseSelection.has(checkbox.dataset.leaseSelect);
+        });
+        syncLeaseSelectionUI();
       });
-      syncLeaseSelectionUI();
     });
     document.getElementById('selectAllAccountsBtn').addEventListener('click', () => {
       const all = state.accounts.length;
-      if (!window.confirm('确认全选全部 ' + all + ' 个账号？此操作会忽略当前搜索和筛选')) return;
-      state.accounts.forEach((account) => state.leaseSelection.add(account.auth_id));
-      document.querySelectorAll('#leaseRows [data-lease-select]').forEach((checkbox) => {
-        checkbox.checked = true;
+      confirmAction({
+        title: '全选全部账号',
+        detail: '将选择全部 ' + all + ' 个账号用于代理操作，并忽略当前搜索和筛选条件。',
+        confirmLabel: '全选账号',
+        icon: 'users'
+      }).then((confirmed) => {
+        if (!confirmed) return;
+        state.accounts.forEach((account) => state.leaseSelection.add(account.auth_id));
+        document.querySelectorAll('#leaseRows [data-lease-select]').forEach((checkbox) => {
+          checkbox.checked = true;
+        });
+        syncLeaseSelectionUI();
       });
-      syncLeaseSelectionUI();
     });
     document.getElementById('bindSelectedBtn').addEventListener('click', (event) => runSelectedResinAction('resin.bind', event.currentTarget));
     document.getElementById('clearSelectedBtn').addEventListener('click', (event) => runSelectedResinAction('resin.clear', event.currentTarget));
@@ -3349,7 +3565,13 @@
       renderResin();
     });
     document.getElementById('bindUnboundBtn').addEventListener('click', async (event) => {
-      if (!window.confirm('确认批量绑定当前所有未绑定账号？代理冲突账号会被跳过')) return;
+      const confirmed = await confirmAction({
+        title: '绑定全部未绑定账号',
+        detail: '将为当前所有未绑定账号创建 Resin 租约。\n代理冲突账号会被跳过，已绑定账号保持当前租约。',
+        confirmLabel: '开始绑定',
+        icon: 'link'
+      });
+      if (!confirmed) return;
       const button = event.currentTarget;
       setBusy(button, true);
       try {
@@ -3367,7 +3589,14 @@
       savePolicy(event.submitter || document.querySelector('#policyForm button[type="submit"]'));
     });
     document.getElementById('policyResetBtn').addEventListener('click', async (event) => {
-      if (!window.confirm('确认重置为当前 YAML 的默认策略？')) return;
+      const confirmed = await confirmAction({
+        title: '重置策略',
+        detail: '将把运行时策略恢复为当前 YAML 的默认值，并立即持久化到 state。',
+        confirmLabel: '重置策略',
+        icon: 'refresh',
+        tone: 'danger'
+      });
+      if (!confirmed) return;
       const button = event.currentTarget;
       setBusy(button, true);
       try {
@@ -3400,7 +3629,33 @@
     });
     document.getElementById('drawerClose').addEventListener('click', closeDrawer);
     document.getElementById('accountDrawer').addEventListener('click', (event) => { if (event.target === event.currentTarget) closeDrawer(); });
-    document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && !document.getElementById('accountDrawer').hidden) closeDrawer(); });
+    document.getElementById('confirmCancel').addEventListener('click', () => settleConfirm(false));
+    document.getElementById('confirmAccept').addEventListener('click', () => settleConfirm(true));
+    document.getElementById('confirmDialog').addEventListener('click', (event) => { if (event.target === event.currentTarget) settleConfirm(false); });
+    document.addEventListener('keydown', (event) => {
+      const confirmDialog = document.getElementById('confirmDialog');
+      if (!confirmDialog.hidden) {
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          settleConfirm(false);
+          return;
+        }
+        if (event.key === 'Tab') {
+          const focusable = [document.getElementById('confirmCancel'), document.getElementById('confirmAccept')];
+          const first = focusable[0];
+          const last = focusable[focusable.length - 1];
+          if (event.shiftKey && document.activeElement === first) {
+            event.preventDefault();
+            last.focus();
+          } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault();
+            first.focus();
+          }
+        }
+        return;
+      }
+      if (event.key === 'Escape' && !document.getElementById('accountDrawer').hidden) closeDrawer();
+    });
     function applyLocationHash() {
       const hash = (window.location.hash || '#overview').slice(1);
       if (hash.startsWith('settings/')) {

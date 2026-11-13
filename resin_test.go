@@ -3,12 +3,17 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 func seedResinState(t *testing.T, plugin *Plugin, account string, generation int64) {
@@ -20,6 +25,38 @@ func seedResinState(t *testing.T, plugin *Plugin, account string, generation int
 	}); errUpdate != nil {
 		t.Fatal(errUpdate)
 	}
+}
+
+func newResinConcurrencyServer(t *testing.T) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		current := active.Add(1)
+		defer active.Add(-1)
+		for {
+			observed := maxActive.Load()
+			if current <= observed || maxActive.CompareAndSwap(observed, current) {
+				break
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+		switch request.Method {
+		case http.MethodGet:
+			if request.URL.Path != "/api/v1/platforms/"+testResinPlatformID {
+				writer.WriteHeader(http.StatusNotFound)
+				return
+			}
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = writer.Write([]byte(`{"id":"` + testResinPlatformID + `","name":"Default"}`))
+		case http.MethodDelete:
+			writer.WriteHeader(http.StatusNoContent)
+		default:
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server, &maxActive
 }
 
 func TestBindResinPreservesTokensAndMasksResult(t *testing.T) {
@@ -243,6 +280,182 @@ func TestClearResinProxyDeletesLeaseAndClearsAuth(t *testing.T) {
 	}
 	if !foundEvent {
 		t.Fatal("resin clear event was not recorded")
+	}
+}
+
+func TestClearResinProxyInfersLeaseFromSavedConfig(t *testing.T) {
+	var deleted []string
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "Bearer admin-secret" {
+			writer.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch request.Method {
+		case http.MethodGet:
+			if request.URL.Path != "/api/v1/platforms/"+testResinPlatformID {
+				writer.WriteHeader(http.StatusNotFound)
+				return
+			}
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = writer.Write([]byte(`{"id":"` + testResinPlatformID + `","name":"Default"}`))
+		case http.MethodDelete:
+			deleted = append(deleted, request.URL.Path)
+			writer.WriteHeader(http.StatusNoContent)
+		default:
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	oldProxy := "socks5h://Default.grok-alice-old1:proxy-secret@resin:2260"
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", map[string]any{
+		"proxy_url": oldProxy,
+	})
+	host := newMockHostCall(entries, auths)
+	plugin := newTestPlugin(t, host, nil)
+	if errUpdate := plugin.stateStore().Update(func(state *State) error {
+		state.Resin = ResinSettings{
+			Configured:    true,
+			Enabled:       true,
+			Platform:      "Default",
+			PlatformID:    testResinPlatformID,
+			AdminURL:      server.URL,
+			AdminToken:    "admin-secret",
+			ProxyToken:    "proxy-secret",
+			ProxyTemplate: "socks5h://{platform}.{account}:{proxy_token}@resin:2260",
+			ValidatedAt:   time.Now().UTC(),
+		}
+		return nil
+	}); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+
+	result, errClear := plugin.ClearResinProxy(context.Background(), "auth-1")
+	if errClear != nil {
+		t.Fatal(errClear)
+	}
+	if !result.Cleared || !result.RemoteLeaseDeleted || result.Account != "grok-alice-old1" {
+		t.Fatalf("unexpected inferred clear result: %#v", result)
+	}
+	if len(deleted) != 1 || !strings.HasSuffix(deleted[0], "/grok-alice-old1") {
+		t.Fatalf("managed lease was not deleted: %#v", deleted)
+	}
+}
+
+func TestResinBindSelectedUsesBoundedQueue(t *testing.T) {
+	t.Setenv("RESIN_ADMIN_TOKEN", "admin-secret")
+	t.Setenv("RESIN_PROXY_TOKEN", "proxy-secret")
+	server, maxActive := newResinConcurrencyServer(t)
+
+	var entries []pluginapi.HostAuthFileEntry
+	auths := make(map[string]json.RawMessage)
+	authIDs := []any{}
+	for index := 1; index <= 4; index++ {
+		authID := fmt.Sprintf("auth-%d", index)
+		entry, raw := singleGrokAuth(t, authID, fmt.Sprintf("user%d@example.com", index), nil)
+		entries = append(entries, entry...)
+		for key, value := range raw {
+			auths[key] = value
+		}
+		authIDs = append(authIDs, authID)
+	}
+	host := newMockHostCall(entries, auths)
+	plugin := newTestPlugin(t, host, func(cfg *Config) {
+		cfg.Probe.Concurrency = 2
+		cfg.Resin.Enabled = true
+		cfg.Resin.Platform = "Default"
+		cfg.Resin.PlatformID = testResinPlatformID
+		cfg.Resin.AdminURL = server.URL
+	})
+	response := actionManagementForTest(t, plugin, "resin.bind", map[string]any{"auth_ids": authIDs})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.StatusCode, response.Body)
+	}
+	if got := maxActive.Load(); got != 2 {
+		t.Fatalf("max concurrent resin requests = %d, want 2", got)
+	}
+}
+
+func TestResinBindUnboundUsesBoundedQueue(t *testing.T) {
+	t.Setenv("RESIN_ADMIN_TOKEN", "admin-secret")
+	t.Setenv("RESIN_PROXY_TOKEN", "proxy-secret")
+	server, maxActive := newResinConcurrencyServer(t)
+
+	var entries []pluginapi.HostAuthFileEntry
+	auths := make(map[string]json.RawMessage)
+	for index := 1; index <= 4; index++ {
+		authID := fmt.Sprintf("auth-%d", index)
+		entry, raw := singleGrokAuth(t, authID, fmt.Sprintf("user%d@example.com", index), nil)
+		entries = append(entries, entry...)
+		for key, value := range raw {
+			auths[key] = value
+		}
+	}
+	host := newMockHostCall(entries, auths)
+	plugin := newTestPlugin(t, host, func(cfg *Config) {
+		cfg.Probe.Concurrency = 2
+		cfg.Resin.Enabled = true
+		cfg.Resin.Platform = "Default"
+		cfg.Resin.PlatformID = testResinPlatformID
+		cfg.Resin.AdminURL = server.URL
+	})
+	response := actionManagementForTest(t, plugin, "resin.bind_unbound", nil)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.StatusCode, response.Body)
+	}
+	if got := maxActive.Load(); got != 2 {
+		t.Fatalf("max concurrent resin requests = %d, want 2", got)
+	}
+}
+
+func TestResinClearSelectedUsesBoundedQueue(t *testing.T) {
+	t.Setenv("RESIN_ADMIN_TOKEN", "admin-secret")
+	t.Setenv("RESIN_PROXY_TOKEN", "proxy-secret")
+	server, maxActive := newResinConcurrencyServer(t)
+
+	var entries []pluginapi.HostAuthFileEntry
+	auths := make(map[string]json.RawMessage)
+	authIDs := []any{}
+	for index := 1; index <= 4; index++ {
+		authID := fmt.Sprintf("auth-%d", index)
+		account := fmt.Sprintf("grok-alice-%d", index)
+		entry, raw := singleGrokAuth(t, authID, fmt.Sprintf("user%d@example.com", index), map[string]any{
+			"proxy_url": "socks5h://Default." + account + ":proxy-secret@resin:2260",
+		})
+		entries = append(entries, entry...)
+		for key, value := range raw {
+			auths[key] = value
+		}
+		authIDs = append(authIDs, authID)
+	}
+	host := newMockHostCall(entries, auths)
+	plugin := newTestPlugin(t, host, func(cfg *Config) {
+		cfg.Probe.Concurrency = 2
+		cfg.Resin.Enabled = true
+		cfg.Resin.Platform = "Default"
+		cfg.Resin.PlatformID = testResinPlatformID
+		cfg.Resin.AdminURL = server.URL
+	})
+	if errUpdate := plugin.stateStore().Update(func(state *State) error {
+		for index, authID := range authIDs {
+			accountID := authID.(string)
+			account := state.Accounts[accountID]
+			if account == nil {
+				account = &AccountState{AuthID: accountID, State: StateUnknown}
+				state.Accounts[accountID] = account
+			}
+			account.Resin = ResinState{Managed: true, Account: fmt.Sprintf("grok-alice-%d", index+1), Generation: 1}
+		}
+		return nil
+	}); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+	response := actionManagementForTest(t, plugin, "resin.clear", map[string]any{"auth_ids": authIDs})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.StatusCode, response.Body)
+	}
+	if got := maxActive.Load(); got != 2 {
+		t.Fatalf("max concurrent resin requests = %d, want 2", got)
 	}
 }
 

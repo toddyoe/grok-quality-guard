@@ -66,11 +66,12 @@ func (p *Plugin) BindResin(ctx context.Context, authID string, dryRun bool) (Res
 	}
 	stateAccount, _ := p.stateAccount(authID)
 	existingProxy := strings.TrimSpace(authRawString(raw, "proxy_url"))
-	if existingProxy != "" && !stateAccount.Resin.Managed {
+	boundAccount, managed := managedResinBinding(raw, stateAccount, cfg)
+	if existingProxy != "" && !managed {
 		return ResinBindResult{AuthID: authID, DryRun: dryRun, Conflict: true, Error: "auth already has a non-managed proxy_url"}, fmt.Errorf("proxy_url conflict")
 	}
-	if stateAccount.Resin.Managed && stateAccount.Resin.Account != "" && existingProxy != "" {
-		return ResinBindResult{AuthID: authID, Account: stateAccount.Resin.Account, ProxyURL: maskProxyURL(existingProxy), DryRun: dryRun}, nil
+	if managed && boundAccount != "" && existingProxy != "" {
+		return ResinBindResult{AuthID: authID, Account: boundAccount, ProxyURL: maskProxyURL(existingProxy), DryRun: dryRun}, nil
 	}
 	generated, errGenerate := p.generateResinAccount(authID, raw)
 	if errGenerate != nil {
@@ -124,21 +125,21 @@ func (p *Plugin) ClearResinProxy(ctx context.Context, authID string) (ResinClear
 	}
 	stateAccount, _ := p.stateAccount(authID)
 	generation := stateAccount.Resin.Generation
-	account := stateAccount.Resin.Account
 	proxyURL := strings.TrimSpace(authRawString(raw, "proxy_url"))
+	cfg := p.ResinConfig()
+	account, managed := managedResinBinding(raw, stateAccount, cfg)
 	result := ResinClearResult{
 		AuthID:   authID,
 		Account:  account,
 		ProxyURL: maskProxyURL(proxyURL),
 	}
-	hasManagedLease := stateAccount.Resin.Managed || account != ""
+	hasManagedLease := managed || account != ""
 	if proxyURL == "" && !hasManagedLease {
 		result.Skipped = true
 		return result, nil
 	}
 	remoteLeaseSkipped := false
 	if account != "" {
-		cfg := p.ResinConfig()
 		if cfg.LocalOnly {
 			remoteLeaseSkipped = true
 		} else {
@@ -199,24 +200,42 @@ func (p *Plugin) BindUnboundResin(ctx context.Context, dryRun bool) ([]ResinBind
 	if errRefresh := p.RefreshCatalog(ctx); errRefresh != nil {
 		return nil, errRefresh
 	}
-	results := make([]ResinBindResult, 0)
-	for _, account := range p.catalogSnapshot() {
-		_, _, raw, errResolve := p.resolveAuth(ctx, account.ID)
+	accounts := p.catalogSnapshot()
+	results := make([]ResinBindResult, len(accounts))
+	attempted := make([]bool, len(accounts))
+	indices := make([]int, len(accounts))
+	for index := range accounts {
+		indices[index] = index
+	}
+	errRun := runBoundedQueue(ctx, indices, p.probeQueueSize(), p.probeConcurrency(), func(jobCtx context.Context, index int) {
+		account := accounts[index]
+		_, _, raw, errResolve := p.resolveAuth(jobCtx, account.ID)
 		if errResolve != nil {
-			results = append(results, ResinBindResult{AuthID: account.ID, DryRun: dryRun, Error: errResolve.Error()})
-			continue
+			results[index] = ResinBindResult{AuthID: account.ID, DryRun: dryRun, Error: errResolve.Error()}
+			attempted[index] = true
+			return
 		}
 		stateAccount, _ := p.stateAccount(account.ID)
 		if stateAccount.Resin.Account != "" || strings.TrimSpace(authRawString(raw, "proxy_url")) != "" {
-			continue
+			return
 		}
-		result, errBind := p.BindResin(ctx, account.ID, dryRun)
+		result, errBind := p.BindResin(jobCtx, account.ID, dryRun)
 		if errBind != nil && result.Error == "" {
 			result.Error = errBind.Error()
 		}
-		results = append(results, result)
+		results[index] = result
+		attempted[index] = true
+	})
+	if errRun != nil {
+		return nil, errRun
 	}
-	return results, nil
+	filtered := make([]ResinBindResult, 0, len(results))
+	for index, result := range results {
+		if attempted[index] {
+			filtered = append(filtered, result)
+		}
+	}
+	return filtered, nil
 }
 
 func (p *Plugin) RotateResin(ctx context.Context, authID string) error {
@@ -232,11 +251,11 @@ func (p *Plugin) RotateResin(ctx context.Context, authID string) error {
 		return errResolve
 	}
 	stateAccount, _ := p.stateAccount(authID)
-	if !stateAccount.Resin.Managed {
+	previousAccount, managed := managedResinBinding(raw, stateAccount, cfg)
+	if !managed {
 		return fmt.Errorf("auth proxy is not managed by resin")
 	}
 	proxyURL := strings.TrimSpace(authRawString(raw, "proxy_url"))
-	previousAccount := firstNonEmpty(stateAccount.Resin.Account, resinAccountFromProxyURL(proxyURL))
 	if proxyURL == "" && previousAccount == "" {
 		return fmt.Errorf("auth has no proxy_url to rotate")
 	}
@@ -314,6 +333,39 @@ func resinAccountFromProxyURL(proxyURL string) string {
 		return ""
 	}
 	return username[dot+1:]
+}
+
+func managedResinBinding(raw map[string]json.RawMessage, stateAccount AccountState, cfg ResinSettings) (string, bool) {
+	account := strings.TrimSpace(stateAccount.Resin.Account)
+	proxyURL := strings.TrimSpace(authRawString(raw, "proxy_url"))
+	managed := stateAccount.Resin.Managed || account != ""
+	if !managed && resinProxyMatchesSettings(proxyURL, cfg) {
+		account = resinAccountFromProxyURL(proxyURL)
+		return account, account != ""
+	}
+	if account == "" && managed {
+		account = resinAccountFromProxyURL(proxyURL)
+	}
+	return account, managed
+}
+
+func resinProxyMatchesSettings(proxyURL string, cfg ResinSettings) bool {
+	if strings.TrimSpace(proxyURL) == "" || cfg.LocalOnly {
+		return false
+	}
+	parsedProxy, errProxy := url.Parse(strings.TrimSpace(proxyURL))
+	if errProxy != nil || parsedProxy.Scheme == "" || parsedProxy.Host == "" {
+		return false
+	}
+	rendered, errRender := renderResinProxy(cfg, "grok-validation")
+	if errRender != nil {
+		return false
+	}
+	parsedSettings, errSettings := url.Parse(rendered)
+	if errSettings != nil || parsedSettings.Scheme == "" || parsedSettings.Host == "" {
+		return false
+	}
+	return parsedProxy.Scheme == parsedSettings.Scheme && strings.EqualFold(parsedProxy.Host, parsedSettings.Host)
 }
 
 func rewriteResinProxyAccount(proxyURL, account string) (string, error) {
