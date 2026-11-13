@@ -1959,8 +1959,8 @@
                           class="check-title">被动观测</span><span class="check-desc">分析真实请求的响应和流式
                           Chunk，不改变路由</span></span></label>
                     <label class="check-card"><input id="p_transparent" type="checkbox"><span class="check-copy"><span
-                          class="check-title">透明保护</span><span class="check-desc">仅在首个客户端可见 Chunk
-                          前保护可安全重放的文本请求</span></span></label>
+                          class="check-title">透明保护</span><span class="check-desc">拦截所有 Grok/xAI OAuth 请求，在首个客户端可见 Chunk
+                          前完成质量门；不可安全重放的请求只执行一次</span></span></label>
                     <div class="field"><label for="p_auto_action">自动处置</label><select id="p_auto_action">
                         <option value="cooldown_only">冷却</option>
                         <option value="observe">仅观察</option>

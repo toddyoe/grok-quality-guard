@@ -32,6 +32,18 @@ func (p *Plugin) listAuths() ([]pluginapi.HostAuthFileEntry, error) {
 	return response.Files, nil
 }
 
+func (p *Plugin) listAuthModels() ([]pluginapi.HostAuthModels, error) {
+	result, errCall := hostCall(pluginabi.MethodHostAuthModels, pluginapi.HostAuthModelsRequest{})
+	if errCall != nil {
+		return nil, errCall
+	}
+	var response pluginapi.HostAuthModelsResponse
+	if errUnmarshal := json.Unmarshal(result, &response); errUnmarshal != nil {
+		return nil, fmt.Errorf("decode host.auth.models result: %w", errUnmarshal)
+	}
+	return response.Credentials, nil
+}
+
 func (p *Plugin) getAuth(authIndex string) (pluginapi.HostAuthGetResponse, error) {
 	result, errCall := hostCall(pluginabi.MethodHostAuthGet, pluginapi.HostAuthGetRequest{AuthIndex: authIndex})
 	if errCall != nil {

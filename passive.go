@@ -110,7 +110,7 @@ func (p *Plugin) HandleUsage(request []byte) {
 	if len(request) == 0 || json.Unmarshal(request, &record) != nil {
 		return
 	}
-	if record.AuthID == "" || p.isProbeAuth(record.AuthID) {
+	if record.AuthID == "" {
 		return
 	}
 	p.mu.RLock()
@@ -127,6 +127,16 @@ func (p *Plugin) HandleUsage(request []byte) {
 	pending := p.pending[record.RequestID]
 	delete(p.pending, record.RequestID)
 	p.pendingMu.Unlock()
+	// Transparent executions are audited by the executor before emission. Their
+	// usage records have no passive observation and must not be judged twice.
+	if pending == nil && policy.TransparentGuard {
+		return
+	}
+	// Probe usage is internal and has no passive observation. Real requests keep
+	// their pending observation and must still be recorded during a probe window.
+	if pending == nil && p.isProbeAuth(record.AuthID) {
+		return
+	}
 	if record.Failed {
 		_ = p.ApplyVerdict(context.Background(), record.AuthID, QualityVerdict{Class: ClassIgnored, Reason: "unsuccessful"}, "passive", "")
 		return

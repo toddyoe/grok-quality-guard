@@ -22,7 +22,7 @@
 - soft / hard TPS 异常
 - 空流和空闲流
 
-本设计采用“先观测、后处置、透明保护可选”的策略。默认不自动修改凭证，只有管理员显式开启自动处置后才写 `disabled`。透明拦截模式默认关闭，开启后只保护可安全重放的普通文本请求。
+本设计采用“先观测、后处置、透明保护可选”的策略。默认不自动修改凭证，只有管理员显式开启自动处置后才写 `disabled`。透明拦截模式默认关闭，开启后拦截所有可识别的 Grok / xAI OAuth 请求；重放资格只决定失败后是否允许换号重试。
 
 ### 1.2 目标
 
@@ -179,7 +179,7 @@ dump 检测必须先于“已有 thinking 就放行”，否则 fake reasoning �
 2. `RequestInterceptor.Terminate` 会直接结束请求，不会触发 CPA 内置换号。
 3. CPA 原生重试只覆盖上游 bootstrap 错误或首个 payload 之前发生的错误。
 4. 一旦开始向客户端 emit，任何换号都无法撤销已下发内容。
-5. 插件 executor 路由在 CPA Home 模式开启时不可用。透明模式必须检测并明确报错或降级为 passive。
+5. 透明门依赖 CPA 实际调用插件 `ModelRouter`；插件自身不对 Home 模式或请求元数据做主动旁路。
 6. `host.model.execute_stream` 支持 `AuthID`、`ProxyURL`、`ForcedProvider`、`EntryProtocol`、`ExitProtocol`、`Body`、`Headers`。
 7. 嵌套调用必须转发 `HostCallbackID`，否则可能递归触发本插件拦截器。
 8. `host.model.execute_stream` 返回的是 host 管理的 stream，需要 `stream_read` 和 `stream_close`。
@@ -246,14 +246,14 @@ passive_guard 不改变正常请求的路由和响应。它无法阻止当前请
 
 默认关闭。职责：
 
-- `ModelRouter` 判断请求是否属于可安全保护的 Grok 文本请求
+- `ModelRouter` 判断请求是否属于 Grok / xAI 路由模型
 - 路由到插件自有 `Executor`
 - executor 固定 AuthID 和 ProxyURL 调用 `host.model.execute_stream`
 - 在首个客户端可见 chunk 前完成质量门
-- 异常时关闭上游流并换号
+- 可安全重放的异常流关闭上游流并换号；不可安全重放的请求只执行一次
 - 所有候选异常时 fail closed
 
-透明模式只覆盖安全可重放子集，不覆盖全部 Grok 请求。
+透明模式覆盖全部可识别的 Grok / xAI 路由请求。禁用推理、非推理模型和不可安全重放请求都不得绕过质量门；它们只在 thinking 判定和失败后的重试策略上有所区别。
 
 ### 3.2 组件划分
 
@@ -300,7 +300,8 @@ client request
   -> host.model.execute_stream
   -> hold stream and analyze
        ├─ deliver: emit buffered prefix, then pass through
-       ├─ withhold: close upstream, rotate Resin, next attempt
+       ├─ withhold + replayable: close upstream, rotate Resin, next attempt
+       ├─ withhold + unsafe replay: return 503 quality_degraded
        └─ all exhausted: host.stream.close 503 quality_degraded
 ```
 
@@ -321,21 +322,14 @@ probe scheduler
 
 ### 4.1 适用范围
 
-质量判定只针对：
+质量判定对象是 xAI / Grok OAuth 请求的响应。
 
-- xAI / Grok auth
-- 文本 chat / responses
-- 请求明确启用 reasoning
-- 非 compaction
-- 非 forced egress probe 的普通观测路径
-
-必须豁免：
-
-- image、video、speech、audio、realtime、websocket
-- compaction / `compaction_trigger`
-- reasoning disabled
-- 主动探测请求本身不应重复进入普通账号质量样本
-- 上游非 2xx 请求不应被分类为质量降智
+- `transparent_guard=true` 时，所有可识别的 Grok 路由请求都进入透明门，不按 reasoning 能力或重放资格旁路。
+- 非推理模型、显式关闭 reasoning 和未知推理能力的请求只跳过 `missing_thinking`；空流、速度、dump 和缓冲上限仍须执行。
+- 可安全重放只决定质量失败后能否换号或换代理，不决定是否接管请求。
+- passive 观测只对具有可解析文本流的样本形成质量结论，不改变 CPA 原生路由。
+- 主动探测请求本身不重复进入普通账号被动样本。
+- 上游非 2xx 请求不分类为质量降智。
 
 ### 4.2 真实思考证据
 
@@ -685,14 +679,12 @@ Router 输入包含 SourceFormat、RequestedModel、Stream、Headers、Query、B
 Router 处理条件：
 
 1. 插件配置 `transparent_guard=true`
-2. CPA Home 模式未开启
+2. 请求不是插件内部主动探测
 3. 请求模型匹配 Grok：默认 model prefix 为 `grok-`，或从缓存的 `host.auth.models` 可确认该模型属于 xAI
-4. 请求通过“可安全重放”检查
-5. 至少有一个可用 Grok auth 候选
 
-否则返回 `Handled=false`，由 CPA 原生路径处理。
+否则返回 `Handled=false`，由 CPA 原生路径处理。符合条件的请求即使不可安全重放或没有候选账号，也必须由插件接管并返回明确错误，不能静默回退 CPA。
 
-### 6.2 可安全重放子集
+### 6.2 重放资格与尝试次数
 
 允许：
 
@@ -715,11 +707,10 @@ Router 处理条件：
 - `mcp_servers` 非空数组
 - hosted tool：`web_search`、`code_interpreter`、`file_search`、`image_generation`、远程 `shell`
 - 任何未知 server/native tool
-- reasoning disabled
 - 请求体无法解析为预期 JSON
 - 请求路径表明媒体或非文本能力
 
-无法证明可安全重放时，不接管请求。安全优先于覆盖范围。
+重放资格只控制失败后的失败恢复：可安全重放请求受 `max_attempts` 限制并允许换号/换代理；不可证明可安全重放时仍执行一次透明质量门，失败返回 `503 quality_degraded`，不换号重试。只有显式配置 `on_exhausted: fail_open` 才会下发最后一个已缓冲响应。
 
 ### 6.3 候选账号
 
@@ -733,6 +724,8 @@ Router 处理条件：
 
 - provider/type 必须为 xAI/Grok
 - 跳过 `cooling`
+
+主动探测标记只用于识别没有请求级 pending observation 的内部 probe usage，不得按 AuthID 过滤透明候选，也不得丢弃同一窗口内真实请求的 usage。
 - 跳过 `disabled_by_guard`
 - 跳过 `externally_disabled`
 - 跳过 runtime unavailable
@@ -849,7 +842,9 @@ host.stream.close(
 
 ### 6.8 Resin 轮换与当前请求
 
-透明模式中检测到 `missing_thinking` 后：
+仅对 `safeReplayRequest=true` 的请求执行以下轮换流程。不可安全重放请求只执行一次，不进入轮换或换号。
+
+透明模式中检测到 `missing_thinking` 等质量异常后：
 
 1. 记录异常
 2. 如果代理轮换和自动轮换开启，API 模式使用已保存的平台名称改写新代理并异步排队删除旧租约，本地模式只改写已有代理用户名并写回
@@ -863,12 +858,9 @@ host.stream.close(
 ### 6.9 无法覆盖的场景
 
 - 已开始 streaming 后的坏流
-- 依赖 `previous_response_id` 的 stored response
-- 已经执行过 hosted tool 的请求
-- Home 模式开启时的插件 executor 路由
-- WebSocket / realtime
-- compaction
-- 媒体生成
+- 不可安全重放请求的跨账号失败恢复；这些请求仍会执行一次质量门
+- CPA 未调用插件 `ModelRouter` 的请求
+- Host 绕过插件 executor 的 WebSocket / realtime 请求
 - 客户端取消后无法重放
 
 ## 7. passive 设计
@@ -1652,8 +1644,8 @@ python scripts/migrate_auth_metadata_to_state.py <auth_dir> <state.json>
 4. Resin 没有显式创建租约 API，删除后由下一次请求惰性创建。
 5. 删除租约不保证换到不同出口 IP。
 6. 代理切换与异步 DELETE 不是跨服务原子事务；租约删除失败会保留在持久化队列中后台重试。
-7. Home 模式开启时插件 executor 路由不可用。
-8. hosted tool、stored response、compaction 等不可安全重放。
+7. 透明门依赖 CPA 调用插件 `ModelRouter`；插件自身不按 Home 模式旁路。
+8. hosted tool、stored response、compaction 等仍经过透明质量门，但不可安全重放，因此只执行一次且不换号重试。
 9. auth 文件可能被管理员或其他进程并发修改；写回前必须重新读取并做字段级合并。
 10. 事件日志不能保存 prompt、响应正文和原始错误 body。
 11. 本地轮换只能改写已有代理用户名，不能创建新绑定，也不会删除远端旧租约。
@@ -1744,7 +1736,7 @@ Resin：
 - 插件 reload 后状态恢复
 - 并发请求状态一致
 - 大量账号加载不阻塞注册
-- Home 模式透明路由拒绝
+- Home 模式元数据不会旁路透明路由
 - 管理 API action 正常和错误响应
 
 ### 16.3 手工验收
@@ -1810,7 +1802,9 @@ git diff --check
 ### Phase 5：透明模式
 
 - ModelRouter
-- 安全重放检查
+- Grok 模型和 xAI auth model alias 识别
+- 不可安全重放请求只执行一次
+- 非推理请求完整缓冲并跳过 missing-thinking
 - 插件 Executor
 - 流式 hold / emit
 - 多账号重试

@@ -17,10 +17,11 @@ import (
 type mockHostCall struct {
 	mu sync.Mutex
 
-	entries []pluginapi.HostAuthFileEntry
-	auths   map[string]json.RawMessage
-	saves   map[string]json.RawMessage
-	saveErr error
+	entries    []pluginapi.HostAuthFileEntry
+	auths      map[string]json.RawMessage
+	authModels []pluginapi.HostAuthModels
+	saves      map[string]json.RawMessage
+	saveErr    error
 
 	nextStream     int
 	streams        map[string][]pluginapi.HostModelStreamReadResponse
@@ -107,6 +108,10 @@ func (m *mockHostCall) call(method string, payload any) (json.RawMessage, error)
 		m.mu.Lock()
 		defer m.mu.Unlock()
 		return marshalTestResult(authListResponse{Files: append([]pluginapi.HostAuthFileEntry(nil), m.entries...)})
+	case pluginabi.MethodHostAuthModels:
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return marshalTestResult(pluginapi.HostAuthModelsResponse{Credentials: append([]pluginapi.HostAuthModels(nil), m.authModels...)})
 	case pluginabi.MethodHostAuthGet:
 		var req pluginapi.HostAuthGetRequest
 		if err := json.Unmarshal(encoded, &req); err != nil {

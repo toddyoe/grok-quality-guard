@@ -9,7 +9,7 @@ Grok Quality Guard 观测 Grok / xAI auth 的真实响应质量，识别 HTTP 20
 ## 功能
 
 - 被动观测 `passive_guard`：通过 response、stream chunk 和 usage 分析已有请求，不改变路由
-- 可选透明保护 `transparent_guard`：在首次向客户端 emit 前完成质量门，异常时关闭上游流并换号
+- 可选透明保护 `transparent_guard`：拦截所有可识别的 Grok / xAI OAuth 请求，在首次向客户端 emit 前完成质量门
 - 真实 thinking 证据判定，不使用空 reasoning stub 或单独的 `reasoning_tokens` 判断健康
 - 检测 `missing_thinking`、`buffered_burst`、`cipher_drool`、`fake_encrypted_dump`、`fast_reasoning_ratio_dump`、`soft_tps`、`hard_tps`、`empty_stream`、`probe_error`、`proxy_error`
 - 账号状态机：`unknown`、`healthy`、`suspect`、`degraded`、`cooling`、`quota_exhausted`、`credential_invalid`、`disabled_by_guard`、`externally_disabled`
@@ -239,16 +239,15 @@ plugins:
 
 ### 透明保护
 
-`transparent_guard: true` 时，插件只保护可安全重放的普通文本 chat / responses 请求。以下请求不会被透明接管：
+`transparent_guard: true` 时，所有将使用 xAI / Grok OAuth 的文本 chat / responses 请求都会先进入插件质量门，而不是只在可安全重放时才接管。模型可通过 `grok-*` 命名或 CPA 的 xAI auth model 列表识别。
 
-- 图片、音频、视频等媒体请求
-- `previous_response_id` 或 stored response
-- compaction 请求
-- 可能产生副作用的 hosted tools
-- 禁用推理的请求
-- 无法安全重放到其他账号的请求
+不可安全重放的请求仍会执行一次质量判定，但不会换号或代理重试；质量门拒绝时返回 `503 quality_degraded`。这类请求包括图片、音频、视频等媒体输入、`previous_response_id` 或 stored response、compaction、可能产生副作用的 hosted tools，以及无法安全重放到其他账号的请求。
 
-透明模式在首次向客户端 emit 前完成质量门。一旦开始 emit，插件不能回滚已经发送的内容；如果所有候选账号耗尽，默认返回 `503 quality_degraded`。可配置 `on_exhausted: fail_open` 在失败时返回最后一个已缓冲响应，但这会牺牲 fail-closed 语义。
+禁用推理的请求和非推理 Grok 模型同样会被透明拦截，只是跳过 `missing_thinking` 判定；空流、异常速度、dump 特征和缓冲上限仍然生效。非推理流会完整缓冲到终态后判定，不会因为普通可见文本缺少 reasoning 而误拒。
+
+主动探测只按请求级证据忽略内部 probe usage，不会在探测窗口内按 AuthID 丢弃真实请求的 usage，也不会把该账号从透明候选集中排除。
+
+透明模式在首次向客户端 emit 前完成质量门。一旦开始 emit，插件不能回滚已经发送的内容；如果所有候选账号耗尽，默认返回 `503 quality_degraded`。可配置 `on_exhausted: fail_open` 在失败时返回最后一个已缓冲响应，但这会牺牲 fail-closed 语义。透明缓冲超过 `hold_max_buffer_bytes` 时也会 fail closed，不会把未完成质量判定的内容下发给客户端。
 
 ## Resin 与本地代理轮换
 
@@ -438,7 +437,7 @@ git push origin v0.1.0
 ## 已知边界
 
 - streaming 开始后无法回滚，也无法在已经 emit 后换号
-- stored responses、compaction、媒体输入和有副作用的 hosted tools 不属于透明重放范围
+- stored responses、compaction、媒体输入和有副作用的 hosted tools 不可安全重放，仍会经过透明质量门，但只执行一次且不换号重试
 - CPA 不能直接以固定 AuthID 探测 disabled auth，恢复探测存在短暂重新启用窗口
 - Resin 删除租约后不保证换到不同出口 IP；本地轮换不会删除远端租约
 - 不实现 OAuth 登录或账号导入导出

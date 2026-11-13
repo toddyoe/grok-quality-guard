@@ -74,22 +74,12 @@ func (p *Plugin) RouteModel(request []byte) ([]byte, error) {
 	if !policy.TransparentGuard {
 		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false, Reason: "transparent_guard_disabled"})
 	}
-	if isProbeHeader(req.Headers) || metadataBool(req.Metadata, "home_mode") || metadataBool(req.Metadata, "home") {
-		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false, Reason: "internal_or_home_request"})
+	if isProbeHeader(req.Headers) {
+		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false, Reason: "internal_probe_request"})
 	}
 	requestedModel := firstNonEmpty(req.RequestedModel, asString(req.Metadata["model"]), modelFromRequestBody(req.Body))
-	if !isGrokModel(requestedModel, policy.ModelPrefixes) {
+	if !p.isGrokRouteModel(requestedModel) {
 		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false, Reason: "not_grok_model"})
-	}
-	if !reasoningRequiredForModel(requestedModel, req.Body) {
-		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false, Reason: "reasoning_not_required"})
-	}
-	if !safeReplayRequest(req.Body, req.SourceFormat, req.RequestedModel) {
-		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false, Reason: "request_not_safely_replayable"})
-	}
-	candidates, errCandidates := p.transparentCandidates(context.Background())
-	if errCandidates != nil || len(candidates) == 0 {
-		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false, Reason: "no_eligible_grok_candidate"})
 	}
 	return okEnvelope(pluginapi.ModelRouteResponse{
 		Handled:    true,
@@ -143,17 +133,12 @@ func (p *Plugin) transparentExecute(ctx context.Context, req rpcExecutorRequest)
 	if errRequest != nil {
 		return transparentResult{}, errRequest
 	}
-	if !safeReplayRequest(body, sourceFormat, firstNonEmpty(req.Model, req.Alt)) {
-		return transparentResult{}, fmt.Errorf("request is not safely replayable")
-	}
+	replayable := safeReplayRequest(body, sourceFormat, firstNonEmpty(req.Model, req.Alt))
 	candidates, errCandidates := p.transparentCandidates(ctx)
 	if errCandidates != nil {
 		return transparentResult{}, errCandidates
 	}
-	maxAttempts := policy.Quality.MaxAttempts
-	if maxAttempts <= 0 {
-		maxAttempts = 6
-	}
+	maxAttempts := transparentMaxAttempts(policy, replayable)
 	attempts := 0
 	last := transparentResult{}
 	for _, candidate := range candidates {
@@ -177,7 +162,7 @@ func (p *Plugin) transparentExecute(ctx context.Context, req rpcExecutorRequest)
 				last = result
 			}
 			_ = p.recordAttemptError(account.ID, class, errAttempt)
-			if attempts < maxAttempts && !rotated {
+			if replayable && attempts < maxAttempts && !rotated {
 				didRotate, errRotate := p.rotateAfterFailure(ctx, account.ID, class)
 				if errRotate == nil && didRotate {
 					rotated = true
@@ -205,17 +190,12 @@ func (p *Plugin) transparentExecuteBufferedStream(ctx context.Context, req rpcEx
 	if errRequest != nil {
 		return transparentResult{}, errRequest
 	}
-	if !safeReplayRequest(body, sourceFormat, firstNonEmpty(req.Model, req.Alt)) {
-		return transparentResult{}, fmt.Errorf("request is not safely replayable")
-	}
+	replayable := safeReplayRequest(body, sourceFormat, firstNonEmpty(req.Model, req.Alt))
 	candidates, errCandidates := p.transparentCandidates(ctx)
 	if errCandidates != nil {
 		return transparentResult{}, errCandidates
 	}
-	maxAttempts := policy.Quality.MaxAttempts
-	if maxAttempts <= 0 {
-		maxAttempts = 6
-	}
+	maxAttempts := transparentMaxAttempts(policy, replayable)
 	attempts := 0
 	last := transparentResult{}
 	for _, candidate := range candidates {
@@ -239,7 +219,7 @@ func (p *Plugin) transparentExecuteBufferedStream(ctx context.Context, req rpcEx
 				last = result
 			}
 			_ = p.recordAttemptError(account.ID, class, errAttempt)
-			if attempts < maxAttempts && !rotated {
+			if replayable && attempts < maxAttempts && !rotated {
 				didRotate, errRotate := p.rotateAfterFailure(ctx, account.ID, class)
 				if errRotate == nil && didRotate {
 					rotated = true
@@ -315,7 +295,8 @@ func (p *Plugin) executeTransparentBufferedAttempt(ctx context.Context, executio
 			analyzer.ObserveChunk(read.Payload)
 			chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: append([]byte(nil), read.Payload...)})
 			if bufferBytes > cfg.HoldMaxBufferBytes {
-				_ = p.recordAttemptError(execution.AuthID, "", fmt.Errorf("hold buffer overflow"))
+				reason := fmt.Sprintf("transparent hold buffer exceeded %d bytes", cfg.HoldMaxBufferBytes)
+				return transparentResult{}, QualityVerdict{Action: QualityActionWithhold, Class: ClassProbeError, Reason: reason}, fmt.Errorf("%s", reason)
 			}
 		}
 		if read.Error != "" {
@@ -358,19 +339,13 @@ func (p *Plugin) runTransparentStreamBridge(ctx context.Context, req rpcExecutor
 		p.closePluginStream(streamID, "invalid_request", "request body is empty", http.StatusBadRequest)
 		return
 	}
-	if !safeReplayRequest(body, sourceFormat, firstNonEmpty(req.Model, req.Alt)) {
-		p.closePluginStream(streamID, "request_not_safely_replayable", "request is not safely replayable", http.StatusBadRequest)
-		return
-	}
+	replayable := safeReplayRequest(body, sourceFormat, firstNonEmpty(req.Model, req.Alt))
 	candidates, errCandidates := p.transparentCandidates(ctx)
 	if errCandidates != nil {
 		p.closePluginStream(streamID, "quality_degraded", "no healthy Grok account produced a valid response", http.StatusServiceUnavailable)
 		return
 	}
-	maxAttempts := policy.Quality.MaxAttempts
-	if maxAttempts <= 0 {
-		maxAttempts = 6
-	}
+	maxAttempts := transparentMaxAttempts(policy, replayable)
 	attempts := 0
 	last := transparentStreamAttempt{}
 	for _, candidate := range candidates {
@@ -410,7 +385,7 @@ func (p *Plugin) runTransparentStreamBridge(ctx context.Context, req rpcExecutor
 				last = outcome
 			}
 			_ = p.recordAttemptError(account.ID, class, outcome.Err)
-			if attempts < maxAttempts && !rotated {
+			if replayable && attempts < maxAttempts && !rotated {
 				didRotate, errRotate := p.rotateAfterFailure(ctx, account.ID, class)
 				if errRotate == nil && didRotate {
 					rotated = true
@@ -481,7 +456,7 @@ func (p *Plugin) executeTransparentStreamAttempt(ctx context.Context, execution 
 
 	for {
 		var timerC <-chan time.Time
-		if !emitted && !holdExpired {
+		if reasoningNeeded && !emitted && !holdExpired {
 			timerC = holdTimer.C
 		}
 		select {
@@ -489,15 +464,6 @@ func (p *Plugin) executeTransparentStreamAttempt(ctx context.Context, execution 
 			return transparentStreamAttempt{Class: ClassProbeError, Verdict: QualityVerdict{Class: ClassProbeError, Reason: sanitizeError(ctx.Err())}, Err: ctx.Err(), Emitted: emitted}
 		case <-timerC:
 			holdExpired = true
-			if !reasoningNeeded {
-				if errEmit := p.emitPluginChunks(streamID, buffer); errEmit != nil {
-					return transparentStreamAttempt{Class: ClassProbeError, Verdict: QualityVerdict{Class: ClassProbeError, Reason: sanitizeError(errEmit)}, Err: errEmit, Available: true}
-				}
-				emitted = true
-				buffer = nil
-				bufferBytes = 0
-				continue
-			}
 			preview := analyzer.Preview()
 			preview.HoldExpired = true
 			verdict := ClassifyQualityHold(preview, cfg.MinHoldOutputTokens)
@@ -547,6 +513,10 @@ func (p *Plugin) executeTransparentStreamAttempt(ctx context.Context, execution 
 				} else {
 					buffer = append(buffer, payload)
 					bufferBytes += int64(len(payload))
+					if bufferBytes > cfg.HoldMaxBufferBytes {
+						reason := fmt.Sprintf("transparent hold buffer exceeded %d bytes", cfg.HoldMaxBufferBytes)
+						return transparentStreamAttempt{Class: ClassProbeError, Verdict: QualityVerdict{Action: QualityActionWithhold, Class: ClassProbeError, Reason: reason}, Err: fmt.Errorf("%s", reason), Buffered: buffer, Available: true}
+					}
 				}
 				analyzer.ObserveChunk(payload)
 			}
@@ -580,12 +550,6 @@ func (p *Plugin) executeTransparentStreamAttempt(ctx context.Context, execution 
 				continue
 			}
 			if !reasoningNeeded {
-				if errEmit := p.emitPluginChunks(streamID, buffer); errEmit != nil {
-					return transparentStreamAttempt{Class: ClassProbeError, Verdict: QualityVerdict{Class: ClassProbeError, Reason: sanitizeError(errEmit)}, Err: errEmit, Available: true}
-				}
-				emitted = true
-				buffer = nil
-				bufferBytes = 0
 				continue
 			}
 			preview := analyzer.Preview()
@@ -603,15 +567,6 @@ func (p *Plugin) executeTransparentStreamAttempt(ctx context.Context, execution 
 				bufferBytes = 0
 				continue
 			}
-			if bufferBytes > cfg.HoldMaxBufferBytes {
-				_ = p.recordAttemptError(execution.AuthID, "", fmt.Errorf("hold buffer overflow"))
-				if errEmit := p.emitPluginChunks(streamID, buffer); errEmit != nil {
-					return transparentStreamAttempt{Class: ClassProbeError, Verdict: QualityVerdict{Class: ClassProbeError, Reason: sanitizeError(errEmit)}, Err: errEmit, Available: true}
-				}
-				emitted = true
-				buffer = nil
-				bufferBytes = 0
-			}
 		}
 	}
 }
@@ -625,6 +580,17 @@ func (p *Plugin) executableAuth(ctx context.Context, authID string) (Account, ma
 		return Account{}, nil, false
 	}
 	return account, raw, true
+}
+
+func transparentMaxAttempts(policy Policy, replayable bool) int {
+	if !replayable {
+		return 1
+	}
+	maxAttempts := policy.Quality.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = 6
+	}
+	return maxAttempts
 }
 
 func executorRequestInput(req rpcExecutorRequest) ([]byte, string, error) {
@@ -710,9 +676,6 @@ func (p *Plugin) transparentCandidates(ctx context.Context) ([]Account, error) {
 		}
 		stateAccount, okState := p.stateAccount(account.ID)
 		if okState && isIsolatedState(stateAccount.State) {
-			continue
-		}
-		if p.isProbeAuth(account.ID) {
 			continue
 		}
 		candidates = append(candidates, account)
@@ -1056,24 +1019,6 @@ func reasoningDisabledBody(payload map[string]any) bool {
 		}
 	}
 	return false
-}
-
-func metadataBool(metadata map[string]any, key string) bool {
-	if metadata == nil {
-		return false
-	}
-	value, ok := metadata[key]
-	if !ok {
-		return false
-	}
-	switch typed := value.(type) {
-	case bool:
-		return typed
-	case string:
-		return strings.EqualFold(strings.TrimSpace(typed), "true") || strings.TrimSpace(typed) == "1"
-	default:
-		return false
-	}
 }
 
 func recentWithin(value, now time.Time, window time.Duration) time.Time {

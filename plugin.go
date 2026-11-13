@@ -56,6 +56,9 @@ type Plugin struct {
 	catalog   []Account
 	catalogAt time.Time
 
+	authModelsMu sync.RWMutex
+	grokModels   map[string]struct{}
+
 	accountLocksMu sync.Mutex
 	accountLocks   map[string]*sync.Mutex
 
@@ -95,6 +98,7 @@ func NewPlugin() *Plugin {
 		modelStreams:         make(map[string]struct{}),
 		tasks:                make(map[string]*taskRecord),
 		probing:              make(map[string]struct{}),
+		grokModels:           make(map[string]struct{}),
 		resinLeaseDeleteWake: make(chan struct{}, 1),
 	}
 	plugin.probeCond = sync.NewCond(&plugin.probeGate)
@@ -353,6 +357,9 @@ func (p *Plugin) RefreshCatalog(_ context.Context) error {
 	p.catalog = accounts
 	p.catalogAt = time.Now().UTC()
 	p.catalogMu.Unlock()
+	if authModels, errModels := p.listAuthModels(); errModels == nil {
+		p.setGrokAuthModels(authModels)
+	}
 	_ = p.syncCatalogState(accounts)
 	return nil
 }

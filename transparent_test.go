@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -59,11 +60,41 @@ func streamRequestForTest() rpcExecutorRequest {
 	}
 }
 
+func nonReasoningStreamRequestForTest() rpcExecutorRequest {
+	body := []byte(`{"model":"grok-composer-2.5-fast","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	return rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           "grok-composer-2.5-fast",
+			Format:          "codex",
+			SourceFormat:    "codex",
+			Stream:          true,
+			OriginalRequest: body,
+			Headers:         http.Header{"Content-Type": []string{"application/json"}},
+		},
+		HostCallbackID: "callback-non-reasoning",
+	}
+}
+
 func enableTransparentForTest(cfg *Config) {
 	cfg.TransparentGuard = true
 	cfg.PassiveGuard = true
 	cfg.Quality.SoftTPS = 1e9
 	cfg.Quality.HardTPS = 2e9
+}
+
+func TestTransparentCandidatesIncludeProbeMarkedAccount(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	plugin := newTestPlugin(t, host, enableTransparentForTest)
+	plugin.markProbeAuth("auth-1", time.Minute)
+
+	candidates, errCandidates := plugin.transparentCandidates(context.Background())
+	if errCandidates != nil {
+		t.Fatal(errCandidates)
+	}
+	if len(candidates) != 1 || candidates[0].ID != "auth-1" {
+		t.Fatalf("probe-marked account was excluded from transparent candidates: %#v", candidates)
+	}
 }
 
 func TestTransparentStreamFailsOverBeforeEmit(t *testing.T) {
@@ -136,19 +167,88 @@ func TestTransparentStreamFailOpenEmitsLastBufferedResponse(t *testing.T) {
 	}
 }
 
-func TestTransparentStreamRejectsUnsafeRequest(t *testing.T) {
-	entries, auths := singleGrokAuth(t, "auth-1", "alice@example.com", nil)
+func TestTransparentStreamUnsafeRequestUsesSingleAttempt(t *testing.T) {
+	entries, auths := twoGrokAuths(t)
 	host := newMockHostCall(entries, auths)
+	host.scriptStream("auth-1", badStreamScript()...)
+	host.scriptStream("auth-2", goodStreamScript()...)
 	plugin := newTestPlugin(t, host, enableTransparentForTest)
 	req := streamRequestForTest()
 	req.OriginalRequest = []byte(`{"model":"grok-4.5","previous_response_id":"resp_1"}`)
 	plugin.runTransparentStreamBridge(context.Background(), req, "plugin-stream-4")
 	detail := host.closes["plugin-stream-4"]
-	if detail == nil || detail.Code != "request_not_safely_replayable" || detail.HTTPStatus != http.StatusBadRequest {
+	if detail == nil || detail.Code != "quality_degraded" || detail.HTTPStatus != http.StatusServiceUnavailable {
 		t.Fatalf("unexpected close detail: %#v", detail)
 	}
-	if len(host.modelCalls) != 0 {
-		t.Fatal("unsafe request reached the host model executor")
+	if len(host.modelCalls) != 1 {
+		t.Fatalf("unsafe request used %d attempts, want 1", len(host.modelCalls))
+	}
+	if len(host.emitted["plugin-stream-4"]) != 0 {
+		t.Fatal("unsafe request emitted degraded content")
+	}
+}
+
+func TestTransparentNonReasoningStreamDelivered(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	host.scriptStream("auth-1",
+		streamData("data: {\"choices\":[{\"delta\":{\"content\":\"plain answer without any reasoning content at all\"}}]}\n\n"),
+		streamData("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":12}}\n\n"),
+		pluginapi.HostModelStreamReadResponse{Done: true},
+	)
+	plugin := newTestPlugin(t, host, enableTransparentForTest)
+	plugin.runTransparentStreamBridge(context.Background(), nonReasoningStreamRequestForTest(), "plugin-stream-non-reasoning")
+
+	var joined strings.Builder
+	for _, payload := range host.emitted["plugin-stream-non-reasoning"] {
+		joined.Write(payload)
+	}
+	if !strings.Contains(joined.String(), "plain answer without any reasoning content at all") {
+		t.Fatalf("non-reasoning stream was not delivered: %s", joined.String())
+	}
+	if detail := host.closes["plugin-stream-non-reasoning"]; detail != nil {
+		t.Fatalf("non-reasoning stream closed with error: %#v", detail)
+	}
+	if len(host.modelCalls) != 1 {
+		t.Fatalf("non-reasoning stream used %d attempts, want 1", len(host.modelCalls))
+	}
+}
+
+func TestTransparentNonReasoningEmptyStreamRejected(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	host.scriptStream("auth-1", pluginapi.HostModelStreamReadResponse{Done: true})
+	plugin := newTestPlugin(t, host, enableTransparentForTest)
+	plugin.runTransparentStreamBridge(context.Background(), nonReasoningStreamRequestForTest(), "plugin-stream-non-reasoning-empty")
+
+	if len(host.emitted["plugin-stream-non-reasoning-empty"]) != 0 {
+		t.Fatalf("empty stream emitted content: %#v", host.emitted["plugin-stream-non-reasoning-empty"])
+	}
+	detail := host.closes["plugin-stream-non-reasoning-empty"]
+	if detail == nil || detail.Code != "quality_degraded" || detail.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("unexpected close detail: %#v", detail)
+	}
+}
+
+func TestTransparentStreamBufferOverflowRejectedBeforeEmit(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	host.scriptStream("auth-1",
+		streamData("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"),
+		pluginapi.HostModelStreamReadResponse{Done: true},
+	)
+	plugin := newTestPlugin(t, host, func(cfg *Config) {
+		enableTransparentForTest(cfg)
+		cfg.Quality.HoldMaxBufferBytes = 1
+	})
+	plugin.runTransparentStreamBridge(context.Background(), nonReasoningStreamRequestForTest(), "plugin-stream-buffer-overflow")
+
+	if len(host.emitted["plugin-stream-buffer-overflow"]) != 0 {
+		t.Fatalf("buffer overflow emitted content: %s", host.emitted["plugin-stream-buffer-overflow"])
+	}
+	detail := host.closes["plugin-stream-buffer-overflow"]
+	if detail == nil || detail.Code != "quality_degraded" || detail.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("unexpected close detail: %#v", detail)
 	}
 }
 
@@ -213,8 +313,8 @@ func TestRouteModelSafetyAndCandidateChecks(t *testing.T) {
 	encoded, _ = json.Marshal(request)
 	raw, _ = plugin.RouteModel(encoded)
 	_ = json.Unmarshal(raw, &routeEnvelope)
-	if routeEnvelope.Result.Handled {
-		t.Fatal("unsafe MCP request was routed to the transparent executor")
+	if !routeEnvelope.Result.Handled {
+		t.Fatal("unsafe MCP request bypassed the transparent gate")
 	}
 }
 
@@ -329,7 +429,7 @@ func TestTransparentNonStreamResponsesThinkingDelivered(t *testing.T) {
 	}
 }
 
-func TestRouteModelUsesBodyModelAndSkipsIneligibleRequests(t *testing.T) {
+func TestRouteModelUsesBodyModelAndHandlesAllGrokRequests(t *testing.T) {
 	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
 	host := newMockHostCall(entries, auths)
 	plugin := newTestPlugin(t, host, enableTransparentForTest)
@@ -362,10 +462,73 @@ func TestRouteModelUsesBodyModelAndSkipsIneligibleRequests(t *testing.T) {
 	if result := route("", `{"model":"grok-4.6","input":"hi","reasoning":{"effort":"medium"}}`); !result.Handled {
 		t.Fatalf("body model fallback was not used: %#v", result)
 	}
-	if result := route("grok-composer-2.5-fast", `{"model":"grok-composer-2.5-fast","input":"hi"}`); result.Handled || result.Reason != "reasoning_not_required" {
-		t.Fatalf("non-reasoning model was routed: %#v", result)
+	if result := route("grok-composer-2.5-fast", `{"model":"grok-composer-2.5-fast","input":"hi"}`); !result.Handled {
+		t.Fatalf("non-reasoning Grok model bypassed the transparent gate: %#v", result)
 	}
-	if result := route("grok-4.6", `{"model":"grok-4.6","input":"hi","reasoning_effort":"none"}`); result.Handled || result.Reason != "reasoning_not_required" {
-		t.Fatalf("reasoning-disabled request was routed: %#v", result)
+	if result := route("grok-4.6", `{"model":"grok-4.6","input":"hi","reasoning_effort":"none"}`); !result.Handled {
+		t.Fatalf("reasoning-disabled Grok request bypassed the transparent gate: %#v", result)
+	}
+	if result := route("claude-sonnet-4-5", `{"model":"claude-sonnet-4-5","input":"hi"}`); result.Handled {
+		t.Fatalf("non-Grok request was routed: %#v", result)
+	}
+}
+
+func TestRouteModelUsesXAIAuthModelAlias(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	host.authModels = []pluginapi.HostAuthModels{{
+		ID:       "auth-1",
+		Provider: "xai",
+		Models:   []string{"vendor-thinking-pro"},
+	}}
+	plugin := newTestPlugin(t, host, enableTransparentForTest)
+	request := rpcModelRouteRequest{ModelRouteRequest: pluginapi.ModelRouteRequest{
+		SourceFormat:   "openai-response",
+		RequestedModel: "vendor-thinking-pro",
+		Stream:         true,
+		Body:           []byte(`{"model":"vendor-thinking-pro","input":"hi"}`),
+	}}
+	encoded, _ := json.Marshal(request)
+	raw, errRoute := plugin.RouteModel(encoded)
+	if errRoute != nil {
+		t.Fatal(errRoute)
+	}
+	var envelope struct {
+		OK     bool                         `json:"ok"`
+		Result pluginapi.ModelRouteResponse `json:"result"`
+	}
+	if errUnmarshal := json.Unmarshal(raw, &envelope); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if !envelope.OK || !envelope.Result.Handled {
+		t.Fatalf("xAI auth model alias was not routed: %s", raw)
+	}
+}
+
+func TestRouteModelHomeMetadataDoesNotBypassGate(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	plugin := newTestPlugin(t, host, enableTransparentForTest)
+	request := rpcModelRouteRequest{ModelRouteRequest: pluginapi.ModelRouteRequest{
+		SourceFormat:   "openai-response",
+		RequestedModel: "grok-4.6",
+		Stream:         true,
+		Body:           []byte(`{"model":"grok-4.6","input":"hi"}`),
+		Metadata:       map[string]any{"home_mode": true, "home": true},
+	}}
+	encoded, _ := json.Marshal(request)
+	raw, errRoute := plugin.RouteModel(encoded)
+	if errRoute != nil {
+		t.Fatal(errRoute)
+	}
+	var envelope struct {
+		OK     bool                         `json:"ok"`
+		Result pluginapi.ModelRouteResponse `json:"result"`
+	}
+	if errUnmarshal := json.Unmarshal(raw, &envelope); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if !envelope.OK || !envelope.Result.Handled {
+		t.Fatalf("home metadata bypassed the transparent gate: %s", raw)
 	}
 }

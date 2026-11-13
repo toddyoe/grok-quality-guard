@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"strings"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 const (
@@ -48,6 +50,43 @@ func isGrokModel(model string, prefixes []string) bool {
 		}
 	}
 	return strings.Contains(normalized, "grok")
+}
+
+func (p *Plugin) isGrokRouteModel(model string) bool {
+	if p == nil {
+		return false
+	}
+	p.mu.RLock()
+	prefixes := append([]string(nil), p.policy.ModelPrefixes...)
+	p.mu.RUnlock()
+	if isGrokModel(model, prefixes) {
+		return true
+	}
+	slug := normalizeGrokModelSlug(model)
+	if slug == "" {
+		return false
+	}
+	p.authModelsMu.RLock()
+	_, ok := p.grokModels[slug]
+	p.authModelsMu.RUnlock()
+	return ok
+}
+
+func (p *Plugin) setGrokAuthModels(credentials []pluginapi.HostAuthModels) {
+	models := make(map[string]struct{})
+	for _, credential := range credentials {
+		if !isGrokProvider(credential.Provider) {
+			continue
+		}
+		for _, model := range credential.Models {
+			if slug := normalizeGrokModelSlug(model); slug != "" {
+				models[slug] = struct{}{}
+			}
+		}
+	}
+	p.authModelsMu.Lock()
+	p.grokModels = models
+	p.authModelsMu.Unlock()
 }
 
 // modelReasoningSupport infers reasoning capability from the model name instead

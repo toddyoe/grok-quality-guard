@@ -283,6 +283,54 @@ func TestPassiveAuditFlagsMissingThinkingForReasoningRequest(t *testing.T) {
 	}
 }
 
+func TestProbeWindowDoesNotDropRealPassiveUsage(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	plugin := newTestPlugin(t, host, nil)
+
+	analyzer := NewStreamAnalyzer()
+	analyzer.ObserveChunk([]byte(`data: {"type":"response.output_text.delta","delta":"` + strings.Repeat("visible ", 64) + `"}` + "\n\n"))
+	plugin.pendingMu.Lock()
+	plugin.pending["real-request"] = &PendingObservation{
+		RequestID: "real-request",
+		Body:      []byte(`{"model":"grok-4.7","reasoning":{"effort":"xhigh"}}`),
+		Analyzer:  analyzer,
+		StartedAt: time.Now(),
+		Source:    "stream",
+		Model:     "grok-4.7",
+	}
+	plugin.pendingMu.Unlock()
+	plugin.markProbeAuth("auth-1", 3*time.Minute)
+
+	record := pluginapi.UsageRecord{
+		AuthID:          "auth-1",
+		RequestID:       "real-request",
+		Provider:        "xai",
+		Model:           "grok-4.7",
+		ReasoningEffort: "xhigh",
+		Stream:          true,
+		TTFT:            1700 * time.Millisecond,
+		Latency:         3554 * time.Millisecond,
+		Detail: pluginapi.UsageDetail{
+			OutputTokens:    99,
+			ReasoningTokens: 0,
+		},
+	}
+	raw, errMarshal := json.Marshal(record)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	plugin.HandleUsage(raw)
+
+	account, ok := plugin.stateAccount("auth-1")
+	if !ok || account.LastAttempt == nil {
+		t.Fatalf("real usage during probe window was not recorded: %#v", account)
+	}
+	if account.LastAttempt.Class != ClassMissingThinking {
+		t.Fatalf("real usage class = %q, want %q", account.LastAttempt.Class, ClassMissingThinking)
+	}
+}
+
 func TestPassiveUsageFlagsReasoningRequestWithoutThinking(t *testing.T) {
 	entries, auths := singleGrokAuth(t, "auth-1", "user@example.com", nil)
 	host := newMockHostCall(entries, auths)
