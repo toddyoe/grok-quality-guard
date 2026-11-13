@@ -6,7 +6,7 @@
       "name": "Grok Quality Guard",
       "description": "Grok account quality guard with passive detection and transparent retry/failover",
       "author": "grok-quality-guard contributors",
-      "version": "0.1.4",
+      "version": "0.1.5",
       "repository": "https://github.com/toddyoe/grok-quality-guard",
       "logo": "https://raw.githubusercontent.com/toddyoe/grok-quality-guard/main/assets/logo.png",
       "homepage": "https://github.com/toddyoe/grok-quality-guard#readme",
