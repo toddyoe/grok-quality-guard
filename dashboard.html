@@ -796,6 +796,15 @@
       min-width: 980px;
     }
 
+    .accounts-table {
+      table-layout: fixed;
+      min-width: 1120px;
+    }
+
+    .accounts-table .actions-cell {
+      width: 160px;
+    }
+
     th,
     td {
       padding: 10px 12px;
@@ -838,6 +847,19 @@
       color: var(--subtle);
       font-size: 10px;
       font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    }
+
+    .truncate-line {
+      display: block;
+      min-width: 0;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .truncate-line[title] {
+      cursor: help;
     }
 
     .mono {
@@ -1764,7 +1786,17 @@
             </div>
           </div>
           <div class="table-wrap">
-            <table>
+            <table class="accounts-table">
+              <colgroup>
+                <col style="width:36px">
+                <col style="width:15%">
+                <col style="width:72px">
+                <col style="width:32%">
+                <col style="width:11%">
+                <col style="width:9%">
+                <col style="width:11%">
+                <col style="width:160px">
+              </colgroup>
               <thead>
                 <tr>
                   <th class="select-cell"><input id="accountSelectAll" type="checkbox" aria-label="选择本页全部账号"></th>
@@ -2794,8 +2826,9 @@
       const cooldown = account.cooldown_until ? '冷却至：' + esc(formatFullTime(account.cooldown_until)) : '无冷却';
       const probe = account.probe_backoff_until ? '探测退避至：' + esc(formatFullTime(account.probe_backoff_until)) : '可立即探测';
       const attemptDetail = account.last_attempt ? '最近尝试：' + attemptLabel(account.last_attempt, { includeTime: false }) : '最近观测：' + formatTime(account.last_observed_at);
+      const reasonSummary = reasonLabel(account.last_reason);
       return '<tr><td class="select-cell"><input type="checkbox" data-account-select="' + authID + '" aria-label="选择账号" ' + (selected ? 'checked' : '') + '></td>' +
-        '<td><div class="account-name" title="' + esc(account.display_full || account.display || account.label || '未命名账号') + '">' + esc(account.display || account.label || '未命名账号') + '</div><div class="subline" title="' + esc(account.auth_id) + '">' + esc(account.auth_id_display || account.auth_id) + '</div></td><td class="nowrap">' + badge(stateLabel(account.state), stateTone(account.state)) + '</td><td><div>' + esc(reasonLabel(account.last_reason)) + '</div><div class="subline">' + esc(attemptDetail) + '</div></td><td><div class="metric-inline"><strong>' + esc(num(account.tps, 1)) + '</strong><span class="muted">TPS</span></div><div class="subline">输出：' + esc(num(account.output_tokens)) + ' · 推理：' + esc(num(account.reasoning_tokens)) + ' · 密文：' + esc(formatBytes(account.encrypted_bytes)) + '</div></td><td>' + resin + resinDetail + '</td><td><div>' + cooldown + '</div><div class="subline">' + probe + '</div></td><td class="actions-cell"><div class="actions"><button class="btn btn-xs" type="button" data-account-action="accounts.probe" data-auth="' + authID + '">' + icon('play') + '检测</button><button class="btn btn-xs" type="button" data-open-account="' + authID + '">' + icon('eye') + '详情</button></div></td></tr>';
+        '<td><div class="account-name" title="' + esc(account.display_full || account.display || account.label || '未命名账号') + '">' + esc(account.display || account.label || '未命名账号') + '</div><div class="subline" title="' + esc(account.auth_id) + '">' + esc(account.auth_id_display || account.auth_id) + '</div></td><td class="nowrap">' + badge(stateLabel(account.state), stateTone(account.state)) + '</td><td><div class="truncate-line" title="' + esc(reasonSummary) + '">' + esc(reasonSummary) + '</div><div class="subline truncate-line" title="' + esc(attemptDetail) + '">' + esc(attemptDetail) + '</div></td><td><div class="metric-inline"><strong>' + esc(num(account.tps, 1)) + '</strong><span class="muted">TPS</span></div><div class="subline">输出：' + esc(num(account.output_tokens)) + ' · 推理：' + esc(num(account.reasoning_tokens)) + ' · 密文：' + esc(formatBytes(account.encrypted_bytes)) + '</div></td><td>' + resin + resinDetail + '</td><td><div>' + cooldown + '</div><div class="subline">' + probe + '</div></td><td class="actions-cell"><div class="actions"><button class="btn btn-xs" type="button" data-account-action="accounts.probe" data-auth="' + authID + '">' + icon('play') + '检测</button><button class="btn btn-xs" type="button" data-open-account="' + authID + '">' + icon('eye') + '详情</button></div></td></tr>';
     }
     function leaseStatus(account) {
       if (account.resin_managed || account.proxy_status === 'bound') return 'bound';
