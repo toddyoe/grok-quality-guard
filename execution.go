@@ -77,8 +77,12 @@ func (p *Plugin) RouteModel(request []byte) ([]byte, error) {
 	if isProbeHeader(req.Headers) || metadataBool(req.Metadata, "home_mode") || metadataBool(req.Metadata, "home") {
 		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false, Reason: "internal_or_home_request"})
 	}
-	if !isGrokModel(firstNonEmpty(req.RequestedModel, asString(req.Metadata["model"])), policy.ModelPrefixes) {
+	requestedModel := firstNonEmpty(req.RequestedModel, asString(req.Metadata["model"]), modelFromRequestBody(req.Body))
+	if !isGrokModel(requestedModel, policy.ModelPrefixes) {
 		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false, Reason: "not_grok_model"})
+	}
+	if !reasoningRequiredForModel(requestedModel, req.Body) {
+		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false, Reason: "reasoning_not_required"})
 	}
 	if !safeReplayRequest(req.Body, req.SourceFormat, req.RequestedModel) {
 		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false, Reason: "request_not_safely_replayable"})
@@ -272,7 +276,7 @@ func (p *Plugin) executeTransparentOnce(ctx context.Context, execution pluginapi
 	sig.DurationMS = time.Since(startedAt).Milliseconds()
 	sig.GenerationMS = generationWindowMS(sig.DurationMS, sig.FirstTokenMS, sig.ReasoningTokens)
 	sig.TPS = tps(sig.OutputTokens, sig.GenerationMS)
-	verdict := classifyNonStreamResult(sig, cfg, reasoningRequired(requestBody), cfg.MinPassiveOutputTokens)
+	verdict := classifyNonStreamResult(sig, cfg, reasoningRequiredForModel(execution.Model, requestBody), cfg.MinHoldOutputTokens)
 	result := transparentResult{Payload: response.Body, Headers: response.Headers, Available: true}
 	if verdict.Class == ClassNone {
 		_ = p.ApplyVerdict(ctx, execution.AuthID, verdict, "transparent", callbackID)
@@ -324,7 +328,7 @@ func (p *Plugin) executeTransparentBufferedAttempt(ctx context.Context, executio
 		}
 	}
 	sig := analyzer.Finalize(true)
-	verdict := classifyFinal(sig, cfg, reasoningRequired(requestBody), cfg.MinHoldOutputTokens, true)
+	verdict := classifyFinal(sig, cfg, reasoningRequiredForModel(execution.Model, requestBody), cfg.MinHoldOutputTokens, true)
 	result := transparentResult{Headers: stream.Headers, Chunks: chunks, Available: true}
 	if verdict.Class == ClassNone {
 		_ = p.ApplyVerdict(ctx, execution.AuthID, verdict, "transparent", callbackID)
@@ -473,7 +477,7 @@ func (p *Plugin) executeTransparentStreamAttempt(ctx context.Context, execution 
 	emitted := false
 	buffer := make([][]byte, 0)
 	var bufferBytes int64
-	reasoningNeeded := reasoningRequired(requestBody)
+	reasoningNeeded := reasoningRequiredForModel(execution.Model, requestBody)
 
 	for {
 		var timerC <-chan time.Time
@@ -485,6 +489,15 @@ func (p *Plugin) executeTransparentStreamAttempt(ctx context.Context, execution 
 			return transparentStreamAttempt{Class: ClassProbeError, Verdict: QualityVerdict{Class: ClassProbeError, Reason: sanitizeError(ctx.Err())}, Err: ctx.Err(), Emitted: emitted}
 		case <-timerC:
 			holdExpired = true
+			if !reasoningNeeded {
+				if errEmit := p.emitPluginChunks(streamID, buffer); errEmit != nil {
+					return transparentStreamAttempt{Class: ClassProbeError, Verdict: QualityVerdict{Class: ClassProbeError, Reason: sanitizeError(errEmit)}, Err: errEmit, Available: true}
+				}
+				emitted = true
+				buffer = nil
+				bufferBytes = 0
+				continue
+			}
 			preview := analyzer.Preview()
 			preview.HoldExpired = true
 			verdict := ClassifyQualityHold(preview, cfg.MinHoldOutputTokens)
@@ -566,6 +579,15 @@ func (p *Plugin) executeTransparentStreamAttempt(ctx context.Context, execution 
 			if emitted {
 				continue
 			}
+			if !reasoningNeeded {
+				if errEmit := p.emitPluginChunks(streamID, buffer); errEmit != nil {
+					return transparentStreamAttempt{Class: ClassProbeError, Verdict: QualityVerdict{Class: ClassProbeError, Reason: sanitizeError(errEmit)}, Err: errEmit, Available: true}
+				}
+				emitted = true
+				buffer = nil
+				bufferBytes = 0
+				continue
+			}
 			preview := analyzer.Preview()
 			preview.HoldExpired = holdExpired
 			holdVerdict := ClassifyQualityHold(preview, cfg.MinHoldOutputTokens)
@@ -621,7 +643,7 @@ func executorRequestInput(req rpcExecutorRequest) ([]byte, string, error) {
 }
 
 func buildHostExecution(req rpcExecutorRequest, body []byte, sourceFormat, authID, proxyURL string, stream bool) pluginapi.HostModelExecutionRequest {
-	model := firstNonEmpty(req.Model, asString(req.Metadata["model"]), req.Alt)
+	model := firstNonEmpty(req.Model, asString(req.Metadata["model"]), modelFromRequestBody(body), req.Alt)
 	return pluginapi.HostModelExecutionRequest{
 		EntryProtocol:  sourceFormat,
 		ExitProtocol:   sourceFormat,

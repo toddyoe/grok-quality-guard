@@ -22,31 +22,33 @@ type mockHostCall struct {
 	saves   map[string]json.RawMessage
 	saveErr error
 
-	nextStream    int
-	streams       map[string][]pluginapi.HostModelStreamReadResponse
-	streamScripts map[string][][]pluginapi.HostModelStreamReadResponse
-	streamStatus  map[string]int
-	streamNoID    map[string]bool
-	streamByID    map[string]string
-	emitted       map[string][][]byte
-	closes        map[string]*pluginabi.Error
-	modelCalls    []pluginapi.HostModelExecutionRequest
-	callbacks     []string
-	authGets      []string
+	nextStream     int
+	streams        map[string][]pluginapi.HostModelStreamReadResponse
+	streamScripts  map[string][][]pluginapi.HostModelStreamReadResponse
+	streamStatus   map[string]int
+	streamNoID     map[string]bool
+	streamByID     map[string]string
+	modelResponses map[string]pluginapi.HostModelExecutionResponse
+	emitted        map[string][][]byte
+	closes         map[string]*pluginabi.Error
+	modelCalls     []pluginapi.HostModelExecutionRequest
+	callbacks      []string
+	authGets       []string
 }
 
 func newMockHostCall(entries []pluginapi.HostAuthFileEntry, auths map[string]json.RawMessage) *mockHostCall {
 	return &mockHostCall{
-		entries:       append([]pluginapi.HostAuthFileEntry(nil), entries...),
-		auths:         cloneRawMap(auths),
-		saves:         make(map[string]json.RawMessage),
-		streams:       make(map[string][]pluginapi.HostModelStreamReadResponse),
-		streamScripts: make(map[string][][]pluginapi.HostModelStreamReadResponse),
-		streamStatus:  make(map[string]int),
-		streamNoID:    make(map[string]bool),
-		streamByID:    make(map[string]string),
-		emitted:       make(map[string][][]byte),
-		closes:        make(map[string]*pluginabi.Error),
+		entries:        append([]pluginapi.HostAuthFileEntry(nil), entries...),
+		auths:          cloneRawMap(auths),
+		saves:          make(map[string]json.RawMessage),
+		streams:        make(map[string][]pluginapi.HostModelStreamReadResponse),
+		streamScripts:  make(map[string][][]pluginapi.HostModelStreamReadResponse),
+		streamStatus:   make(map[string]int),
+		streamNoID:     make(map[string]bool),
+		streamByID:     make(map[string]string),
+		modelResponses: make(map[string]pluginapi.HostModelExecutionResponse),
+		emitted:        make(map[string][][]byte),
+		closes:         make(map[string]*pluginabi.Error),
 	}
 }
 
@@ -87,6 +89,12 @@ func (m *mockHostCall) scriptStreamStatusWithoutID(authID string, status int, re
 	m.streamStatus[authID] = status
 	m.streamNoID[authID] = true
 	m.streams[authID] = append([]pluginapi.HostModelStreamReadResponse(nil), reads...)
+}
+
+func (m *mockHostCall) scriptModelResponse(authID string, response pluginapi.HostModelExecutionResponse) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.modelResponses[authID] = response
 }
 
 func (m *mockHostCall) call(method string, payload any) (json.RawMessage, error) {
@@ -147,8 +155,12 @@ func (m *mockHostCall) call(method string, payload any) (json.RawMessage, error)
 		m.mu.Lock()
 		m.modelCalls = append(m.modelCalls, req.HostModelExecutionRequest)
 		m.callbacks = append(m.callbacks, req.HostCallbackID)
+		response, ok := m.modelResponses[req.AuthID]
 		m.mu.Unlock()
-		return marshalTestResult(pluginapi.HostModelExecutionResponse{StatusCode: http.StatusOK, Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: []byte(`{"output_text":"ok"}`)})
+		if !ok {
+			response = pluginapi.HostModelExecutionResponse{StatusCode: http.StatusOK, Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: []byte(`{"output":[]}`)}
+		}
+		return marshalTestResult(response)
 	case pluginabi.MethodHostModelExecuteStream:
 		var req hostModelExecutionRequest
 		if err := json.Unmarshal(encoded, &req); err != nil {

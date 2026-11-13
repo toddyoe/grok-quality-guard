@@ -50,6 +50,79 @@ func isGrokModel(model string, prefixes []string) bool {
 	return strings.Contains(normalized, "grok")
 }
 
+// modelReasoningSupport infers reasoning capability from the model name instead
+// of maintaining a table that must be updated for every model release. Grok 4+
+// text models reason by default; explicit non-reasoning families and aliases
+// override that default. Unknown families stay outside the thinking gate.
+func modelReasoningSupport(model string) (known bool, supports bool) {
+	slug := normalizeGrokModelSlug(model)
+	if slug == "" {
+		return false, false
+	}
+	if isKnownNonReasoningGrokModel(slug) {
+		return true, false
+	}
+	if isReasoningDisabledAlias(slug) {
+		return true, false
+	}
+	if major, ok := grokMajorVersion(slug); ok && major >= 4 {
+		return true, true
+	}
+	// Grok 3 Mini is the only pre-4 family that emits reasoning tokens.
+	if strings.HasPrefix(slug, "grok-3-mini") {
+		return true, true
+	}
+	return false, false
+}
+
+func normalizeGrokModelSlug(model string) string {
+	normalized := strings.ToLower(strings.TrimSpace(model))
+	if idx := strings.LastIndexByte(normalized, '/'); idx >= 0 {
+		normalized = strings.TrimSpace(normalized[idx+1:])
+	}
+	return normalized
+}
+
+func isKnownNonReasoningGrokModel(slug string) bool {
+	switch {
+	case strings.HasPrefix(slug, "grok-composer-"),
+		strings.HasPrefix(slug, "grok-build-"),
+		strings.HasPrefix(slug, "grok-imagine-"):
+		return true
+	}
+	for _, marker := range []string{"non-reasoning", "non_reasoning", "nonreasoning", "no-reasoning"} {
+		if strings.Contains(slug, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isReasoningDisabledAlias(slug string) bool {
+	return strings.HasSuffix(slug, "-none") || strings.HasSuffix(slug, "-off")
+}
+
+func grokMajorVersion(slug string) (int, bool) {
+	const prefix = "grok-"
+	if !strings.HasPrefix(slug, prefix) {
+		return 0, false
+	}
+	rest := slug[len(prefix):]
+	end := 0
+	major := 0
+	for end < len(rest) && rest[end] >= '0' && rest[end] <= '9' {
+		major = major*10 + int(rest[end]-'0')
+		end++
+	}
+	if end == 0 {
+		return 0, false
+	}
+	if end < len(rest) && rest[end] != '.' && rest[end] != '-' && rest[end] != '_' {
+		return 0, false
+	}
+	return major, true
+}
+
 func isConfirmedClass(class string) bool {
 	switch class {
 	case ClassMissingThinking, ClassBufferedBurst, ClassCipherDrool, ClassFakeEncryptedDump, ClassFastReasoningRatio, ClassHardTPS, ClassEmptyStream, ClassExpectedMarkerMissing:

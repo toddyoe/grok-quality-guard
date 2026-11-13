@@ -167,6 +167,75 @@ func TestReasoningDisabledBody(t *testing.T) {
 	}
 }
 
+func TestReasoningEligibilityUsesDynamicModelRules(t *testing.T) {
+	reasoningModels := []string{
+		"Build/grok-4.6-low",
+		"grok-4.6-xhigh",
+		"grok-4.6-max",
+		"grok-4.8",
+		"grok-5.0-xhigh",
+		"grok-4.7-build-fast",
+		"grok-3-mini-fast",
+	}
+	for _, model := range reasoningModels {
+		if !reasoningRequiredForModel(model, []byte(`{"stream":true}`)) {
+			t.Fatalf("model %q should require thinking evidence", model)
+		}
+	}
+
+	nonReasoningModels := []string{
+		"grok-composer-2.5-fast",
+		"grok-composer-3.0-fast",
+		"grok-build-0.1",
+		"grok-imagine-image-2.0",
+		"grok-4.20-0309-non-reasoning",
+		"grok-4.8-non-reasoning",
+		"grok-4.6-none",
+		"grok-2",
+		"custom-grok",
+	}
+	for _, model := range nonReasoningModels {
+		if reasoningRequiredForModel(model, []byte(`{"stream":true}`)) {
+			t.Fatalf("model %q must not use the thinking gate", model)
+		}
+	}
+
+	if reasoningRequiredForModel("grok-4.6", []byte(`{"reasoning_effort":"none"}`)) {
+		t.Fatal("explicitly disabled reasoning must bypass the thinking gate")
+	}
+	if reasoningRequiredForModel("custom-grok", []byte(`{"reasoning_effort":"high"}`)) {
+		t.Fatal("unknown models must stay outside the thinking gate, matching grok2api")
+	}
+	if !reasoningRequiredForModel("vendor-alias", []byte(`{"model":"grok-4.6","stream":true}`)) {
+		t.Fatal("known body model should resolve an unknown requested alias")
+	}
+}
+
+func TestProtocolAliasesAndNonStreamThinkingParsing(t *testing.T) {
+	if got := normalizeQualityProtocol("openai"); got != qualityProtocolChat {
+		t.Fatalf("openai protocol = %q, want %q", got, qualityProtocolChat)
+	}
+	if got := normalizeQualityProtocol("claude"); got != qualityProtocolAnthropic {
+		t.Fatalf("claude protocol = %q, want %q", got, qualityProtocolAnthropic)
+	}
+
+	chat := NewStreamAnalyzerWithProtocol("openai")
+	chat.SetStreaming(false)
+	chat.ObserveJSON([]byte(`{"choices":[{"message":{"content":"answer","reasoning_content":"thought"}}],"usage":{"completion_tokens":10,"completion_tokens_details":{"reasoning_tokens":3}}}`))
+	chatSignals := chat.Finalize(true)
+	if !chatSignals.HasThinking || chatSignals.VisibleTokens == 0 {
+		t.Fatalf("non-stream chat thinking parsing failed: %#v", chatSignals)
+	}
+
+	claude := NewStreamAnalyzerWithProtocol("claude")
+	claude.SetStreaming(false)
+	claude.ObserveJSON([]byte(`{"type":"message","content":[{"type":"thinking","thinking":"thought"},{"type":"text","text":"answer"}],"usage":{"output_tokens":10}}`))
+	claudeSignals := claude.Finalize(true)
+	if !claudeSignals.HasThinking || claudeSignals.VisibleTokens == 0 {
+		t.Fatalf("non-stream claude thinking parsing failed: %#v", claudeSignals)
+	}
+}
+
 func TestSSEParserHandlesHostLineChunks(t *testing.T) {
 	analyzer := NewStreamAnalyzerWithProtocol(qualityProtocolResponses)
 	analyzer.ObserveChunk([]byte("event: response.output_text.delta"))
@@ -203,5 +272,41 @@ func TestSSEParserHandlesBareJSONChatChunks(t *testing.T) {
 	sig := analyzer.Finalize(true)
 	if sig.VisibleText != "QUALITY_OK" || !sig.Terminal || sig.OutputTokens != 40 {
 		t.Fatalf("bare JSON chat chunks were not parsed: %#v", sig)
+	}
+}
+
+func TestResponsesNonStreamThinkingParsing(t *testing.T) {
+	body := []byte(`{"id":"resp_1","object":"response","model":"grok-4.6","output":[{"id":"rs_1","type":"reasoning","summary":[{"type":"summary_text","text":"plan the answer"}]},{"id":"msg_1","type":"message","content":[{"type":"output_text","text":"final answer"}]}],"usage":{"input_tokens":10,"output_tokens":20,"output_tokens_details":{"reasoning_tokens":8}}}`)
+	analyzer := NewStreamAnalyzerWithProtocol("openai-response")
+	analyzer.SetStreaming(false)
+	analyzer.ObserveJSON(body)
+	signals := analyzer.Finalize(true)
+	if !signals.HasThinking || !signals.HasReasoningDelta || signals.VisibleTokens == 0 {
+		t.Fatalf("top-level Responses thinking parsing failed: %#v", signals)
+	}
+	verdict := classifyNonStreamResult(signals, DefaultQualityConfig(), true, 8)
+	if verdict.Class != ClassNone {
+		t.Fatalf("non-stream Responses with thinking was rejected: %#v", verdict)
+	}
+}
+
+func TestResponsesReasoningSummaryDoneIsThinking(t *testing.T) {
+	analyzer := NewStreamAnalyzerWithProtocol(qualityProtocolResponses)
+	analyzer.SetStreaming(false)
+	analyzer.ObserveChunk([]byte("data: {\"type\":\"response.reasoning_summary_text.done\",\"text\":\"plan the answer\"}\n\n"))
+	analyzer.ObserveChunk([]byte("data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"output_tokens\":8}}}\n\n"))
+	signals := analyzer.Finalize(true)
+	if !signals.HasThinking || !signals.HasReasoningDelta {
+		t.Fatalf("reasoning summary done text was not counted as thinking: %#v", signals)
+	}
+}
+
+func TestResponsesNonStreamOutputTextShorthand(t *testing.T) {
+	analyzer := NewStreamAnalyzerWithProtocol("openai-response")
+	analyzer.SetStreaming(false)
+	analyzer.ObserveJSON([]byte(`{"id":"resp_1","object":"response","output_text":"a visible answer","usage":{"output_tokens":20}}`))
+	signals := analyzer.Finalize(true)
+	if signals.VisibleTokens == 0 || isEmptyStream(signals) {
+		t.Fatalf("output_text shorthand was treated as empty: %#v", signals)
 	}
 }

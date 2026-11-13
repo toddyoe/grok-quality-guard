@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
@@ -214,5 +215,157 @@ func TestRouteModelSafetyAndCandidateChecks(t *testing.T) {
 	_ = json.Unmarshal(raw, &routeEnvelope)
 	if routeEnvelope.Result.Handled {
 		t.Fatal("unsafe MCP request was routed to the transparent executor")
+	}
+}
+
+func responsesRequestForTest(model string, stream bool) rpcExecutorRequest {
+	streamText := "false"
+	if stream {
+		streamText = "true"
+	}
+	body := []byte(`{"model":"` + model + `","stream":` + streamText + `,"input":"hi","reasoning":{"effort":"medium"}}`)
+	return rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           model,
+			Format:          "openai-response",
+			SourceFormat:    "openai-response",
+			Stream:          stream,
+			OriginalRequest: body,
+			Headers:         http.Header{"Content-Type": []string{"application/json"}},
+		},
+		HostCallbackID: "callback-responses",
+	}
+}
+
+func goodResponsesStreamScript() []pluginapi.HostModelStreamReadResponse {
+	return []pluginapi.HostModelStreamReadResponse{
+		streamData("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"grok-4.6\"}}\n\n"),
+		streamData("data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[]}}\n\n"),
+		streamData("data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"plan the answer\"}\n\n"),
+		streamData("data: {\"type\":\"response.output_text.delta\",\"delta\":\"good answer\"}\n\n"),
+		streamData("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"output_tokens\":20,\"output_tokens_details\":{\"reasoning_tokens\":8}}}}\n\n"),
+		{Done: true},
+	}
+}
+
+func badResponsesStreamScript() []pluginapi.HostModelStreamReadResponse {
+	return []pluginapi.HostModelStreamReadResponse{
+		streamData("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_bad\",\"model\":\"grok-4.6\"}}\n\n"),
+		streamData("data: {\"type\":\"response.output_text.delta\",\"delta\":\"bad answer bad answer bad answer bad answer bad answer bad answer bad answer bad answer bad answer bad answer bad answer bad answer \"}\n\n"),
+		streamData("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_bad\",\"usage\":{\"output_tokens\":100,\"output_tokens_details\":{\"reasoning_tokens\":0}}}}\n\n"),
+		{Done: true},
+	}
+}
+
+func TestTransparentCodexResponsesThinkingStreamDelivered(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	host.scriptStream("auth-1", goodResponsesStreamScript()...)
+	plugin := newTestPlugin(t, host, enableTransparentForTest)
+	plugin.runTransparentStreamBridge(context.Background(), responsesRequestForTest("grok-4.6", true), "plugin-stream-responses-good")
+
+	joined := strings.Builder{}
+	for _, payload := range host.emitted["plugin-stream-responses-good"] {
+		joined.Write(payload)
+	}
+	if !strings.Contains(joined.String(), "good answer") || !strings.Contains(joined.String(), "response.reasoning_summary_text.delta") {
+		t.Fatalf("thinking Responses stream was not delivered intact: %s", joined.String())
+	}
+	if detail := host.closes["plugin-stream-responses-good"]; detail != nil {
+		t.Fatalf("thinking Responses stream closed with error: %#v", detail)
+	}
+	if len(host.modelCalls) != 1 {
+		t.Fatalf("thinking Responses stream used %d accounts, want 1", len(host.modelCalls))
+	}
+}
+
+func TestTransparentCodexResponsesMissingThinkingFailsOver(t *testing.T) {
+	entries, auths := twoGrokAuths(t)
+	host := newMockHostCall(entries, auths)
+	host.scriptStream("auth-1", badResponsesStreamScript()...)
+	host.scriptStream("auth-2", goodResponsesStreamScript()...)
+	plugin := newTestPlugin(t, host, enableTransparentForTest)
+	plugin.runTransparentStreamBridge(context.Background(), responsesRequestForTest("grok-4.6", true), "plugin-stream-responses-failover")
+
+	joined := strings.Builder{}
+	for _, payload := range host.emitted["plugin-stream-responses-failover"] {
+		joined.Write(payload)
+	}
+	if strings.Contains(joined.String(), "bad answer") {
+		t.Fatalf("missing-thinking Responses content leaked: %s", joined.String())
+	}
+	if !strings.Contains(joined.String(), "good answer") {
+		t.Fatalf("good Responses account was not delivered: %s", joined.String())
+	}
+}
+
+func TestTransparentNonStreamResponsesThinkingDelivered(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	host.scriptModelResponse("auth-1", pluginapi.HostModelExecutionResponse{
+		StatusCode: http.StatusOK,
+		Headers:    http.Header{"Content-Type": []string{"application/json"}},
+		Body:       []byte(`{"id":"resp_1","object":"response","model":"grok-4.6","output":[{"id":"rs_1","type":"reasoning","summary":[{"type":"summary_text","text":"plan the answer"}]},{"id":"msg_1","type":"message","content":[{"type":"output_text","text":"final answer"}]}],"usage":{"input_tokens":10,"output_tokens":20,"output_tokens_details":{"reasoning_tokens":8}}}`),
+	})
+	plugin := newTestPlugin(t, host, enableTransparentForTest)
+	encoded, errMarshal := json.Marshal(responsesRequestForTest("grok-4.6", false))
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	response, errExecute := plugin.Execute(encoded)
+	if errExecute != nil {
+		t.Fatal(errExecute)
+	}
+	var envelope struct {
+		OK     bool                       `json:"ok"`
+		Result pluginapi.ExecutorResponse `json:"result"`
+		Error  pluginabi.Error            `json:"error"`
+	}
+	if errUnmarshal := json.Unmarshal(response, &envelope); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if !envelope.OK || !strings.Contains(string(envelope.Result.Payload), "final answer") {
+		t.Fatalf("non-stream Responses with thinking was rejected: %s", response)
+	}
+}
+
+func TestRouteModelUsesBodyModelAndSkipsIneligibleRequests(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	plugin := newTestPlugin(t, host, enableTransparentForTest)
+
+	route := func(model, body string) pluginapi.ModelRouteResponse {
+		request := rpcModelRouteRequest{ModelRouteRequest: pluginapi.ModelRouteRequest{
+			SourceFormat:   "openai-response",
+			RequestedModel: model,
+			Stream:         true,
+			Body:           []byte(body),
+		}}
+		encoded, errMarshal := json.Marshal(request)
+		if errMarshal != nil {
+			t.Fatal(errMarshal)
+		}
+		raw, errRoute := plugin.RouteModel(encoded)
+		if errRoute != nil {
+			t.Fatal(errRoute)
+		}
+		var envelope struct {
+			OK     bool                         `json:"ok"`
+			Result pluginapi.ModelRouteResponse `json:"result"`
+		}
+		if errUnmarshal := json.Unmarshal(raw, &envelope); errUnmarshal != nil {
+			t.Fatal(errUnmarshal)
+		}
+		return envelope.Result
+	}
+
+	if result := route("", `{"model":"grok-4.6","input":"hi","reasoning":{"effort":"medium"}}`); !result.Handled {
+		t.Fatalf("body model fallback was not used: %#v", result)
+	}
+	if result := route("grok-composer-2.5-fast", `{"model":"grok-composer-2.5-fast","input":"hi"}`); result.Handled || result.Reason != "reasoning_not_required" {
+		t.Fatalf("non-reasoning model was routed: %#v", result)
+	}
+	if result := route("grok-4.6", `{"model":"grok-4.6","input":"hi","reasoning_effort":"none"}`); result.Handled || result.Reason != "reasoning_not_required" {
+		t.Fatalf("reasoning-disabled request was routed: %#v", result)
 	}
 }

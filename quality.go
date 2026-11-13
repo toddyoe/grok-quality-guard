@@ -243,10 +243,12 @@ func normalizeQualityProtocol(value string) string {
 	switch {
 	case strings.Contains(normalized, "chat"):
 		return qualityProtocolChat
-	case strings.Contains(normalized, "message"), strings.Contains(normalized, "anthropic"):
-		return qualityProtocolAnthropic
 	case strings.Contains(normalized, "response"), strings.Contains(normalized, "codex"):
 		return qualityProtocolResponses
+	case strings.Contains(normalized, "openai"):
+		return qualityProtocolChat
+	case strings.Contains(normalized, "message"), strings.Contains(normalized, "anthropic"), strings.Contains(normalized, "claude"):
+		return qualityProtocolAnthropic
 	default:
 		return normalized
 	}
@@ -369,9 +371,12 @@ func (a *StreamAnalyzer) observePayload(raw []byte, fallbackEvent string, now ti
 	if protocol == "" {
 		protocol = detectQualityProtocol(payload)
 	} else if !qualityPayloadMatchesProtocol(payload, protocol) {
-		if detected := detectQualityProtocol(payload); detected != "" {
-			protocol = detected
+		detected := detectQualityProtocol(payload)
+		if detected == "" {
+			a.signals.UnknownEvents++
+			return
 		}
+		protocol = detected
 	}
 	if protocol == "" {
 		a.signals.UnknownEvents++
@@ -399,6 +404,9 @@ func detectQualityProtocol(payload map[string]any) string {
 		return qualityProtocolResponses
 	}
 	if _, ok := payload["output"]; ok {
+		return qualityProtocolResponses
+	}
+	if _, ok := payload["output_text"]; ok {
 		return qualityProtocolResponses
 	}
 	if eventName == "response" || strings.HasPrefix(eventName, "response.") {
@@ -453,10 +461,13 @@ func qualityPayloadMatchesProtocol(payload map[string]any, protocol string) bool
 		if _, ok := payload["response"]; ok {
 			return true
 		}
-		_, ok := payload["output"]
+		if _, ok := payload["output"]; ok {
+			return true
+		}
+		_, ok := payload["output_text"]
 		return ok
 	default:
-		return true
+		return false
 	}
 }
 func (a *StreamAnalyzer) observeChat(payload map[string]any, now time.Time) {
@@ -467,7 +478,7 @@ func (a *StreamAnalyzer) observeChat(payload map[string]any, now time.Time) {
 			if choice == nil {
 				continue
 			}
-			if message, okMessage := choice["message"].(map[string]any); okMessage {
+			if message, okMessage := choice["message"].(map[string]any); okMessage && !a.streaming {
 				a.observeChatMessage(message, now)
 			}
 			if delta, okDelta := choice["delta"].(map[string]any); okDelta {
@@ -529,11 +540,22 @@ func (a *StreamAnalyzer) observeResponses(payload map[string]any, now time.Time)
 		a.terminalAt = now
 	case "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
 		a.addReasoningText(asString(payload["delta"]))
+	case "response.reasoning_text.done", "response.reasoning_summary_text.done":
+		if !a.streaming {
+			a.addReasoningText(asString(payload["text"]))
+		}
+	case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
+		if !a.streaming {
+			if part, ok := payload["part"].(map[string]any); ok {
+				a.addReasoningText(asString(part["text"]))
+			}
+		}
 	case "response.output_text.delta":
 		a.addVisibleText(asString(payload["delta"]), now)
 	case "response.output_text.done":
-		if !a.visibleDelta {
-			a.addVisibleText(asString(payload["text"]), now)
+		if !a.streaming && !a.visibleDelta {
+			runes := a.noteAggregateVisibleText(asString(payload["text"]), now, "")
+			a.aggregateRunes = maxInt64(a.aggregateRunes, runes)
 		}
 	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta", "response.mcp_call_arguments.delta":
 		if strings.TrimSpace(asString(payload["delta"])) != "" {
@@ -543,19 +565,34 @@ func (a *StreamAnalyzer) observeResponses(payload map[string]any, now time.Time)
 	case "response.output_item.added", "response.output_item.done":
 		a.observeResponsesItem(payload, now)
 	}
+	// A non-streaming Responses payload has output at the top level. The
+	// streaming terminal event carries the same array under response.output.
+	if output, ok := payload["output"].([]any); ok {
+		a.observeResponsesOutputItems(output, now)
+	}
+	if !a.streaming {
+		if text := asString(payload["output_text"]); strings.TrimSpace(text) != "" {
+			runes := a.noteAggregateVisibleText(text, now, "")
+			a.aggregateRunes = maxInt64(a.aggregateRunes, runes)
+		}
+	}
 	if response, ok := payload["response"].(map[string]any); ok {
 		if output, okOutput := response["output"].([]any); okOutput {
-			var aggregateRunes int64
-			for _, rawItem := range output {
-				item, _ := rawItem.(map[string]any)
-				if item != nil {
-					aggregateRunes += a.observeResponsesItemMap(item, now)
-				}
-			}
-			a.aggregateRunes = maxInt64(a.aggregateRunes, aggregateRunes)
+			a.observeResponsesOutputItems(output, now)
 		}
 		a.observeUsage(response)
 	}
+}
+
+func (a *StreamAnalyzer) observeResponsesOutputItems(output []any, now time.Time) {
+	var aggregateRunes int64
+	for _, rawItem := range output {
+		item, _ := rawItem.(map[string]any)
+		if item != nil {
+			aggregateRunes += a.observeResponsesItemMap(item, now)
+		}
+	}
+	a.aggregateRunes = maxInt64(a.aggregateRunes, aggregateRunes)
 }
 
 func (a *StreamAnalyzer) observeResponsesItem(payload map[string]any, now time.Time) {
@@ -578,8 +615,10 @@ func (a *StreamAnalyzer) observeResponsesItemMap(item map[string]any, now time.T
 		if enc := asString(item["encrypted_content"]); strings.TrimSpace(enc) != "" {
 			a.addEncrypted(enc)
 		}
-		a.observeResponsesReasoningContent(item["summary"])
-		a.observeResponsesReasoningContent(item["content"])
+		if !a.streaming {
+			a.observeResponsesReasoningContent(item["summary"])
+			a.observeResponsesReasoningContent(item["content"])
+		}
 		return 0
 	case "message":
 		return a.observeResponsesMessageContent(item["content"], now)
@@ -658,7 +697,7 @@ func (a *StreamAnalyzer) observeAnthropic(payload map[string]any, now time.Time)
 	case "message_stop":
 		a.signals.Terminal = true
 		a.terminalAt = now
-	case "message":
+	case "", "message":
 		if content, ok := payload["content"]; ok {
 			a.observeAnthropicContent(content, now)
 		}
@@ -1300,6 +1339,32 @@ func reasoningRequired(body []byte) bool {
 		}
 	}
 	return true
+}
+
+func reasoningRequiredForModel(model string, body []byte) bool {
+	if !reasoningRequired(body) {
+		return false
+	}
+	known, supports := modelReasoningSupport(model)
+	if !known {
+		if bodyModel := modelFromRequestBody(body); bodyModel != "" && bodyModel != model {
+			known, supports = modelReasoningSupport(bodyModel)
+		}
+	}
+	// Match grok2api: unknown models advertise no reasoning capability and
+	// therefore stay outside the request-path thinking gate.
+	return known && supports
+}
+
+func modelFromRequestBody(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var payload map[string]any
+	if errUnmarshal := json.Unmarshal(body, &payload); errUnmarshal != nil {
+		return ""
+	}
+	return strings.TrimSpace(asString(payload["model"]))
 }
 
 func disabledReasoningValue(value any) bool {
