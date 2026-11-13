@@ -3253,8 +3253,6 @@
     } async function runSelectedResinAction(action, button) {
       const selected = selectedLeaseAccounts();
       if (!selected.length) return;
-      const managed = selected.filter((account) => account.resin_managed).length;
-      const conflicts = selected.filter((account) => !account.resin_managed && account.proxy_status === 'conflict').length;
       const resin = state.resin || {};
       const localMode = Boolean(resin.local_only && resin.enabled);
       let confirmation;
@@ -3262,8 +3260,8 @@
         confirmation = {
           title: '清除所选代理',
           detail: localMode
-            ? ('将清除 ' + selected.length + ' 个账号的代理配置。\n本地轮换模式不会调用 Resin API，也不会删除远端旧租约。')
-            : ('将清除 ' + selected.length + ' 个账号的代理配置。\n其中 ' + managed + ' 个插件管理的 Resin 租约会先删除远端租约，' + conflicts + ' 个外部代理只清除 OAuth 文件配置，不会删除外部代理服务。'),
+            ? ('清除 ' + selected.length + ' 个账号代理，本地模式不删除远端租约')
+            : ('清除 ' + selected.length + ' 个账号代理，插件管理的租约会先删除远端租约'),
           confirmLabel: '清除代理',
           icon: 'x',
           tone: 'danger'
@@ -3271,7 +3269,7 @@
       } else {
         confirmation = {
           title: '绑定所选账号',
-          detail: '将为所选 ' + selected.length + ' 个账号绑定 Resin 租约。\n已绑定账号会保持当前租约，外部代理冲突账号不会被覆盖。',
+          detail: '绑定 ' + selected.length + ' 个账号，已绑定和冲突账号会跳过',
           confirmLabel: '绑定租约',
           icon: 'link'
         };
@@ -3567,7 +3565,7 @@
     document.getElementById('bindUnboundBtn').addEventListener('click', async (event) => {
       const confirmed = await confirmAction({
         title: '绑定全部未绑定账号',
-        detail: '将为当前所有未绑定账号创建 Resin 租约。\n代理冲突账号会被跳过，已绑定账号保持当前租约。',
+        detail: '绑定全部未绑定账号，冲突账号会跳过',
         confirmLabel: '开始绑定',
         icon: 'link'
       });
