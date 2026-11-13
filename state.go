@@ -35,6 +35,7 @@ type QualityEvidence struct {
 	HoldExpired       bool      `json:"hold_expired"`
 	HasThinking       bool      `json:"has_thinking"`
 	HasReasoningDelta bool      `json:"has_reasoning_delta"`
+	ReasoningRequired bool      `json:"reasoning_required"`
 	ReasoningStarted  bool      `json:"reasoning_started"`
 	SemanticOutput    bool      `json:"semantic_output"`
 	UsageReported     bool      `json:"usage_reported"`
@@ -62,7 +63,7 @@ func qualityEvidenceFromVerdict(verdict QualityVerdict, source string, at time.T
 	return &QualityEvidence{
 		At: at, Source: source, Action: verdict.Action, Class: verdict.Class, Reason: verdict.Reason,
 		Protocol: sig.Protocol, Streaming: sig.Streaming, Terminal: sig.Terminal, HoldExpired: sig.HoldExpired,
-		HasThinking: sig.HasThinking, HasReasoningDelta: sig.HasReasoningDelta, ReasoningStarted: sig.ReasoningStarted,
+		HasThinking: sig.HasThinking, HasReasoningDelta: sig.HasReasoningDelta, ReasoningRequired: sig.ReasoningRequired, ReasoningStarted: sig.ReasoningStarted,
 		SemanticOutput: sig.SemanticOutput, UsageReported: sig.UsageReported,
 		VisibleRunes: sig.VisibleRunes, VisibleTokens: sig.VisibleTokens, OutputTokens: sig.OutputTokens,
 		ReasoningTokens: sig.ReasoningTokens, EncryptedBytes: sig.EncryptedBytes, EncryptedFloor: sig.EncryptedFloor,

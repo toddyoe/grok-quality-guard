@@ -528,7 +528,7 @@ type QualityVerdict struct {
 
 | 路径 | 判定范围 | 不会推断的内容 |
 | --- | --- | --- |
-| 被动审计 | 仅 streaming、已有 TTFT、输出 >= 32、生成窗口有效的样本 | 不推断 missing-thinking |
+| 被动审计 | 仅 streaming、已有 TTFT、输出 >= 32、生成窗口有效的样本；已知要求推理时检查 missing-thinking | 不推断未知模型能力、显式关闭推理或非流式被动样本 |
 | 主动探测 | marker、输出下限、thinking 要求、生成窗口、TPS | 不把传输错误或上游非 2xx 当成质量降智 |
 | 非流式质量门 | 空响应、缺少真实思考、密文下限、可用的 TPS | 不做流式 burst/dump 推断 |
 

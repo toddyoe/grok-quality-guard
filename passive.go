@@ -132,6 +132,11 @@ func (p *Plugin) HandleUsage(request []byte) {
 		return
 	}
 
+	reasoningBody := []byte(nil)
+	if pending != nil {
+		reasoningBody = pending.Body
+	}
+	reasoningNeeded := usageReasoningRequired(record, reasoningBody)
 	sig := Signals{
 		Terminal:        true,
 		Streaming:       record.Stream,
@@ -159,6 +164,7 @@ func (p *Plugin) HandleUsage(request []byte) {
 		sig.GenerationMS = generationWindowMS(sig.DurationMS, sig.FirstTokenMS, sig.ReasoningTokens)
 		sig.TPS = tps(sig.OutputTokens, sig.GenerationMS)
 	}
+	sig.ReasoningRequired = reasoningNeeded
 	verdict := classifyPassiveAudit(sig, policy.Quality)
 
 	if errApply := p.ApplyVerdict(context.Background(), record.AuthID, verdict, "passive", ""); errApply != nil {
@@ -175,6 +181,24 @@ func (p *Plugin) recordInternalError(authID string, errValue error) error {
 		return nil
 	})
 	return nil
+}
+
+func usageReasoningRequired(record pluginapi.UsageRecord, body []byte) bool {
+	if len(body) > 0 && !reasoningRequired(body) {
+		return false
+	}
+	if disabledReasoningValue(record.ReasoningEffort) {
+		return false
+	}
+	for _, model := range []string{record.ResponseModel, record.Model, record.Alias} {
+		if strings.TrimSpace(model) == "" {
+			continue
+		}
+		if reasoningRequiredForModel(model, body) {
+			return true
+		}
+	}
+	return false
 }
 
 func firstNonEmpty(values ...string) string {

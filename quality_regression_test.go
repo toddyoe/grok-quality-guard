@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
@@ -258,5 +259,115 @@ func TestHoldExpiredBurstRequiresReasoningBill(t *testing.T) {
 	cipher.ReasoningTokens = 80
 	if !qualityIsBurstDump(cipher, 8) {
 		t.Fatalf("reasoning bill at hold expiry should trigger burst: %#v", cipher)
+	}
+}
+
+func TestPassiveAuditFlagsMissingThinkingForReasoningRequest(t *testing.T) {
+	config := DefaultQualityConfig()
+	signals := Signals{
+		Protocol:          qualityProtocolResponses,
+		Streaming:         true,
+		Terminal:          true,
+		FirstTokenKnown:   true,
+		FirstTokenMS:      1700,
+		DurationMS:        3554,
+		OutputTokens:      99,
+		ReasoningTokens:   0,
+		VisibleTokens:     0,
+		UsageReported:     true,
+		ReasoningRequired: true,
+	}
+	verdict := classifyPassiveAudit(signals, config)
+	if verdict.Class != ClassMissingThinking {
+		t.Fatalf("class = %q, want %q (%#v)", verdict.Class, ClassMissingThinking, verdict.Signals)
+	}
+}
+
+func TestPassiveUsageFlagsReasoningRequestWithoutThinking(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "user@example.com", nil)
+	host := newMockHostCall(entries, auths)
+	plugin := newTestPlugin(t, host, nil)
+
+	record := pluginapi.UsageRecord{
+		AuthID:          "auth-1",
+		RequestID:       "passive-responses-missing-thinking",
+		Provider:        "xai",
+		Model:           "grok-4.7",
+		ReasoningEffort: "xhigh",
+		Stream:          true,
+		TTFT:            1700 * time.Millisecond,
+		Latency:         3554 * time.Millisecond,
+		Detail: pluginapi.UsageDetail{
+			OutputTokens:    99,
+			ReasoningTokens: 0,
+		},
+	}
+	raw, errMarshal := json.Marshal(record)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	plugin.HandleUsage(raw)
+
+	account, ok := plugin.stateAccount("auth-1")
+	if !ok || account.LastAttempt == nil {
+		t.Fatalf("passive usage was not recorded: %#v", account)
+	}
+	if account.LastAttempt.Class != ClassMissingThinking {
+		t.Fatalf("passive class = %q, want %q", account.LastAttempt.Class, ClassMissingThinking)
+	}
+	if account.LastEvidence == nil || !account.LastEvidence.ReasoningRequired {
+		t.Fatalf("passive evidence did not preserve reasoning requirement: %#v", account.LastEvidence)
+	}
+}
+
+func TestUsageReasoningRequiredUsesModelEffortAndBody(t *testing.T) {
+	cases := []struct {
+		name   string
+		record pluginapi.UsageRecord
+		body   []byte
+		want   bool
+	}{
+		{name: "known reasoning model", record: pluginapi.UsageRecord{Model: "grok-4.7"}, want: true},
+		{name: "response model wins over alias", record: pluginapi.UsageRecord{Model: "vendor-alias", ResponseModel: "grok-4.7"}, want: true},
+		{name: "unknown alias stays outside capability gate", record: pluginapi.UsageRecord{Model: "vendor-alias", ReasoningEffort: "xhigh"}, want: false},
+		{name: "explicit none disables", record: pluginapi.UsageRecord{Model: "grok-4.7", ReasoningEffort: "none"}, want: false},
+		{name: "non reasoning family", record: pluginapi.UsageRecord{Model: "grok-composer-2.5-fast"}, want: false},
+		{name: "body none disables", record: pluginapi.UsageRecord{Model: "grok-4.7"}, body: []byte(`{"reasoning":{"effort":"none"}}`), want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := usageReasoningRequired(tc.record, tc.body); got != tc.want {
+				t.Fatalf("usageReasoningRequired() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestThinkingGuardDisabledBypassesMissingThinkingInAllQualityPaths(t *testing.T) {
+	config := DefaultQualityConfig()
+	config.ThinkingGuard = false
+	config.SoftTPS = 1e9
+	config.HardTPS = 2e9
+	signals := Signals{
+		Streaming:       true,
+		Terminal:        true,
+		FirstTokenKnown: true,
+		FirstTokenMS:    100,
+		DurationMS:      2000,
+		OutputTokens:    100,
+		VisibleTokens:   100,
+	}
+	if verdict := classifyFinal(signals, config, true, 8, true); verdict.Class != ClassNone {
+		t.Fatalf("stream thinking_guard=false class = %q, want none (%#v)", verdict.Class, verdict)
+	}
+	if verdict := classifyNonStreamResult(signals, config, true, 8); verdict.Class != ClassNone {
+		t.Fatalf("non-stream thinking_guard=false class = %q, want none (%#v)", verdict.Class, verdict)
+	}
+	passive := signals
+	passive.ReasoningRequired = true
+	passive.FirstTokenMS = 100
+	passive.DurationMS = 2000
+	if verdict := classifyPassiveAudit(passive, config); verdict.Class != ClassNone {
+		t.Fatalf("passive thinking_guard=false class = %q, want none (%#v)", verdict.Class, verdict)
 	}
 }

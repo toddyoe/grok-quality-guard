@@ -2277,6 +2277,7 @@
       'upstream stream completed without content': '上游流已结束但没有内容',
       'upstream response completed without content': '上游响应已结束但没有内容',
       'reasoning was disabled for this request': '本次请求未启用推理',
+      'thinking guard is disabled': '思考检查已关闭',
       not_build_stream: '非 Build 流式请求',
       missing_first_token: '缺少首 Token 时间',
       unsuccessful: '请求未成功',
@@ -2387,6 +2388,7 @@
       const flags = [
         '真实思考：' + yesNo(evidence.has_thinking),
         '明文推理：' + yesNo(evidence.has_reasoning_delta),
+        '需推理：' + yesNo(evidence.reasoning_required),
         '推理开始：' + yesNo(evidence.reasoning_started),
         '语义输出：' + yesNo(evidence.semantic_output),
         '用量上报：' + yesNo(evidence.usage_reported)

@@ -67,6 +67,7 @@ type Signals struct {
 	HoldExpired       bool
 	SemanticOutput    bool
 	Streaming         bool
+	ReasoningRequired bool
 	FirstTokenMS      int64
 	FirstTokenKnown   bool
 	DurationMS        int64
@@ -1173,13 +1174,18 @@ func classifyFinal(sig Signals, cfg QualityConfig, reasoningRequired bool, minOu
 	if isEmptyStream(sig) {
 		return QualityVerdict{Action: QualityActionWithhold, Class: ClassEmptyStream, Reason: "upstream stream completed without content", Signals: sig}
 	}
+	thinkingRequired := cfg.ThinkingGuard && reasoningRequired
 	if streaming {
 		hold := ClassifyQualityHold(sig, minOutput)
 		if hold.Action == QualityActionWithhold {
-			if hold.Class == ClassMissingThinking && !reasoningRequired {
+			if hold.Class == ClassMissingThinking && !thinkingRequired {
 				hold.Action = QualityActionDeliver
 				hold.Class = ClassNone
-				hold.Reason = "reasoning was disabled for this request"
+				if cfg.ThinkingGuard {
+					hold.Reason = "reasoning was disabled for this request"
+				} else {
+					hold.Reason = "thinking guard is disabled"
+				}
 			} else {
 				return hold
 			}
@@ -1194,7 +1200,7 @@ func classifyFinal(sig Signals, cfg QualityConfig, reasoningRequired bool, minOu
 			}
 		}
 	}
-	if reasoningRequired && !sig.HasThinking && !isSemanticOnly(sig) {
+	if thinkingRequired && !sig.HasThinking && !isSemanticOnly(sig) {
 		output := sig.VisibleTokens
 		if output <= 0 {
 			output = sig.OutputTokens
@@ -1260,10 +1266,23 @@ func classifyPassiveAudit(sig Signals, cfg QualityConfig) QualityVerdict {
 	if !sig.Terminal || !sig.FirstTokenKnown {
 		return QualityVerdict{Action: QualityActionDeliver, Class: ClassIgnored, Reason: "missing_first_token", Signals: sig}
 	}
+	sig.EncryptedFloor = encryptedFloor(sig.ReasoningTokens, cfg)
+	if sig.EncryptedBytes > 0 && sig.EncryptedBytes >= sig.EncryptedFloor {
+		sig.HasThinking = true
+	}
 	sig.GenerationMS = generationWindowMS(sig.DurationMS, sig.FirstTokenMS, sig.ReasoningTokens)
 	sig.TPS = tps(sig.OutputTokens, sig.GenerationMS)
 	if sig.GenerationMS <= 0 || sig.OutputTokens < cfg.MinPassiveOutputTokens {
 		return QualityVerdict{Action: QualityActionDeliver, Class: ClassIgnored, Reason: "insufficient_output_tokens", Signals: sig}
+	}
+	if cfg.ThinkingGuard && sig.ReasoningRequired && !sig.HasThinking && !isSemanticOnly(sig) {
+		output := sig.VisibleTokens
+		if output <= 0 {
+			output = sig.OutputTokens
+		}
+		if output >= cfg.MinPassiveOutputTokens {
+			return QualityVerdict{Action: QualityActionWithhold, Class: ClassMissingThinking, Reason: "no real reasoning evidence", Signals: sig}
+		}
 	}
 	class, speed, gen := classifyOutputSpeed(sig, cfg, cfg.FailClosed)
 	sig.GenerationMS = gen
@@ -1289,7 +1308,7 @@ func classifyNonStreamResult(sig Signals, cfg QualityConfig, reasoningRequired b
 	if isEmptyStream(sig) {
 		return QualityVerdict{Action: QualityActionWithhold, Class: ClassEmptyStream, Reason: "upstream response completed without content", Signals: sig}
 	}
-	if reasoningRequired && !sig.HasThinking && !isSemanticOnly(sig) {
+	if cfg.ThinkingGuard && reasoningRequired && !sig.HasThinking && !isSemanticOnly(sig) {
 		output := sig.VisibleTokens
 		if output <= 0 {
 			output = sig.OutputTokens

@@ -60,7 +60,7 @@ TPS = outputTokens * 1000 / generationWindow
 - `: grok2api-reasoning-evidence <bytes>` 作为密文字节数证据，仍必须满足密文下限
 - Chat、Responses 和 Anthropic Messages 的流式与非流式响应都使用同一套内容、thinking、密文下限、TPS 和空流规则
 
-被动审计只做可确认的样本速度审计：非流式、缺少 TTFT、输出不足 32 token 或生成窗口无效的样本记录为 `ignored`，不推断 `missing_thinking`。主动探测使用固定 marker，并在输出达到 64 token 且要求思考时检查 thinking 账单。非流式响应不做流式 burst/dump 推断，但仍检查空响应、缺少真实思考和可用的 TPS 证据。
+被动审计对可确定要求推理的流式样本检查 `missing_thinking`：非流式、缺少 TTFT、输出不足 32 token 或生成窗口无效的样本记录为 `ignored`；未知模型能力或显式关闭推理时不推断。速度审计仍只对满足流式、TTFT、输出和生成窗口条件的样本生效。
 
 ### 非质量错误与证据保留
 
