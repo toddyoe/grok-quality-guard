@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestGuardMetadataAndAuthIdentity(t *testing.T) {
+func TestAuthIdentityAndProxyHelpers(t *testing.T) {
 	raw := map[string]json.RawMessage{}
 	for key, value := range map[string]any{
 		"type":          "xai",
@@ -15,13 +15,6 @@ func TestGuardMetadataAndAuthIdentity(t *testing.T) {
 		"refresh_token": "refresh",
 		"disabled":      true,
 		"proxy_url":     "socks5h://Default.grok-alice-1abc:secret@resin:2260",
-		"grok_quality_guard": map[string]any{
-			"managed":                 true,
-			"resin_account":           "grok-alice-1abc",
-			"disable_kind":            "cooldown",
-			"cooldown_until":          "2026-11-11T13:00:00Z",
-			"strike_missing_thinking": true,
-		},
 	} {
 		encoded, _ := json.Marshal(value)
 		raw[key] = encoded
@@ -29,12 +22,8 @@ func TestGuardMetadataAndAuthIdentity(t *testing.T) {
 	if !isGrokAuth(raw) {
 		t.Fatal("xai auth not recognized")
 	}
-	meta := guardMeta(raw)
-	if !meta.Managed || meta.ResinAccount != "grok-alice-1abc" || meta.DisableKind != DisableKindCooldown || !meta.StrikeMissingThinking {
-		t.Fatalf("unexpected guard metadata: %#v", meta)
-	}
-	if state := authDisabledState(raw); state != StateCooling {
-		t.Fatalf("disabled state = %q, want cooling", state)
+	if !authDisabled(raw) || authEmail(raw) == "" {
+		t.Fatalf("unexpected auth identity: disabled=%t email=%q", authDisabled(raw), authEmail(raw))
 	}
 	if base := resinAccountBase(raw); base != "alice" {
 		t.Fatalf("resin base = %q, want alice", base)

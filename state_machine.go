@@ -59,9 +59,6 @@ func (p *Plugin) applyVerdictLocked(
 	now := time.Now().UTC()
 	previousState, _ := p.stateAccount(authID)
 	priorMissingStrike := previousState.QualityStrikeMissingThinking
-	if raw != nil && guardMeta(raw).StrikeMissingThinking {
-		priorMissingStrike = true
-	}
 	backoff := nextProbeBackoff(policy.Probe, previousState)
 	outcome := verdictResult{}
 
@@ -69,16 +66,6 @@ func (p *Plugin) applyVerdictLocked(
 		account := p.ensureStateAccount(state, authID, "", "")
 		if priorMissingStrike {
 			account.QualityStrikeMissingThinking = true
-		}
-		if raw != nil && reEnabled {
-			meta := guardMeta(raw)
-			if meta.Managed {
-				account.State = stateForDisableKind(meta.DisableKind)
-				account.DisableKind = meta.DisableKind
-				if until, errUntil := time.Parse(time.RFC3339, strings.TrimSpace(meta.CooldownUntil)); errUntil == nil {
-					account.CooldownUntil = until
-				}
-			}
 		}
 		account.LastObservedAt = now
 		account.LastAttempt = &AttemptEvidence{
@@ -439,11 +426,11 @@ func (p *Plugin) holdProbeRecoveryLocked(
 		raw = resolvedRaw
 		response = resolvedResponse
 	}
-	meta := guardMeta(raw)
-	if !meta.Managed || authDisabled(raw) {
+	account, okAccount := p.stateAccount(authID)
+	if !okAccount || account.DisableKind == "" || authDisabled(raw) {
 		return nil
 	}
-	if meta.DisableKind == DisableKindPermanent || meta.DisableKind == DisableKindCredentialInvalid {
+	if account.DisableKind == DisableKindPermanent || account.DisableKind == DisableKindCredentialInvalid {
 		return nil
 	}
 	p.mu.RLock()
@@ -459,7 +446,7 @@ func (p *Plugin) holdProbeRecoveryLocked(
 	if duration <= 0 {
 		duration = policy.Quality.MissingThinkingCooldown.Duration
 	}
-	return p.saveGuardDisableLocked(ctx, authID, response, raw, DisableKindCooldown, duration, class, "probe", meta.StrikeMissingThinking)
+	return p.saveGuardDisableLocked(ctx, authID, response, raw, DisableKindCooldown, duration, class, "probe", account.QualityStrikeMissingThinking)
 }
 
 func (p *Plugin) applyGuardDisable(authID, kind string, duration time.Duration, class, source string, strike bool) error {
@@ -469,9 +456,9 @@ func (p *Plugin) applyGuardDisable(authID, kind string, duration time.Duration, 
 	return p.applyGuardDisableLocked(context.Background(), authID, kind, duration, class, source, strike)
 }
 
-// applyGuardDisableLocked updates the auth file before the state store. Callers
-// must hold the per-auth lock. A failed auth save leaves the previous state and
-// binding intact.
+// applyGuardDisableLocked records the desired state before touching the auth
+// file so an interrupted write can be repaired by the reconciler. Callers must
+// hold the per-auth lock.
 func (p *Plugin) applyGuardDisableLocked(ctx context.Context, authID, kind string, duration time.Duration, class, source string, strike bool) error {
 	_, response, raw, errResolve := p.resolveAuth(ctx, authID)
 	if errResolve != nil {
@@ -490,19 +477,21 @@ func (p *Plugin) saveGuardDisableLocked(
 	class, source string,
 	strike bool,
 ) error {
-	meta := guardMeta(raw)
-	if authDisabled(raw) && !meta.Managed {
+	store := p.stateStore()
+	if store == nil {
+		return errors.New("state store is not initialized")
+	}
+	previousState, _ := p.stateAccount(authID)
+	if authDisabled(raw) && previousState.DisableKind == "" {
 		return p.setStateExternal(authID, class)
 	}
-	previousDisabled := authDisabled(raw)
-	if !meta.Managed {
-		meta.Managed = true
-		meta.PreviousDisabled = previousDisabled
+	if kind == "" {
+		kind = DisableKindCooldown
 	}
-	if strike {
-		meta.StrikeMissingThinking = true
+	previousDisabled := previousState.PreviousDisabled
+	if previousState.DisableKind == "" {
+		previousDisabled = authDisabled(raw)
 	}
-	meta.DisableKind = kind
 	var until time.Time
 	if kind == DisableKindCooldown || kind == DisableKindQuota {
 		if duration <= 0 {
@@ -511,43 +500,32 @@ func (p *Plugin) saveGuardDisableLocked(
 			p.mu.RUnlock()
 		}
 		until = time.Now().UTC().Add(duration)
-		meta.CooldownUntil = until.Format(time.RFC3339)
-	} else {
-		meta.CooldownUntil = ""
 	}
-	setRawBool(raw, "disabled", true)
-	if errMeta := setGuardMeta(raw, meta); errMeta != nil {
-		return errMeta
-	}
-	encoded, errMarshal := marshalRawMap(raw)
-	if errMarshal != nil {
-		return errMarshal
-	}
-	if _, errSave := p.saveAuth(response.Name, encoded); errSave != nil {
-		return fmt.Errorf("save guard-disabled auth: %w", errSave)
-	}
-	return p.stateStore().Update(func(state *State) error {
+	errState := store.Update(func(state *State) error {
 		account := p.ensureStateAccount(state, authID, "", "")
-		switch kind {
-		case DisableKindCooldown:
-			account.State = StateCooling
-			account.CooldownUntil = until
-		case DisableKindQuota:
-			account.State = StateQuotaExhausted
-			account.CooldownUntil = until
-		case DisableKindCredentialInvalid:
-			account.State = StateCredentialInvalid
-			account.CooldownUntil = time.Time{}
-		default:
-			account.State = StateDisabledByGuard
-			account.CooldownUntil = time.Time{}
-		}
+		account.State = stateForDisableKind(kind)
+		account.CooldownUntil = until
+		account.DisableKind = kind
+		account.PreviousDisabled = previousDisabled
+		account.QualityStrikeMissingThinking = account.QualityStrikeMissingThinking || strike
 		if class != "" {
 			account.LastReason = class
 		}
-		account.DisableKind = kind
-		account.PreviousDisabled = meta.PreviousDisabled
-		account.QualityStrikeMissingThinking = meta.StrikeMissingThinking
+		intent := true
+		account.AuthDisabledIntent = &intent
+		return nil
+	})
+	if errState != nil {
+		return errState
+	}
+	if !authDisabled(raw) {
+		if errSave := p.saveAuthDisabled(response.Name, raw, true); errSave != nil {
+			return fmt.Errorf("save guard-disabled auth: %w", errSave)
+		}
+	}
+	return store.Update(func(state *State) error {
+		account := p.ensureStateAccount(state, authID, "", "")
+		account.AuthDisabledIntent = nil
 		p.recordEvent(state, authID, class, "guard_disable", kind, source)
 		return nil
 	})
@@ -557,6 +535,10 @@ func (p *Plugin) setStateExternal(authID, class string) error {
 	return p.stateStore().Update(func(state *State) error {
 		account := p.ensureStateAccount(state, authID, "", "")
 		account.State = StateExternallyDisabled
+		account.DisableKind = ""
+		account.CooldownUntil = time.Time{}
+		account.PreviousDisabled = false
+		account.AuthDisabledIntent = nil
 		if class != "" {
 			account.LastReason = class
 		}
@@ -589,18 +571,16 @@ func (p *Plugin) ManualRestore(ctx context.Context, authID string) error {
 	if errResolve != nil {
 		return errResolve
 	}
-	meta := guardMeta(raw)
-	if authDisabled(raw) && !meta.Managed {
+	store := p.stateStore()
+	if store == nil {
+		return errors.New("state store is not initialized")
+	}
+	stateAccount, hasState := p.stateAccount(authID)
+	guardOwned := hasState && stateAccount.DisableKind != ""
+	if authDisabled(raw) && !guardOwned {
 		if errUpdate := p.stateStore().Update(func(state *State) error {
 			account := p.ensureStateAccount(state, authID, "", "")
-			account.State = StateUnknown
-			account.CooldownUntil = time.Time{}
-			account.ProbeBackoffUntil = time.Time{}
-			account.DisableKind = ""
-			account.QualityStrikeMissingThinking = false
-			account.SoftStrikes = 0
-			account.ErrorStrikes = 0
-			account.ThinkingStrikes = 0
+			resetGuardDisableState(account)
 			p.recordEvent(state, authID, "", "restore", "external_left_disabled", "manual")
 			return nil
 		}); errUpdate != nil {
@@ -608,37 +588,44 @@ func (p *Plugin) ManualRestore(ctx context.Context, authID string) error {
 		}
 		return nil
 	}
-	if meta.Managed {
-		setRawBool(raw, "disabled", false)
-		meta.DisableKind = ""
-		meta.CooldownUntil = ""
-		meta.StrikeMissingThinking = false
-		if errMeta := setGuardMeta(raw, meta); errMeta != nil {
-			return errMeta
+	if guardOwned {
+		if errIntent := store.Update(func(state *State) error {
+			account := p.ensureStateAccount(state, authID, "", "")
+			intent := false
+			account.AuthDisabledIntent = &intent
+			return nil
+		}); errIntent != nil {
+			return errIntent
 		}
-		encoded, errMarshal := marshalRawMap(raw)
-		if errMarshal != nil {
-			return errMarshal
-		}
-		if _, errSave := p.saveAuth(response.Name, encoded); errSave != nil {
+	}
+	if authDisabled(raw) {
+		if errSave := p.saveAuthDisabled(response.Name, raw, false); errSave != nil {
 			return fmt.Errorf("save restored auth: %w", errSave)
 		}
 	}
-	return p.stateStore().Update(func(state *State) error {
+	return store.Update(func(state *State) error {
 		account := p.ensureStateAccount(state, authID, "", "")
-		account.State = StateUnknown
-		account.LastReason = ""
-		account.CooldownUntil = time.Time{}
-		account.ProbeBackoffUntil = time.Time{}
-		account.DisableKind = ""
-		account.PreviousDisabled = false
-		account.QualityStrikeMissingThinking = false
-		account.SoftStrikes = 0
-		account.ErrorStrikes = 0
-		account.ThinkingStrikes = 0
+		resetGuardDisableState(account)
 		p.recordEvent(state, authID, "", "restore", "restored", "manual")
 		return nil
 	})
+}
+
+func resetGuardDisableState(account *AccountState) {
+	if account == nil {
+		return
+	}
+	account.State = StateUnknown
+	account.LastReason = ""
+	account.CooldownUntil = time.Time{}
+	account.ProbeBackoffUntil = time.Time{}
+	account.DisableKind = ""
+	account.PreviousDisabled = false
+	account.AuthDisabledIntent = nil
+	account.QualityStrikeMissingThinking = false
+	account.SoftStrikes = 0
+	account.ErrorStrikes = 0
+	account.ThinkingStrikes = 0
 }
 
 func (p *Plugin) Reconcile(ctx context.Context) error {
@@ -647,19 +634,32 @@ func (p *Plugin) Reconcile(ctx context.Context) error {
 		return nil
 	}
 	snapshot := store.Snapshot()
+	catalog := p.catalogSnapshot()
+	accounts := make(map[string]Account, len(catalog))
+	for _, account := range catalog {
+		accounts[account.ID] = account
+	}
 	for authID, stateAccount := range snapshot.Accounts {
 		if stateAccount == nil {
 			continue
 		}
-		if !isIsolatedState(stateAccount.State) && stateAccount.State != StateUnknown {
+		if stateAccount.AuthDisabledIntent != nil || isIsolatedState(stateAccount.State) {
+			p.reconcileAccount(ctx, authID)
 			continue
 		}
-		p.reconcileAccount(ctx, authID, stateAccount.State)
+		if stateAccount.State != StateUnknown {
+			continue
+		}
+		account, okAccount := accounts[authID]
+		if !okAccount || !account.Disabled {
+			continue
+		}
+		p.reconcileAccount(ctx, authID)
 	}
 	return nil
 }
 
-func (p *Plugin) reconcileAccount(ctx context.Context, authID, currentState string) {
+func (p *Plugin) reconcileAccount(ctx context.Context, authID string) {
 	lock := p.accountLock(authID)
 	lock.Lock()
 	defer lock.Unlock()
@@ -668,58 +668,72 @@ func (p *Plugin) reconcileAccount(ctx context.Context, authID, currentState stri
 	if errResolve != nil {
 		return
 	}
-	meta := guardMeta(raw)
-	if !authDisabled(raw) && !meta.Managed {
-		_ = p.updateStateAccount(authID, func(account *AccountState) error {
-			account.State = StateUnknown
-			account.DisableKind = ""
-			account.CooldownUntil = time.Time{}
-			return nil
-		})
+	store := p.stateStore()
+	if store == nil {
 		return
 	}
-	externalState := authDisabledState(raw)
-	if externalState != "" && !meta.Managed {
-		if currentState != StateExternallyDisabled {
-			_ = p.setStateExternal(authID, "")
-		}
+	stateAccount, okState := p.stateAccount(authID)
+	if !okState {
 		return
 	}
-	if !meta.Managed {
-		return
-	}
-	switch meta.DisableKind {
-	case DisableKindPermanent:
-		_ = p.updateStateAccount(authID, func(account *AccountState) error {
-			account.State = StateDisabledByGuard
-			account.DisableKind = DisableKindPermanent
-			account.CooldownUntil = time.Time{}
-			return nil
-		})
-	case DisableKindCredentialInvalid:
-		_ = p.updateStateAccount(authID, func(account *AccountState) error {
-			account.State = StateCredentialInvalid
-			account.DisableKind = DisableKindCredentialInvalid
-			account.CooldownUntil = time.Time{}
-			return nil
-		})
-	case DisableKindCooldown, DisableKindQuota:
-		if !authDisabled(raw) {
-			if errDisable := p.saveAuthDisabled(response.Name, raw, true); errDisable != nil {
+	if stateAccount.AuthDisabledIntent != nil {
+		target := *stateAccount.AuthDisabledIntent
+		if target != authDisabled(raw) {
+			if errSave := p.saveAuthDisabled(response.Name, raw, target); errSave != nil {
 				return
 			}
 		}
-		until, _ := time.Parse(time.RFC3339, strings.TrimSpace(meta.CooldownUntil))
-		_ = p.updateStateAccount(authID, func(account *AccountState) error {
-			if account.State != StateDisabledByGuard {
-				account.State = stateForDisableKind(meta.DisableKind)
-			}
-			account.CooldownUntil = until
-			account.DisableKind = meta.DisableKind
-			account.QualityStrikeMissingThinking = meta.StrikeMissingThinking
+		if target {
+			_ = store.Update(func(state *State) error {
+				account := p.ensureStateAccount(state, authID, "", "")
+				account.AuthDisabledIntent = nil
+				return nil
+			})
+			return
+		}
+		_ = store.Update(func(state *State) error {
+			account := p.ensureStateAccount(state, authID, "", "")
+			resetGuardDisableState(account)
+			p.recordEvent(state, authID, "", "restore", "restored", "reconcile")
 			return nil
 		})
+		return
 	}
+	if authDisabled(raw) {
+		if stateAccount.DisableKind == "" {
+			if stateAccount.State != StateExternallyDisabled {
+				_ = p.setStateExternal(authID, "")
+			}
+			return
+		}
+		expectedState := stateForDisableKind(stateAccount.DisableKind)
+		if stateAccount.State != expectedState {
+			_ = p.updateStateAccount(authID, func(account *AccountState) error {
+				account.State = expectedState
+				return nil
+			})
+		}
+		return
+	}
+	if stateAccount.DisableKind == "" {
+		if stateAccount.State == StateExternallyDisabled {
+			_ = p.updateStateAccount(authID, func(account *AccountState) error {
+				account.State = StateUnknown
+				return nil
+			})
+		}
+		return
+	}
+	if isCooldownState(stateAccount.State) && time.Now().UTC().Before(stateAccount.CooldownUntil) {
+		_ = p.saveAuthDisabled(response.Name, raw, true)
+		return
+	}
+	_ = store.Update(func(state *State) error {
+		account := p.ensureStateAccount(state, authID, "", "")
+		resetGuardDisableState(account)
+		p.recordEvent(state, authID, "", "restore", "restored", "reconcile")
+		return nil
+	})
 }
 
 func validateAuthPayload(raw map[string]json.RawMessage) error {

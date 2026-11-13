@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -141,6 +142,61 @@ func taskErrorStatus(errValue error) int {
 		return resinErr.Status
 	}
 	return 0
+}
+
+func runBoundedQueue[T any](ctx context.Context, values []T, queueSize, workers int, fn func(context.Context, T)) error {
+	if len(values) == 0 {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if workers <= 0 {
+		workers = 1
+	}
+	if workers > len(values) {
+		workers = len(values)
+	}
+	if queueSize <= 0 || queueSize > len(values) {
+		queueSize = len(values)
+	}
+	jobs := make(chan T, queueSize)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case value, ok := <-jobs:
+					if !ok {
+						return
+					}
+					if ctx.Err() != nil {
+						return
+					}
+					fn(ctx, value)
+				}
+			}
+		}()
+	}
+	for _, value := range values {
+		select {
+		case jobs <- value:
+		case <-ctx.Done():
+			close(jobs)
+			wg.Wait()
+			return ctx.Err()
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	if errCtx := ctx.Err(); errCtx != nil {
+		return errCtx
+	}
+	return nil
 }
 
 func (p *Plugin) hasActiveTask(kind, authID string) bool {

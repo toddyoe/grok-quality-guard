@@ -58,13 +58,10 @@ func TestGuardDisablePreservesTokensAndWritesAuthFirst(t *testing.T) {
 	if authRawString(raw, "access_token") != "access-auth-1" || authRawString(raw, "refresh_token") != "refresh-auth-1" {
 		t.Fatal("token fields were not preserved")
 	}
-	meta := guardMeta(raw)
-	if !meta.Managed || meta.DisableKind != DisableKindCooldown || !meta.StrikeMissingThinking || meta.CooldownUntil == "" {
-		t.Fatalf("unexpected guard metadata: %#v", meta)
-	}
+	assertNoGuardMetadata(t, raw)
 }
 
-func TestGuardDisableSaveFailureLeavesStateUntouched(t *testing.T) {
+func TestGuardDisableSaveFailureLeavesIntentForReconcile(t *testing.T) {
 	entries, auths := singleGrokAuth(t, "auth-1", "alice@example.com", nil)
 	host := newMockHostCall(entries, auths)
 	host.saveErr = errors.New("disk full")
@@ -74,24 +71,81 @@ func TestGuardDisableSaveFailureLeavesStateUntouched(t *testing.T) {
 		t.Fatal("expected auth save failure")
 	}
 	account, _ := plugin.stateAccount("auth-1")
-	if account.State != StateUnknown || !account.CooldownUntil.IsZero() {
-		t.Fatalf("state changed after failed auth save: %#v", account)
+	if account.State != StateCooling || account.DisableKind != DisableKindCooldown || account.AuthDisabledIntent == nil || !*account.AuthDisabledIntent {
+		t.Fatalf("failed auth save did not retain a disable intent: %#v", account)
 	}
 	if len(host.saves) != 0 {
 		t.Fatal("unexpected saved auth")
 	}
+	host.mu.Lock()
+	host.saveErr = nil
+	host.mu.Unlock()
+	if errReconcile := plugin.Reconcile(context.Background()); errReconcile != nil {
+		t.Fatal(errReconcile)
+	}
+	saved, errDecode := rawAuthToMap(host.saves["auth-1"])
+	if errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if !authDisabled(saved) {
+		t.Fatal("reconcile did not complete the pending disable intent")
+	}
+	account, _ = plugin.stateAccount("auth-1")
+	if account.AuthDisabledIntent != nil {
+		t.Fatalf("reconcile did not clear the disable intent: %#v", account)
+	}
+}
+
+func TestManualRestoreSaveFailureLeavesEnableIntentForReconcile(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	plugin := newTestPlugin(t, host, nil)
+	if errDisable := plugin.applyGuardDisable("auth-1", DisableKindCooldown, time.Hour, ClassMissingThinking, "test", false); errDisable != nil {
+		t.Fatal(errDisable)
+	}
+
+	host.mu.Lock()
+	host.saveErr = errors.New("disk full")
+	host.mu.Unlock()
+	if errRestore := plugin.ManualRestore(context.Background(), "auth-1"); errRestore == nil {
+		t.Fatal("expected restore auth save failure")
+	}
+	account, _ := plugin.stateAccount("auth-1")
+	if account.State != StateCooling || account.DisableKind != DisableKindCooldown || account.AuthDisabledIntent == nil || *account.AuthDisabledIntent {
+		t.Fatalf("failed restore did not retain an enable intent: %#v", account)
+	}
+
+	host.mu.Lock()
+	host.saveErr = nil
+	host.mu.Unlock()
+	if errReconcile := plugin.Reconcile(context.Background()); errReconcile != nil {
+		t.Fatal(errReconcile)
+	}
+	saved, errDecode := rawAuthToMap(host.saves["auth-1"])
+	if errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if authDisabled(saved) {
+		t.Fatal("reconcile did not complete the pending enable intent")
+	}
+	account, _ = plugin.stateAccount("auth-1")
+	if account.State != StateUnknown || account.DisableKind != "" || account.AuthDisabledIntent != nil {
+		t.Fatalf("reconcile did not finalize the restore: %#v", account)
+	}
 }
 
 func TestRecoveryProbeMissingThinkingAfterStrikeBecomesPermanent(t *testing.T) {
-	entries, auths := singleGrokAuth(t, "auth-1", "alice@example.com", map[string]any{
-		"grok_quality_guard": map[string]any{
-			"managed":                 true,
-			"disable_kind":            DisableKindCooldown,
-			"strike_missing_thinking": true,
-		},
-	})
+	entries, auths := singleGrokAuth(t, "auth-1", "alice@example.com", map[string]any{})
 	host := newMockHostCall(entries, auths)
 	plugin := newTestPlugin(t, host, func(cfg *Config) { cfg.AutoAction = "cooldown_then_disable" })
+	if errUpdate := plugin.updateStateAccount("auth-1", func(account *AccountState) error {
+		account.State = StateCooling
+		account.DisableKind = DisableKindCooldown
+		account.QualityStrikeMissingThinking = true
+		return nil
+	}); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
 	_, response, raw, errResolve := plugin.resolveAuth(context.Background(), "auth-1")
 	if errResolve != nil {
 		t.Fatal(errResolve)
@@ -111,10 +165,10 @@ func TestRecoveryProbeMissingThinkingAfterStrikeBecomesPermanent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	meta := guardMeta(saved)
-	if meta.DisableKind != DisableKindPermanent || !authDisabled(saved) {
-		t.Fatalf("unexpected auth metadata: %#v", meta)
+	if !authDisabled(saved) {
+		t.Fatalf("recovery failure did not disable auth: %#v", saved)
 	}
+	assertNoGuardMetadata(t, saved)
 }
 
 func TestAutoCooldownDoesNotExtendActiveCooldown(t *testing.T) {
@@ -193,18 +247,27 @@ func TestRefreshCatalogMarksExternallyDisabled(t *testing.T) {
 	}
 }
 
+func TestReconcileSkipsEnabledUnknownAccounts(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	plugin := newTestPlugin(t, host, nil)
+
+	if err := plugin.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	host.mu.Lock()
+	defer host.mu.Unlock()
+	if len(host.authGets) != 0 {
+		t.Fatalf("reconcile read enabled unknown auths: %#v", host.authGets)
+	}
+}
 func TestReconcileRepairsTemporaryProbeEnable(t *testing.T) {
-	entries, auths := singleGrokAuth(t, "auth-1", "alice@example.com", map[string]any{
-		"grok_quality_guard": map[string]any{
-			"managed":        true,
-			"disable_kind":   DisableKindCooldown,
-			"cooldown_until": time.Now().UTC().Add(time.Hour).Format(time.RFC3339),
-		},
-	})
+	entries, auths := singleGrokAuth(t, "auth-1", "alice@example.com", map[string]any{})
 	host := newMockHostCall(entries, auths)
 	plugin := newTestPlugin(t, host, nil)
 	if err := plugin.updateStateAccount("auth-1", func(account *AccountState) error {
 		account.State = StateCooling
+		account.DisableKind = DisableKindCooldown
 		account.CooldownUntil = time.Now().UTC().Add(time.Hour)
 		return nil
 	}); err != nil {
@@ -227,15 +290,17 @@ func TestReconcileRepairsTemporaryProbeEnable(t *testing.T) {
 }
 
 func TestCooldownOnlyRecoveryFailureKeepsCooling(t *testing.T) {
-	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", map[string]any{
-		"grok_quality_guard": map[string]any{
-			"managed":                 true,
-			"disable_kind":            DisableKindCooldown,
-			"strike_missing_thinking": true,
-		},
-	})
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", map[string]any{})
 	host := newMockHostCall(entries, auths)
 	plugin := newTestPlugin(t, host, func(cfg *Config) { cfg.AutoAction = "cooldown_only" })
+	if errUpdate := plugin.updateStateAccount("auth-1", func(account *AccountState) error {
+		account.State = StateCooling
+		account.DisableKind = DisableKindCooldown
+		account.QualityStrikeMissingThinking = true
+		return nil
+	}); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
 	_, response, raw, errResolve := plugin.resolveAuth(context.Background(), "auth-1")
 	if errResolve != nil {
 		t.Fatal(errResolve)
@@ -258,9 +323,10 @@ func TestCooldownOnlyRecoveryFailureKeepsCooling(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !authDisabled(saved) || guardMeta(saved).DisableKind != DisableKindCooldown {
-		t.Fatalf("unexpected auth metadata: %#v", guardMeta(saved))
+	if !authDisabled(saved) {
+		t.Fatalf("cooldown-only recovery failure did not disable auth: %#v", saved)
 	}
+	assertNoGuardMetadata(t, saved)
 }
 
 func TestCooldownOnlyAppliesCooldownOnConfirmedAnomaly(t *testing.T) {

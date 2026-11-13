@@ -62,10 +62,11 @@ type Plugin struct {
 	pendingMu sync.Mutex
 	pending   map[string]*PendingObservation
 
-	probeGate   sync.Mutex
-	probeCond   *sync.Cond
-	probeActive int
-	probing     map[string]struct{}
+	probeGate            sync.Mutex
+	probeCond            *sync.Cond
+	probeActive          int
+	probePriorityWaiters int
+	probing              map[string]struct{}
 
 	probeSkipMu sync.Mutex
 	probeSkip   map[string]time.Time
@@ -473,15 +474,11 @@ func (p *Plugin) ensureStateAccount(state *State, authID, email, label string) *
 }
 
 func (p *Plugin) stateAccount(authID string) (AccountState, bool) {
-	if p.stateStore() == nil {
+	store := p.stateStore()
+	if store == nil {
 		return AccountState{}, false
 	}
-	state := p.stateStore().Snapshot()
-	account, ok := state.Accounts[authID]
-	if !ok || account == nil {
-		return AccountState{}, false
-	}
-	return *account, true
+	return store.AccountSnapshot(authID)
 }
 
 func (p *Plugin) updateStateAccount(authID string, fn func(*AccountState) error) error {

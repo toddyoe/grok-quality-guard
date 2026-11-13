@@ -768,6 +768,9 @@ func (p *Plugin) rotateAfterFailure(ctx context.Context, authID, class string) (
 	if isIsolatedState(stateAccount.State) {
 		return false, nil
 	}
+	if !stateAccount.Resin.Managed {
+		return false, nil
+	}
 	if errRotate := p.RotateResin(ctx, authID); errRotate != nil {
 		_ = p.recordAttemptError(authID, ClassProxyError, errRotate)
 		return false, errRotate

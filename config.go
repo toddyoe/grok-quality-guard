@@ -15,8 +15,11 @@ import (
 )
 
 const (
-	stateSchemaVersion = 1
-	defaultEventsLimit = 1000
+	stateSchemaVersion        = 1
+	defaultEventsLimit        = 1000
+	defaultProbeQueueSize     = 10000
+	maxProbeQueueSize         = 1000000
+	defaultProbeUnknownJitter = 30 * time.Second
 )
 
 // Duration accepts YAML and JSON duration strings while keeping a stable text form
@@ -101,7 +104,9 @@ type ProbeConfig struct {
 	Timeout         Duration `yaml:"timeout" json:"timeout"`
 	MaxOutputTokens int      `yaml:"max_output_tokens" json:"max_output_tokens"`
 	Concurrency     int      `yaml:"concurrency" json:"concurrency"`
+	QueueSize       int      `yaml:"queue_size" json:"queue_size"`
 	UnknownDelay    Duration `yaml:"unknown_delay" json:"unknown_delay"`
+	UnknownJitter   Duration `yaml:"unknown_jitter" json:"unknown_jitter"`
 	SuspectBackoff  Duration `yaml:"suspect_backoff" json:"suspect_backoff"`
 	MaxBackoff      Duration `yaml:"max_backoff" json:"max_backoff"`
 	EntryProtocol   string   `yaml:"entry_protocol" json:"entry_protocol"`
@@ -178,7 +183,9 @@ func DefaultProbeConfig() ProbeConfig {
 		Timeout:         NewDuration(90 * time.Second),
 		MaxOutputTokens: 768,
 		Concurrency:     1,
+		QueueSize:       defaultProbeQueueSize,
 		UnknownDelay:    NewDuration(30 * time.Second),
+		UnknownJitter:   NewDuration(defaultProbeUnknownJitter),
 		SuspectBackoff:  NewDuration(15 * time.Minute),
 		MaxBackoff:      NewDuration(time.Hour),
 		EntryProtocol:   "codex",
@@ -357,8 +364,17 @@ func normalizeProbe(p *ProbeConfig) error {
 	if p.Concurrency <= 0 {
 		p.Concurrency = defaults.Concurrency
 	}
+	if p.QueueSize <= 0 {
+		p.QueueSize = defaults.QueueSize
+	}
+	if p.QueueSize > maxProbeQueueSize {
+		return fmt.Errorf("probe.queue_size must be <= %d", maxProbeQueueSize)
+	}
 	if p.UnknownDelay.Duration <= 0 {
 		p.UnknownDelay = defaults.UnknownDelay
+	}
+	if p.UnknownJitter.Duration < 0 {
+		return fmt.Errorf("probe.unknown_jitter must be >= 0")
 	}
 	if p.SuspectBackoff.Duration <= 0 {
 		p.SuspectBackoff = defaults.SuspectBackoff

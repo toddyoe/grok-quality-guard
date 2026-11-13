@@ -104,6 +104,7 @@ type AccountState struct {
 	ProbeBackoffUntil            time.Time        `json:"probe_backoff_until,omitempty"`
 	DisableKind                  string           `json:"disable_kind,omitempty"`
 	PreviousDisabled             bool             `json:"previous_disabled,omitempty"`
+	AuthDisabledIntent           *bool            `json:"auth_disabled_intent,omitempty"`
 	Resin                        ResinState       `json:"resin"`
 	Metrics                      Metrics          `json:"metrics"`
 }
@@ -346,6 +347,19 @@ func (s *StateStore) Snapshot() State {
 	return cloneState(s.state)
 }
 
+func (s *StateStore) AccountSnapshot(authID string) (AccountState, bool) {
+	if s == nil {
+		return AccountState{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	account, ok := s.state.Accounts[authID]
+	if !ok || account == nil {
+		return AccountState{}, false
+	}
+	return *cloneAccountState(account), true
+}
+
 func (s *StateStore) Update(fn func(*State) error) error {
 	if s == nil {
 		return errors.New("state store is nil")
@@ -452,21 +466,32 @@ func cloneState(state State) State {
 		if account == nil {
 			continue
 		}
-		copied := *account
-		if account.LastAttempt != nil {
-			attempt := *account.LastAttempt
-			copied.LastAttempt = &attempt
-		}
-		if account.LastEvidence != nil {
-			evidence := *account.LastEvidence
-			copied.LastEvidence = &evidence
-		}
-		clone.Accounts[key] = &copied
+		clone.Accounts[key] = cloneAccountState(account)
 	}
 	if state.Events != nil {
 		clone.Events = append([]Event{}, state.Events...)
 	}
 	return clone
+}
+
+func cloneAccountState(account *AccountState) *AccountState {
+	if account == nil {
+		return nil
+	}
+	copied := *account
+	if account.LastAttempt != nil {
+		attempt := *account.LastAttempt
+		copied.LastAttempt = &attempt
+	}
+	if account.LastEvidence != nil {
+		evidence := *account.LastEvidence
+		copied.LastEvidence = &evidence
+	}
+	if account.AuthDisabledIntent != nil {
+		intent := *account.AuthDisabledIntent
+		copied.AuthDisabledIntent = &intent
+	}
+	return &copied
 }
 
 func trimEvents(state *State, limit int) {

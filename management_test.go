@@ -129,7 +129,7 @@ func TestManagementResourceAndActionAccess(t *testing.T) {
 	if strings.Contains(string(response.Body), "对齐旧插件") {
 		t.Fatal("dashboard should describe the setting semantically instead of referencing the old plugin")
 	}
-	for _, expected := range []string{"概览", "账号质量", "Resin 租约", "事件日志", "设置", "24 小时统计", "resin.config.get", "resin.clear", "leaseSelectAll", "clearSelectedBtn", "accountsPager", "leasesPager", "eventsPager", "selectFilteredBtn", "selectAllAccountsBtn", "全选当前筛选", "全选所有账号", "选择本页全部账号", "r_local_only", "本地轮换", "state_file.update", "id=\"p_state_file\" type=\"text\"", "summary-value truncate", "连续检测到缺少真实思考的响应达到该次数后触发处置或交叉验证", `type="password"`, "const REASON_DETAIL_LABELS", "'expected marker missing': '探测标记缺失'", "'output tokens per second exceeded hard threshold': '输出 Token 速度超过硬阈值'", "'output tokens per second exceeded soft threshold': '输出 Token 速度超过软阈值'", "'probe stream produced no parseable events': '探测流未产生可解析事件'", "'probe stream ended without a terminal event': '探测流结束但未收到终止事件'", "真实思考：", "终止：", "解析失败：", "<td class=\"nowrap\">", "actions-cell", "includeTime: false", "accountRefreshBtn", "leaseRefreshBtn", "eventRefreshBtn", "accountProbeAllBtn", "accounts.probe_non_healthy", "accountRestoreAllBtn", "accounts.restore_non_healthy"} {
+	for _, expected := range []string{"概览", "账号质量", "Resin 租约", "事件日志", "设置", "24 小时统计", "resin.config.get", "resin.clear", "leaseSelectAll", "clearSelectedBtn", "accountsPager", "leasesPager", "eventsPager", "selectFilteredBtn", "selectAllAccountsBtn", "全选当前筛选", "全选所有账号", "选择本页全部账号", "r_local_only", "本地轮换", "state_file.update", "id=\"p_state_file\" type=\"text\"", "summary-value truncate", "连续检测到缺少真实思考的响应达到该次数后触发处置或交叉验证", `type="password"`, "const REASON_DETAIL_LABELS", "'expected marker missing': '探测标记缺失'", "'output tokens per second exceeded hard threshold': '输出 Token 速度超过硬阈值'", "'output tokens per second exceeded soft threshold': '输出 Token 速度超过软阈值'", "'probe stream produced no parseable events': '探测流未产生可解析事件'", "'probe stream ended without a terminal event': '探测流结束但未收到终止事件'", "真实思考：", "终止：", "解析失败：", "<td class=\"nowrap\">", "actions-cell", "includeTime: false", "accountRefreshBtn", "leaseRefreshBtn", "eventRefreshBtn", "accountProbeAllBtn", "accountRestoreAllBtn", "accountSelectionCount", "accountSelectAll", "accountSelectFilteredBtn", "accountSelectAllBtn", "accountClearSelectionBtn", "检测所选", "恢复所选", "accounts.probe_selected", "accounts.restore_selected"} {
 		if !strings.Contains(string(response.Body), expected) {
 			t.Fatalf("dashboard is missing %q", expected)
 		}
@@ -324,17 +324,22 @@ func TestManualProbeRestoresGuardOwnedAccounts(t *testing.T) {
 	}
 }
 
-func TestRestoreNonHealthyBatchManagement(t *testing.T) {
+func TestRestoreSelectedBatchManagement(t *testing.T) {
 	entriesHealthy, authsHealthy := singleGrokAuth(t, "auth-healthy", "[EMAIL]", nil)
 	entriesDegraded, authsDegraded := singleGrokAuth(t, "auth-degraded", "[EMAIL]", nil)
+	entriesUnselected, authsUnselected := singleGrokAuth(t, "auth-unselected", "[EMAIL]", nil)
 	entriesExternal, authsExternal := singleGrokAuth(t, "auth-external", "[EMAIL]", map[string]any{"disabled": true})
 	entries := append(entriesHealthy, entriesDegraded...)
+	entries = append(entries, entriesUnselected...)
 	entries = append(entries, entriesExternal...)
-	auths := make(map[string]json.RawMessage, len(authsHealthy)+len(authsDegraded)+len(authsExternal))
+	auths := make(map[string]json.RawMessage, len(authsHealthy)+len(authsDegraded)+len(authsUnselected)+len(authsExternal))
 	for key, value := range authsHealthy {
 		auths[key] = value
 	}
 	for key, value := range authsDegraded {
+		auths[key] = value
+	}
+	for key, value := range authsUnselected {
 		auths[key] = value
 	}
 	for key, value := range authsExternal {
@@ -346,13 +351,15 @@ func TestRestoreNonHealthyBatchManagement(t *testing.T) {
 		state.Accounts["auth-healthy"].State = StateHealthy
 		state.Accounts["auth-degraded"].State = StateDegraded
 		state.Accounts["auth-degraded"].CooldownUntil = time.Now().UTC().Add(time.Hour)
+		state.Accounts["auth-unselected"].State = StateDegraded
+		state.Accounts["auth-unselected"].CooldownUntil = time.Now().UTC().Add(time.Hour)
 		state.Accounts["auth-external"].State = StateExternallyDisabled
 		return nil
 	}); errUpdate != nil {
 		t.Fatal(errUpdate)
 	}
 
-	body, errMarshal := json.Marshal(actionRequest{Action: "accounts.restore_non_healthy"})
+	body, errMarshal := json.Marshal(actionRequest{Action: "accounts.restore_selected", Params: map[string]any{"auth_ids": []string{"auth-healthy", "auth-degraded", "auth-external"}}})
 	if errMarshal != nil {
 		t.Fatal(errMarshal)
 	}
@@ -366,7 +373,7 @@ func TestRestoreNonHealthyBatchManagement(t *testing.T) {
 	if errUnmarshal := json.Unmarshal(response.Body, &envelope); errUnmarshal != nil {
 		t.Fatalf("decode restore task: %v", errUnmarshal)
 	}
-	if envelope.Data.Kind != "accounts.restore_non_healthy" {
+	if envelope.Data.Kind != "accounts.restore_selected" {
 		t.Fatalf("unexpected task kind: %q", envelope.Data.Kind)
 	}
 	task := waitTaskForTest(t, plugin, envelope.Data.ID)
@@ -381,14 +388,14 @@ func TestRestoreNonHealthyBatchManagement(t *testing.T) {
 	if errUnmarshal := json.Unmarshal(encodedResult, &result); errUnmarshal != nil {
 		t.Fatal(errUnmarshal)
 	}
-	if result.Count != 2 || result.Restored != 1 || result.ExternalLeftDisabled != 1 || result.Failed != 0 {
+	if result.Count != 3 || result.Restored != 1 || result.Skipped != 1 || result.ExternalLeftDisabled != 1 || result.Failed != 0 {
 		t.Fatalf("unexpected restore summary: %#v", result)
 	}
 	statuses := make(map[string]string, len(result.Items))
 	for _, item := range result.Items {
 		statuses[item.AuthID] = item.Status
 	}
-	if statuses["auth-degraded"] != "restored" || statuses["auth-external"] != "external_left_disabled" {
+	if statuses["auth-healthy"] != "skipped" || statuses["auth-degraded"] != "restored" || statuses["auth-external"] != "external_left_disabled" {
 		t.Fatalf("unexpected restore items: %#v", result.Items)
 	}
 	state := plugin.stateStore().Snapshot()
@@ -401,12 +408,15 @@ func TestRestoreNonHealthyBatchManagement(t *testing.T) {
 	if state.Accounts["auth-external"].State != StateUnknown {
 		t.Fatalf("external account guard state was not cleared: %#v", state.Accounts["auth-external"])
 	}
+	if state.Accounts["auth-unselected"].State != StateDegraded || state.Accounts["auth-unselected"].CooldownUntil.IsZero() {
+		t.Fatalf("unselected account was modified: %#v", state.Accounts["auth-unselected"])
+	}
 	if _, saved := host.saves["auth-external"]; saved {
 		t.Fatal("external disabled auth must not be modified")
 	}
 }
 
-func TestProbeNonHealthyBatchManagement(t *testing.T) {
+func TestProbeSelectedBatchManagement(t *testing.T) {
 	entriesHealthy, authsHealthy := singleGrokAuth(t, "auth-healthy", "[EMAIL]", nil)
 	entriesSuspect, authsSuspect := singleGrokAuth(t, "auth-suspect", "[EMAIL]", nil)
 	entriesGuard, authsGuard := singleGrokAuth(t, "auth-guard", "[EMAIL]", nil)
@@ -446,7 +456,7 @@ func TestProbeNonHealthyBatchManagement(t *testing.T) {
 		t.Fatalf("disable guard account status = %d body=%s", response.StatusCode, response.Body)
 	}
 
-	body, errMarshal := json.Marshal(actionRequest{Action: "accounts.probe_non_healthy"})
+	body, errMarshal := json.Marshal(actionRequest{Action: "accounts.probe_selected", Params: map[string]any{"auth_ids": []string{"auth-suspect", "auth-guard", "auth-external"}}})
 	if errMarshal != nil {
 		t.Fatal(errMarshal)
 	}
@@ -460,7 +470,7 @@ func TestProbeNonHealthyBatchManagement(t *testing.T) {
 	if errUnmarshal := json.Unmarshal(response.Body, &envelope); errUnmarshal != nil {
 		t.Fatalf("decode probe task: %v", errUnmarshal)
 	}
-	if envelope.Data.Kind != "accounts.probe_non_healthy" {
+	if envelope.Data.Kind != "accounts.probe_selected" {
 		t.Fatalf("unexpected task kind: %q", envelope.Data.Kind)
 	}
 	task := waitTaskForTest(t, plugin, envelope.Data.ID)
@@ -475,7 +485,7 @@ func TestProbeNonHealthyBatchManagement(t *testing.T) {
 	if errUnmarshal := json.Unmarshal(encodedResult, &result); errUnmarshal != nil {
 		t.Fatal(errUnmarshal)
 	}
-	if result.Count != 3 || result.Probed != 2 || result.Skipped != 1 || result.Failed != 0 {
+	if result.Count != 3 || result.Probed != 2 || result.Restored != 1 || result.Skipped != 1 || result.Failed != 0 {
 		t.Fatalf("unexpected probe summary: %#v", result)
 	}
 	statuses := make(map[string]string, len(result.Items))
@@ -497,6 +507,109 @@ func TestProbeNonHealthyBatchManagement(t *testing.T) {
 	}
 	if state.Accounts["auth-external"].State != StateExternallyDisabled {
 		t.Fatalf("external account should be skipped: %#v", state.Accounts["auth-external"])
+	}
+}
+
+func TestProbeSelectedRestoresUsingExecutionTimeState(t *testing.T) {
+	entriesFirst, authsFirst := singleGrokAuth(t, "auth-first", "[EMAIL]", nil)
+	entriesSecond, authsSecond := singleGrokAuth(t, "auth-second", "[EMAIL]", nil)
+	entries := append(entriesFirst, entriesSecond...)
+	auths := make(map[string]json.RawMessage, len(authsFirst)+len(authsSecond))
+	for key, value := range authsFirst {
+		auths[key] = value
+	}
+	for key, value := range authsSecond {
+		auths[key] = value
+	}
+	host := newMockHostCall(entries, auths)
+	scriptHealthyProbeStream(t, host, "auth-first")
+	scriptHealthyProbeStream(t, host, "auth-second")
+	plugin := newTestPlugin(t, host, func(cfg *Config) {
+		cfg.Probe.Concurrency = 1
+		cfg.Quality.SoftTPS = 1e9
+		cfg.Quality.HardTPS = 2e9
+	})
+	if errUpdate := plugin.stateStore().Update(func(state *State) error {
+		state.Accounts["auth-first"].State = StateSuspect
+		state.Accounts["auth-second"].State = StateSuspect
+		return nil
+	}); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+
+	entered := make(chan string, 2)
+	release := make(chan struct{})
+	installStreamHold(entered, release)
+	body, errMarshal := json.Marshal(actionRequest{Action: "accounts.probe_selected", Params: map[string]any{
+		"auth_ids": []string{"auth-first", "auth-second"},
+	}})
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	response := callManagementForTest(t, plugin, http.MethodPost, "/plugins/grok-quality-guard/api", http.Header{"Content-Type": []string{"application/json"}}, body)
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("probe batch status = %d body=%s", response.StatusCode, response.Body)
+	}
+	var envelope struct {
+		Data Task `json:"data"`
+	}
+	if errUnmarshal := json.Unmarshal(response.Body, &envelope); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	select {
+	case authID := <-entered:
+		if authID != "auth-first" {
+			t.Fatalf("first executed auth = %q, want auth-first", authID)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("first selected probe did not start")
+	}
+	if errUpdate := plugin.stateStore().Update(func(state *State) error {
+		state.Accounts["auth-second"].State = StateDisabledByGuard
+		return nil
+	}); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+	close(release)
+
+	task := waitTaskForTest(t, plugin, envelope.Data.ID)
+	if task.Status != taskStatusSucceeded {
+		t.Fatalf("probe batch task failed: %#v", task)
+	}
+	encodedResult, errMarshalResult := json.Marshal(task.Result)
+	if errMarshalResult != nil {
+		t.Fatal(errMarshalResult)
+	}
+	var result probeBatchResult
+	if errUnmarshal := json.Unmarshal(encodedResult, &result); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if result.Probed != 2 || result.Restored != 1 || result.Failed != 0 {
+		t.Fatalf("unexpected probe summary: %#v", result)
+	}
+	statuses := make(map[string]probeBatchItem, len(result.Items))
+	for _, item := range result.Items {
+		statuses[item.AuthID] = item
+	}
+	second := statuses["auth-second"]
+	if second.StateBefore != StateDisabledByGuard || !second.Restored || second.Status != "probed" {
+		t.Fatalf("second account did not use execution-time restore decision: %#v", second)
+	}
+}
+
+func TestSelectedBatchActionsRejectInvalidAuthIDs(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	plugin := newTestPlugin(t, host, nil)
+	for _, action := range []string{"accounts.probe_selected", "accounts.restore_selected"} {
+		empty := actionManagementForTest(t, plugin, action, nil)
+		if empty.StatusCode != http.StatusBadRequest {
+			t.Fatalf("%s without auth_ids status = %d body=%s", action, empty.StatusCode, empty.Body)
+		}
+		unknown := actionManagementForTest(t, plugin, action, map[string]any{"auth_ids": []string{"missing"}})
+		if unknown.StatusCode != http.StatusBadRequest {
+			t.Fatalf("%s unknown auth status = %d body=%s", action, unknown.StatusCode, unknown.Body)
+		}
 	}
 }
 

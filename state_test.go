@@ -18,11 +18,13 @@ func TestStateStorePersistsAndReloads(t *testing.T) {
 		t.Fatal(errLoad)
 	}
 	if errUpdate := store.Update(func(state *State) error {
+		intent := false
 		state.Accounts["auth-1"] = &AccountState{
-			AuthID:        "auth-1",
-			State:         StateCooling,
-			FirstSeenAt:   time.Now().UTC(),
-			CooldownUntil: time.Now().UTC().Add(time.Hour),
+			AuthID:             "auth-1",
+			State:              StateCooling,
+			FirstSeenAt:        time.Now().UTC(),
+			CooldownUntil:      time.Now().UTC().Add(time.Hour),
+			AuthDisabledIntent: &intent,
 		}
 		return nil
 	}); errUpdate != nil {
@@ -45,7 +47,7 @@ func TestStateStorePersistsAndReloads(t *testing.T) {
 	}
 	snapshot := reloaded.Snapshot()
 	account := snapshot.Accounts["auth-1"]
-	if account == nil || account.State != StateCooling || account.CooldownUntil.IsZero() {
+	if account == nil || account.State != StateCooling || account.CooldownUntil.IsZero() || account.AuthDisabledIntent == nil || *account.AuthDisabledIntent {
 		t.Fatalf("reloaded account mismatch: %#v", account)
 	}
 	matches, errGlob := filepath.Glob(filepath.Join(filepath.Dir(path), ".state-*.tmp"))

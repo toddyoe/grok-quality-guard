@@ -31,6 +31,7 @@ type mockHostCall struct {
 	closes       map[string]*pluginabi.Error
 	modelCalls   []pluginapi.HostModelExecutionRequest
 	callbacks    []string
+	authGets     []string
 }
 
 func newMockHostCall(entries []pluginapi.HostAuthFileEntry, auths map[string]json.RawMessage) *mockHostCall {
@@ -93,6 +94,7 @@ func (m *mockHostCall) call(method string, payload any) (json.RawMessage, error)
 		}
 		m.mu.Lock()
 		defer m.mu.Unlock()
+		m.authGets = append(m.authGets, req.AuthIndex)
 		raw, ok := m.auths[req.AuthIndex]
 		if !ok {
 			return nil, fmt.Errorf("mock auth %s not found", req.AuthIndex)
@@ -283,4 +285,11 @@ func singleGrokAuth(t *testing.T, authID, email string, extra map[string]any) ([
 
 func streamData(payload string) pluginapi.HostModelStreamReadResponse {
 	return pluginapi.HostModelStreamReadResponse{Payload: []byte(payload)}
+}
+
+func assertNoGuardMetadata(t *testing.T, raw map[string]json.RawMessage) {
+	t.Helper()
+	if _, ok := raw["grok_quality_guard"]; ok {
+		t.Fatalf("auth file contains legacy guard metadata: %#v", raw["grok_quality_guard"])
+	}
 }

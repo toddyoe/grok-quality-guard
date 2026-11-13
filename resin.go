@@ -64,15 +64,15 @@ func (p *Plugin) BindResin(ctx context.Context, authID string, dryRun bool) (Res
 	if errResolve != nil {
 		return ResinBindResult{AuthID: authID, DryRun: dryRun, Error: errResolve.Error()}, errResolve
 	}
-	meta := guardMeta(raw)
+	stateAccount, _ := p.stateAccount(authID)
 	existingProxy := strings.TrimSpace(authRawString(raw, "proxy_url"))
-	if existingProxy != "" && !meta.Managed {
+	if existingProxy != "" && !stateAccount.Resin.Managed {
 		return ResinBindResult{AuthID: authID, DryRun: dryRun, Conflict: true, Error: "auth already has a non-managed proxy_url"}, fmt.Errorf("proxy_url conflict")
 	}
-	if meta.Managed && meta.ResinAccount != "" {
-		return ResinBindResult{AuthID: authID, Account: meta.ResinAccount, ProxyURL: maskProxyURL(existingProxy), DryRun: dryRun}, nil
+	if stateAccount.Resin.Managed && stateAccount.Resin.Account != "" && existingProxy != "" {
+		return ResinBindResult{AuthID: authID, Account: stateAccount.Resin.Account, ProxyURL: maskProxyURL(existingProxy), DryRun: dryRun}, nil
 	}
-	generated, errGenerate := p.generateResinAccount(ctx, authID, raw)
+	generated, errGenerate := p.generateResinAccount(authID, raw)
 	if errGenerate != nil {
 		return ResinBindResult{AuthID: authID, DryRun: dryRun, Error: errGenerate.Error()}, errGenerate
 	}
@@ -88,13 +88,8 @@ func (p *Plugin) BindResin(ctx context.Context, authID string, dryRun bool) (Res
 	if dryRun {
 		return result, nil
 	}
-	meta.Managed = true
-	meta.ResinAccount = generated
-	meta.ResinGeneration++
+	generation := stateAccount.Resin.Generation + 1
 	setRawString(raw, "proxy_url", proxyURL)
-	if errMeta := setGuardMeta(raw, meta); errMeta != nil {
-		return result, errMeta
-	}
 	encoded, errMarshal := marshalRawMap(raw)
 	if errMarshal != nil {
 		return result, errMarshal
@@ -103,7 +98,7 @@ func (p *Plugin) BindResin(ctx context.Context, authID string, dryRun bool) (Res
 		return result, errSave
 	}
 	if errUpdate := p.updateStateAccount(authID, func(stateAccount *AccountState) error {
-		stateAccount.Resin = ResinState{Managed: true, Account: generated, Generation: meta.ResinGeneration}
+		stateAccount.Resin = ResinState{Managed: true, Account: generated, Generation: generation}
 		if stateAccount.State == "" {
 			stateAccount.State = StateUnknown
 		}
@@ -127,20 +122,16 @@ func (p *Plugin) ClearResinProxy(ctx context.Context, authID string) (ResinClear
 	if errResolve != nil {
 		return ResinClearResult{AuthID: authID, Error: errResolve.Error()}, errResolve
 	}
-	meta := guardMeta(raw)
 	stateAccount, _ := p.stateAccount(authID)
 	generation := stateAccount.Resin.Generation
-	if meta.ResinGeneration > generation {
-		generation = meta.ResinGeneration
-	}
-	account := firstNonEmpty(meta.ResinAccount, stateAccount.Resin.Account)
+	account := stateAccount.Resin.Account
 	proxyURL := strings.TrimSpace(authRawString(raw, "proxy_url"))
 	result := ResinClearResult{
 		AuthID:   authID,
 		Account:  account,
 		ProxyURL: maskProxyURL(proxyURL),
 	}
-	hasManagedLease := meta.Managed || stateAccount.Resin.Managed || account != ""
+	hasManagedLease := stateAccount.Resin.Managed || account != ""
 	if proxyURL == "" && !hasManagedLease {
 		result.Skipped = true
 		return result, nil
@@ -164,12 +155,6 @@ func (p *Plugin) ClearResinProxy(ctx context.Context, authID string) (ResinClear
 		}
 	}
 	delete(raw, "proxy_url")
-	meta.Managed = false
-	meta.ResinAccount = ""
-	if errMeta := setGuardMeta(raw, meta); errMeta != nil {
-		result.Error = errMeta.Error()
-		return result, errMeta
-	}
 	encoded, errMarshal := marshalRawMap(raw)
 	if errMarshal != nil {
 		result.Error = errMarshal.Error()
@@ -221,8 +206,8 @@ func (p *Plugin) BindUnboundResin(ctx context.Context, dryRun bool) ([]ResinBind
 			results = append(results, ResinBindResult{AuthID: account.ID, DryRun: dryRun, Error: errResolve.Error()})
 			continue
 		}
-		meta := guardMeta(raw)
-		if meta.ResinAccount != "" || strings.TrimSpace(authRawString(raw, "proxy_url")) != "" {
+		stateAccount, _ := p.stateAccount(account.ID)
+		if stateAccount.Resin.Account != "" || strings.TrimSpace(authRawString(raw, "proxy_url")) != "" {
 			continue
 		}
 		result, errBind := p.BindResin(ctx, account.ID, dryRun)
@@ -246,19 +231,21 @@ func (p *Plugin) RotateResin(ctx context.Context, authID string) error {
 	if errResolve != nil {
 		return errResolve
 	}
-	meta := guardMeta(raw)
 	stateAccount, _ := p.stateAccount(authID)
+	if !stateAccount.Resin.Managed {
+		return fmt.Errorf("auth proxy is not managed by resin")
+	}
 	proxyURL := strings.TrimSpace(authRawString(raw, "proxy_url"))
-	previousAccount := firstNonEmpty(meta.ResinAccount, stateAccount.Resin.Account, resinAccountFromProxyURL(proxyURL))
+	previousAccount := firstNonEmpty(stateAccount.Resin.Account, resinAccountFromProxyURL(proxyURL))
 	if proxyURL == "" && previousAccount == "" {
 		return fmt.Errorf("auth has no proxy_url to rotate")
 	}
-	newAccount, errGenerate := p.generateResinAccountAvoiding(ctx, authID, raw, previousAccount)
+	newAccount, errGenerate := p.generateResinAccountAvoiding(authID, raw, previousAccount)
 	if errGenerate != nil {
 		return errGenerate
 	}
 	remoteLeaseDeleted := false
-	if !cfg.LocalOnly && (meta.Managed || stateAccount.Resin.Managed) && previousAccount != "" {
+	if !cfg.LocalOnly && previousAccount != "" {
 		operationCfg, errResolvePlatform := resolveResinPlatformForOperation(ctx, cfg)
 		if errResolvePlatform != nil {
 			return errResolvePlatform
@@ -286,13 +273,8 @@ func (p *Plugin) RotateResin(ctx context.Context, authID string) error {
 		}
 		proxyURL = rotatedProxyURL
 	}
-	meta.Managed = true
-	meta.ResinAccount = newAccount
-	meta.ResinGeneration++
+	generation := stateAccount.Resin.Generation + 1
 	setRawString(raw, "proxy_url", proxyURL)
-	if errMeta := setGuardMeta(raw, meta); errMeta != nil {
-		return errMeta
-	}
 	encoded, errMarshal := marshalRawMap(raw)
 	if errMarshal != nil {
 		return errMarshal
@@ -301,7 +283,7 @@ func (p *Plugin) RotateResin(ctx context.Context, authID string) error {
 		return errSave
 	}
 	if errUpdate := p.updateStateAccount(authID, func(stateAccount *AccountState) error {
-		stateAccount.Resin = ResinState{Managed: true, Account: newAccount, Generation: meta.ResinGeneration}
+		stateAccount.Resin = ResinState{Managed: true, Account: newAccount, Generation: generation}
 		return nil
 	}); errUpdate != nil {
 		return errUpdate
@@ -356,28 +338,18 @@ func rewriteResinProxyAccount(proxyURL, account string) (string, error) {
 	return parsed.String(), nil
 }
 
-func (p *Plugin) generateResinAccount(ctx context.Context, authID string, raw map[string]json.RawMessage) (string, error) {
-	return p.generateResinAccountAvoiding(ctx, authID, raw, guardMeta(raw).ResinAccount)
+func (p *Plugin) generateResinAccount(authID string, raw map[string]json.RawMessage) (string, error) {
+	stateAccount, _ := p.stateAccount(authID)
+	return p.generateResinAccountAvoiding(authID, raw, stateAccount.Resin.Account)
 }
 
-func (p *Plugin) generateResinAccountAvoiding(ctx context.Context, authID string, raw map[string]json.RawMessage, oldAccount string) (string, error) {
+func (p *Plugin) generateResinAccountAvoiding(authID string, raw map[string]json.RawMessage, oldAccount string) (string, error) {
 	base := resinAccountBase(raw)
 	state := p.stateStore().Snapshot()
 	used := make(map[string]struct{}, len(state.Accounts))
 	for _, account := range state.Accounts {
 		if account != nil && account.Resin.Account != "" {
 			used[account.Resin.Account] = struct{}{}
-		}
-	}
-	for _, catalogAccount := range p.catalogSnapshot() {
-		if catalogAccount.ID == authID {
-			continue
-		}
-		_, _, otherRaw, err := p.resolveAuth(ctx, catalogAccount.ID)
-		if err == nil {
-			if value := guardMeta(otherRaw).ResinAccount; value != "" {
-				used[value] = struct{}{}
-			}
 		}
 	}
 	for attempt := 0; attempt < 32; attempt++ {
@@ -397,7 +369,8 @@ func (p *Plugin) generateResinAccountAvoiding(ctx context.Context, authID string
 		}
 		return candidate, nil
 	}
-	suffixSeed := fmt.Sprintf("%s|%d|%d", authID, time.Now().UnixNano(), guardMeta(raw).ResinGeneration)
+	stateAccount, _ := p.stateAccount(authID)
+	suffixSeed := fmt.Sprintf("%s|%d|%d", authID, time.Now().UnixNano(), stateAccount.Resin.Generation)
 	sum := sha256.Sum256([]byte(suffixSeed))
 	for offset := 0; offset+4 <= len(sum); offset += 4 {
 		candidate := "grok-" + base + "-" + base36FromBytes(sum[offset:offset+4], 4)

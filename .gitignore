@@ -1,5 +1,7 @@
 # Binaries
 *.exe
+__pycache__/
+*.py[cod]
 
 # Configuration
 config.yaml

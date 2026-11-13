@@ -621,7 +621,7 @@ disabled_by_guard
 
 `auto_action=cooldown_only`：
 
-1. 第一次确认异常：写临时 `disabled=true`、`disable_kind=cooldown`、`cooldown_until=now+对应冷却时长`，状态 `cooling`。
+1. 第一次确认异常：auth 写 `disabled=true`，state 写 `disable_kind=cooldown`、`cooldown_until=now+对应冷却时长`，状态 `cooling`。
 2. 冷却期内再次观测到异常：保持当前冷却，不重复延长。
 3. 冷却到期后执行恢复探测。
 4. 恢复探测成功：恢复 `disabled=false`，状态 `healthy`。
@@ -630,11 +630,11 @@ disabled_by_guard
 
 `auto_action=cooldown_then_disable`：
 
-1. 第一次确认 `missing_thinking`：写临时 `disabled=true`、`disable_kind=cooldown`、`cooldown_until=now+12h`，状态 `cooling`。
+1. 第一次确认 `missing_thinking`：auth 写 `disabled=true`，state 写 `disable_kind=cooldown`、`cooldown_until=now+12h`，状态 `cooling`。
 2. 冷却期内再次观测到异常：保持当前冷却，不重复延长或立即禁用。
-3. 冷却到期：只有在 auth 仍由 guard 控制且未被管理员手动改动时，临时恢复。
+3. 冷却到期：只有在 state 仍记录该账号由 guard 控制且未被管理员手动改动时，临时恢复。
 4. 恢复探测成功：恢复 `disabled=false`，清除 cooldown，状态 `healthy`，保留 `strike_missing_thinking=true`。
-5. 恢复探测再次确认 `missing_thinking`：写永久 `disabled=true`，`disable_kind=permanent`，状态 `disabled_by_guard`。
+5. 恢复探测再次确认 `missing_thinking`：auth 写 `disabled=true`，state 写 `disable_kind=permanent`，状态 `disabled_by_guard`。
 6. 恢复探测网络错误：重新写回 cooldown，增加 backoff，不直接永久禁用。
 
 上游账号状态错误独立于质量 strike：`credential_invalid` 直接禁用并等待凭据更新；`quota_exhausted` 使用固定 24 小时冷却，因为 Grok 免费额度按滚动 24 小时窗口恢复。这两类处置不受 `auto_action: observe` 限制，避免失效凭据或耗尽额度继续参与路由。
@@ -654,22 +654,21 @@ disabled_by_guard
 
 ### 5.4 冷却写入与恢复
 
-写 disabled 时必须读取完整 auth JSON，仅修改 `disabled` 和 `grok_quality_guard` 元数据。
+写 disabled 时必须读取完整 auth JSON，但只允许修改 CPA 原生字段 `disabled`。禁用原因、所有权、冷却截止时间和 strike 全部保存在 `state.json`。
 
 必须保留 access token、refresh token、id token、expiry、email、type、provider 及其他未知字段。
 
 恢复时只能操作满足以下条件的 auth：
 
 - `disabled=true`
-- `grok_quality_guard.managed=true`
-- `disable_kind=cooldown`
-- 当前 `grok_quality_guard` 仍与插件状态一致
+- state 中该账号处于插件隔离状态
+- state 中存在非空 `disable_kind`
 
-如果管理员在冷却期间手动改变 auth，插件不得自动恢复。
+如果 auth 已 `disabled=true` 但 state 中没有 `disable_kind`，视为外部禁用。若管理员在冷却期间手动启用 auth，reconciler 只在冷却仍有效时修复临时启用窗口；冷却已过期时尊重 auth 当前启用状态并清理插件隔离字段。
 
 ### 5.5 外部禁用
 
-插件首次发现 auth 已 `disabled=true` 且没有 guard 元数据时：
+插件首次发现 auth 已 `disabled=true` 且 state 中没有插件禁用所有权时：
 
 - 状态标为 `externally_disabled`
 - 不探测
@@ -972,16 +971,19 @@ QUALITY_OK
 
 并发：
 
-- 全局并发 1
+- 扫描阶段一次性过滤出到期的非健康账号，再放入有界队列
+- 队列容量由 `probe.queue_size` 控制，默认 10000，最大 1000000
+- 全局并发由 `probe.concurrency` 控制，只启动与并发数相同的 probe goroutine
 - 同一账号同时最多 1 个 probe
-- 使用 jitter 避免启动时全部探测
+- `probe.unknown_jitter` 为首次探测增加稳定抖动，避免启动时全部到期
+- 队列按 auth ID 去重；worker 出队后再次检查 due 状态
 
 ### 8.4 探测与凭证 disabled
 
 CPA 不允许直接执行 disabled auth。恢复探测流程必须：
 
 1. 读取完整 auth
-2. 检查 guard 元数据
+2. 检查 state 中的 `disable_kind` 和 `AuthDisabledIntent`
 3. 临时写 `disabled=false`
 4. 立即发起固定 AuthID 探测
 5. 成功后保持启用
@@ -1088,19 +1090,18 @@ grok-auth_7f3a82d1-3n5q
 4. 使用 `platform_id` 调用 `GET /api/v1/platforms/{platform_id}`，取得规范平台名
 5. 使用该规范平台名渲染 proxy template
 6. 写 `proxy_url`
-7. 写 guard 元数据
-8. 保存 auth
-9. 更新 state
+7. 保存 auth
+8. 更新 state 中的 Resin 租约信息
 
 ### 9.4 轮换
 
 轮换分为 API 模式和仅本地轮换。两种模式共用以下步骤：
 
-1. 读取 auth 和 guard 元数据
-2. 从 guard 元数据、state 或现有代理用户名中取得旧 account
+1. 读取 auth 和 state 中的 Resin 租约信息
+2. 从 state 或现有代理用户名中取得旧 account
 3. 生成新 account，必须与旧 account 不同
 4. 调用 `host.auth.save` 写回，保留 access/refresh token 等所有字段
-5. 更新 `resin_generation`
+5. 更新 state 中的 `resin_generation`
 6. 每个 auth 使用独立互斥锁，防止并发请求重复轮换
 
 API 模式固定顺序：
@@ -1119,7 +1120,7 @@ API 模式固定顺序：
 2. 解析代理 URL，要求包含 scheme、host、用户名和密码
 3. 用户名必须至少包含一个 `.`，最后一个 `.` 后的部分视为旧 account
 4. 只替换用户名中最后一个 `.` 后的 account，保留 scheme、host、port、password、path、query 等其余部分
-5. 写回 auth 和 guard 元数据
+5. 写回 auth 中的 `proxy_url` 并更新 state
 6. 不调用任何 Resin API，不删除远端旧租约
 7. 事件详情必须标记本次轮换未调用 Resin API
 
@@ -1144,7 +1145,7 @@ socks5h://Default.grok-alice-old1:proxy-secret@resin:2260
 | 网络超时 | 标记 `proxy_error`，冷却，不轮换 |
 | auth save 失败 | 不更新 state，记录失败，保持旧绑定 |
 | 随机 account 冲突 | 重试最多 32 次 |
-| 新 proxy 渲染失败 | 不删除旧 auth 元数据，记录错误 |
+| 新 proxy 渲染失败 | 不修改旧 `proxy_url`，记录错误 |
 | 本地模式无 proxy_url | 返回错误，不写 auth |
 | 本地代理用户名无 account 后缀 | 返回错误，不写 auth |
 | 本地代理缺少密码 | 返回错误，不写 auth |
@@ -1216,11 +1217,11 @@ API 模式的验证与保存都执行同一套服务端验证逻辑。`resin.con
 
 1. API 模式下，插件管理的租约先按 `platform_id` 解析平台并调用 `DELETE /api/v1/platforms/{platform_id}/leases/{account}`
 2. `204` 或 `404` 视为远端租约已删除
-3. 删除成功后移除 auth 中的 `proxy_url`，清除 guard 元数据中的 `managed` 和 `resin_account`，保留租约代数和其他 token 字段
+3. 删除成功后移除 auth 中的 `proxy_url`，清除 state 中的 Resin `managed` 和 `account`，保留租约代数和其他 token 字段
 4. 外部代理没有插件管理的租约，只移除 auth 中的 `proxy_url`，不删除外部代理服务
 5. 仅本地轮换模式只移除 auth 中的代理，不调用 Resin API，也不处理远端租约
 6. 任一账号失败只影响该账号，批量接口继续处理其他账号并在结果中返回逐项错误
-+
+
 ## 10. 管理页与 JSON API
 
 ### 10.1 路径
@@ -1331,9 +1332,11 @@ Content-Type: application/json
 | `accounts.list` | `page`、`page_size`、`state`、`query` | 分页账号列表 |
 | `accounts.get` | `auth_id` | 单个账号详情 |
 | `accounts.probe` | `auth_id`、`force` | 提交异步探测任务，返回 `task_id` |
+| `accounts.probe_selected` | `auth_ids` | 将选中账号放入有界探测队列，需要恢复时先恢复再检测 |
 | `accounts.cooldown` | `auth_id`、`duration` | 手动冷却 |
 | `accounts.disable` | `auth_id`、`reason` | 手动永久禁用 |
 | `accounts.restore` | `auth_id` | 恢复 guard-owned auth 并清除 strike |
+| `accounts.restore_selected` | `auth_ids` | 将有界队列中的选中账号恢复；健康账号跳过 |
 | `resin.bind` | `auth_id` 或 `auth_ids` | 提交异步绑定任务；仅本地轮换模式拒绝 |
 | `resin.bind_unbound` | `dry_run` | 提交异步批量绑定任务 |
 | `resin.rotate` | `auth_id` | 提交异步轮换任务；API 模式删除旧租约并重绑，本地模式只改写已有代理用户名 |
@@ -1407,7 +1410,9 @@ plugins:
         timeout: "90s"
         max_output_tokens: 768
         concurrency: 1
+        queue_size: 10000
         unknown_delay: "30s"
+        unknown_jitter: "30s"
         suspect_backoff: "15m"
         max_backoff: "1h"
 
@@ -1490,6 +1495,15 @@ plugin-data/grok-quality-guard/state.json
 
 Docker 部署必须将 `/CLIProxyAPI/plugin-data/grok-quality-guard` 挂载为宿主持久卷，否则容器重建后 state 会丢失。也允许通过 `state_file` 显式覆盖；显式路径不可写时不会静默替换。管理页可编辑实际状态文件路径；切换时先完整写入目标文件，再更新引导路径旁的 `<state_file>.location` 指针。目标文件已存在时拒绝覆盖。目录权限 `0700`，文件权限 `0600`。
 
+插件运行时只允许修改 auth JSON 的原生字段 `disabled` 和 `proxy_url`。禁用所有权、冷却原因、strike、Resin 租约等数据只保存在 state。旧版本的 `grok_quality_guard` auth 元数据使用独立脚本迁移，插件本身不执行迁移：
+
+```text
+python scripts/migrate_auth_metadata_to_state.py <auth_dir> <state.json> --dry-run
+python scripts/migrate_auth_metadata_to_state.py <auth_dir> <state.json>
+```
+
+脚本先原子写入 state，再清理 auth 元数据，可重复执行。
+
 ### 12.2 Schema
 
 ```json
@@ -1526,6 +1540,9 @@ Docker 部署必须将 `/CLIProxyAPI/plugin-data/grok-quality-guard` 挂载为�
       "error_strikes": 0,
       "thinking_strikes": 0,
       "probe_backoff_until": "",
+      "disable_kind": "",
+      "previous_disabled": false,
+      "auth_disabled_intent": null,
       "resin": {
         "managed": false,
         "account": "",
@@ -1837,7 +1854,7 @@ git diff --check
 | Resin 轮换 | API 模式删除旧租约并重绑；本地模式只改写已有代理用户名，不查 IP |
 | 自动恢复 | 仅 guard-owned 冷却账号 |
 | OAuth/导入/导出 | 不支持 |
-| auth 元数据命名空间 | `grok_quality_guard` |
+| auth 写入字段 | 仅 `disabled`、`proxy_url` |
 | 状态文件版本 | 1 |
 | 事件数量上限 | 1000 |
 

@@ -1663,14 +1663,18 @@
                 <option value="externally_disabled">外部禁用</option>
                 <option value="unknown">待检测</option>
               </select>
-              <button class="btn btn-xs" type="button" id="accountProbeAllBtn" title="检测所有非健康状态账号" disabled><svg class="icon">
+              <button class="btn btn-xs" type="button" id="accountProbeAllBtn" title="检测当前已勾选账号" disabled><svg class="icon">
                   <use href="#i-play"></use>
-                </svg>检测全部</button>
-              <button class="btn btn-xs" type="button" id="accountRestoreAllBtn" title="恢复所有非健康状态账号" disabled><svg class="icon">
+                </svg>检测所选</button>
+              <button class="btn btn-xs" type="button" id="accountRestoreAllBtn" title="恢复当前已勾选账号" disabled><svg class="icon">
                   <use href="#i-check"></use>
-                </svg>恢复所有</button>
+                </svg>恢复所选</button>
             </div>
             <div class="toolbar-right">
+              <span class="selection-note" id="accountSelectionCount">已选 0 个账号</span>
+              <button class="btn btn-xs btn-ghost" type="button" id="accountSelectFilteredBtn" hidden>全选当前筛选</button>
+              <button class="btn btn-xs btn-ghost" type="button" id="accountSelectAllBtn" hidden>全选所有账号</button>
+              <button class="btn btn-xs btn-ghost" type="button" id="accountClearSelectionBtn" hidden>清空已选</button>
               <span class="muted" id="accountsNote"></span>
               <button class="btn btn-xs" type="button" id="accountRefreshBtn"><svg class="icon">
                   <use href="#i-refresh"></use>
@@ -1681,6 +1685,7 @@
             <table>
               <thead>
                 <tr>
+                  <th class="select-cell"><input id="accountSelectAll" type="checkbox" aria-label="选择本页全部账号"></th>
                   <th>账号</th>
                   <th>状态</th>
                   <th>最近判定</th>
@@ -1927,8 +1932,12 @@
                         id="p_probe_max_output" type="number" min="1"></div>
                     <div class="field"><label for="p_probe_concurrency">探测并发</label><input id="p_probe_concurrency"
                         type="number" min="1"></div>
+                    <div class="field"><label for="p_probe_queue_size">探测队列容量</label><input id="p_probe_queue_size"
+                        type="number" min="1" max="1000000"></div>
                     <div class="field"><label for="p_probe_unknown_delay">待检测延迟</label><input id="p_probe_unknown_delay"
                         type="text" placeholder="30s"></div>
+                    <div class="field"><label for="p_probe_unknown_jitter">待检测抖动</label><input
+                        id="p_probe_unknown_jitter" type="text" placeholder="30s"></div>
                     <div class="field"><label for="p_probe_suspect_backoff">可疑状态退避</label><input
                         id="p_probe_suspect_backoff" type="text" placeholder="15m"></div>
                     <div class="field"><label for="p_probe_max_backoff">最大退避</label><input id="p_probe_max_backoff"
@@ -2082,6 +2091,7 @@
       eventPage: 1,
       eventPageSize: 50,
       selectedAuthID: '',
+      accountSelection: new Set(),
       leaseSelection: new Set(),
       refreshing: false
     };
@@ -2373,6 +2383,10 @@
       state.accounts = data.items || [];
       state.accountsTotal = Number(data.total || state.accounts.length);
       state.stateCounts = data.state_counts || {};
+      const liveIDs = new Set(state.accounts.map((account) => account.auth_id));
+      Array.from(state.accountSelection).forEach((authID) => {
+        if (!liveIDs.has(authID)) state.accountSelection.delete(authID);
+      });
     }
     async function refreshSection(button, label, refresh) {
       if (state.refreshing) return;
@@ -2560,6 +2574,7 @@
         summaryItem('缺少思考冷却', esc(quality.missing_thinking_cooldown || '-')),
         summaryItem('思考检测 / 交叉验证', esc((quality.thinking_guard !== false ? '开启' : '关闭') + ' / ' + ((quality.soft_cross_verify || quality.thinking_cross_verify) ? '部分开启' : '关闭'))),
         summaryItem('探测模型', esc(policy.probe && policy.probe.model || '-')),
+        summaryItem('探测并发 / 队列', esc(num(policy.probe && policy.probe.concurrency || 1) + '-' + num(policy.probe && policy.probe.queue_size || 10000))),
         summaryItem('状态文件', esc(overview.state_file || '-'), { truncate: true, title: overview.state_file || '-' }),
         summaryItem('事件保留', esc(num(policy.events_limit || 0)))
       ].join('');
@@ -2581,24 +2596,43 @@
         return [account.display, account.display_full, account.email, account.label, account.auth_id, account.auth_id_display, account.resin_account].join(' ').toLowerCase().includes(query);
       });
     }
-    function nonHealthyAccountCount() {
-      return state.accounts.filter((account) => account.state !== 'healthy').length;
+    function selectedAccountAccounts() {
+      return state.accounts.filter((account) => state.accountSelection.has(account.auth_id));
     }
-    function syncAccountBatchButtons() {
-      const count = nonHealthyAccountCount();
+    function selectedAccountIDs() {
+      return selectedAccountAccounts().map((account) => account.auth_id);
+    }
+    function syncAccountSelectionUI() {
+      const filtered = accountFilteredList();
+      const current = pagedItems('accounts');
+      const allCount = state.accounts.length;
+      const pageSelected = current.items.filter((account) => state.accountSelection.has(account.auth_id)).length;
+      const selected = selectedAccountAccounts().length;
+      const selectedFiltered = filtered.filter((account) => state.accountSelection.has(account.auth_id)).length;
+      const selectAll = document.getElementById('accountSelectAll');
+      selectAll.disabled = current.items.length === 0;
+      selectAll.checked = current.items.length > 0 && pageSelected === current.items.length;
+      selectAll.indeterminate = pageSelected > 0 && pageSelected < current.items.length;
+      let scope = '';
+      if (allCount > 0 && selected === allCount) scope = ' · 全部账号';
+      else if (filtered.length > 0 && selected === filtered.length) scope = ' · 当前筛选';
+      else if (current.items.length > 0 && selected === current.items.length) scope = ' · 当前页';
+      document.getElementById('accountSelectionCount').textContent = '已选 ' + selected + ' 个账号' + scope;
+      document.getElementById('accountClearSelectionBtn').hidden = selected === 0;
+      const selectFiltered = document.getElementById('accountSelectFilteredBtn');
+      const selectAllAccounts = document.getElementById('accountSelectAllBtn');
+      selectFiltered.hidden = filtered.length === 0 || filtered.length === allCount || selectedFiltered === filtered.length;
+      selectFiltered.textContent = '全选当前筛选 · ' + filtered.length + ' 个';
+      selectAllAccounts.hidden = allCount === 0 || selected === allCount;
+      selectAllAccounts.textContent = '全选所有账号 · ' + allCount + ' 个';
       const probeButton = document.getElementById('accountProbeAllBtn');
-      if (probeButton) {
-        probeButton.disabled = count === 0;
-        probeButton.title = count > 0 ? '检测全部 ' + count + ' 个非健康状态账号' : '当前没有需要检测的非健康账号';
-      }
+      probeButton.disabled = selected === 0;
+      probeButton.title = selected > 0 ? '检测当前已选 ' + selected + ' 个账号' : '请先勾选账号';
       const restoreButton = document.getElementById('accountRestoreAllBtn');
-      if (restoreButton) {
-        restoreButton.disabled = count === 0;
-        restoreButton.title = count > 0 ? '恢复全部 ' + count + ' 个非健康状态账号' : '当前没有需要恢复的非健康账号';
-      }
+      restoreButton.disabled = selected === 0;
+      restoreButton.title = selected > 0 ? '恢复当前已选 ' + selected + ' 个账号' : '请先勾选账号';
     }
     function renderAccounts() {
-      syncAccountBatchButtons();
       const overview = state.overview || {};
       const states = overview.states || state.stateCounts || {};
       const bound = state.accounts.filter((account) => account.resin_managed).length;
@@ -2614,15 +2648,18 @@
       document.getElementById('accountsCount').textContent = '共 ' + result.total + ' 个 · 当前 ' + result.items.length + ' 个';
       document.getElementById('accountsNote').textContent = state.accountsTotal > state.accounts.length ? '当前加载 ' + state.accounts.length + ' 个' : '已加载全部账号';
       renderPager('accounts', result);
+      syncAccountSelectionUI();
     }
     function accountRow(account) {
       const authID = esc(account.auth_id);
+      const selected = state.accountSelection.has(account.auth_id);
       const resin = account.resin_managed ? badge((state.resin && state.resin.local_only) ? '本地管理' : '已绑定', 'info') : (account.proxy_status === 'conflict' ? badge('代理冲突', 'warn') : badge('未绑定', ''));
       const resinDetail = account.resin_account ? '<div class="subline">' + esc(account.resin_account) + ' · 第 ' + esc(account.resin_generation || 0) + ' 代</div>' : '';
       const cooldown = account.cooldown_until ? '冷却至：' + esc(formatFullTime(account.cooldown_until)) : '无冷却';
       const probe = account.probe_backoff_until ? '探测退避至：' + esc(formatFullTime(account.probe_backoff_until)) : '可立即探测';
       const attemptDetail = account.last_attempt ? '最近尝试：' + attemptLabel(account.last_attempt, { includeTime: false }) : '最近观测：' + formatTime(account.last_observed_at);
-      return '<tr><td><div class="account-name" title="' + esc(account.display_full || account.display || account.label || '未命名账号') + '">' + esc(account.display || account.label || '未命名账号') + '</div><div class="subline" title="' + esc(account.auth_id) + '">' + esc(account.auth_id_display || account.auth_id) + '</div></td><td class="nowrap">' + badge(stateLabel(account.state), stateTone(account.state)) + '</td><td><div>' + esc(reasonLabel(account.last_reason)) + '</div><div class="subline">' + esc(attemptDetail) + '</div></td><td><div class="metric-inline"><strong>' + esc(num(account.tps, 1)) + '</strong><span class="muted">TPS</span></div><div class="subline">输出：' + esc(num(account.output_tokens)) + ' · 推理：' + esc(num(account.reasoning_tokens)) + ' · 密文：' + esc(formatBytes(account.encrypted_bytes)) + '</div></td><td>' + resin + resinDetail + '</td><td><div>' + cooldown + '</div><div class="subline">' + probe + '</div></td><td class="actions-cell"><div class="actions"><button class="btn btn-xs" type="button" data-account-action="accounts.probe" data-auth="' + authID + '">' + icon('play') + '检测</button><button class="btn btn-xs" type="button" data-open-account="' + authID + '">' + icon('eye') + '详情</button></div></td></tr>';
+      return '<tr><td class="select-cell"><input type="checkbox" data-account-select="' + authID + '" aria-label="选择账号" ' + (selected ? 'checked' : '') + '></td>' +
+        '<td><div class="account-name" title="' + esc(account.display_full || account.display || account.label || '未命名账号') + '">' + esc(account.display || account.label || '未命名账号') + '</div><div class="subline" title="' + esc(account.auth_id) + '">' + esc(account.auth_id_display || account.auth_id) + '</div></td><td class="nowrap">' + badge(stateLabel(account.state), stateTone(account.state)) + '</td><td><div>' + esc(reasonLabel(account.last_reason)) + '</div><div class="subline">' + esc(attemptDetail) + '</div></td><td><div class="metric-inline"><strong>' + esc(num(account.tps, 1)) + '</strong><span class="muted">TPS</span></div><div class="subline">输出：' + esc(num(account.output_tokens)) + ' · 推理：' + esc(num(account.reasoning_tokens)) + ' · 密文：' + esc(formatBytes(account.encrypted_bytes)) + '</div></td><td>' + resin + resinDetail + '</td><td><div>' + cooldown + '</div><div class="subline">' + probe + '</div></td><td class="actions-cell"><div class="actions"><button class="btn btn-xs" type="button" data-account-action="accounts.probe" data-auth="' + authID + '">' + icon('play') + '检测</button><button class="btn btn-xs" type="button" data-open-account="' + authID + '">' + icon('eye') + '详情</button></div></td></tr>';
     }
     function leaseStatus(account) {
       if (account.resin_managed || account.proxy_status === 'bound') return 'bound';
@@ -2801,7 +2838,9 @@
       setValue('p_probe_timeout', probe.timeout || '90s');
       setValue('p_probe_max_output', probe.max_output_tokens || 768);
       setValue('p_probe_concurrency', probe.concurrency || 1);
+      setValue('p_probe_queue_size', probe.queue_size || 10000);
       setValue('p_probe_unknown_delay', probe.unknown_delay || '30s');
+      setValue('p_probe_unknown_jitter', probe.unknown_jitter || '30s');
       setValue('p_probe_suspect_backoff', probe.suspect_backoff || '15m');
       setValue('p_probe_max_backoff', probe.max_backoff || '1h');
       document.getElementById('policyModeBadge').textContent = modeLabel(policy);
@@ -2840,7 +2879,9 @@
       policy.probe.timeout = valueOf('p_probe_timeout');
       policy.probe.max_output_tokens = numberValue('p_probe_max_output', 768);
       policy.probe.concurrency = numberValue('p_probe_concurrency', 1);
+      policy.probe.queue_size = numberValue('p_probe_queue_size', 10000);
       policy.probe.unknown_delay = valueOf('p_probe_unknown_delay');
+      policy.probe.unknown_jitter = valueOf('p_probe_unknown_jitter');
       policy.probe.suspect_backoff = valueOf('p_probe_suspect_backoff');
       policy.probe.max_backoff = valueOf('p_probe_max_backoff');
       return policy;
@@ -2849,6 +2890,7 @@
       const policy = collectPolicy();
       const nextStateFile = valueOf('p_state_file');
       if (!(policy.quality.soft_tps < policy.quality.hard_tps)) { toast('软 TPS 阈值必须低于硬 TPS 阈值', 'error'); return; }
+      if (!(policy.probe.queue_size >= 1 && policy.probe.queue_size <= 1000000)) { toast('探测队列容量必须在 1 到 1000000 之间', 'error'); return; }
       if (!nextStateFile) { toast('状态文件路径不能为空', 'error'); return; }
       setBusy(button, true);
       document.getElementById('policyStatus').textContent = '正在保存策略…';
@@ -3136,22 +3178,25 @@
     document.getElementById('eventRefreshBtn').addEventListener('click', (event) => refreshEvents(event.currentTarget));
     document.getElementById('accountProbeAllBtn').addEventListener('click', async (event) => {
       const button = event.currentTarget;
-      const count = nonHealthyAccountCount();
+      const authIDs = selectedAccountIDs();
+      const count = authIDs.length;
       if (!count) {
-        syncAccountBatchButtons();
-        toast('当前没有需要检测的非健康账号', 'success');
+        syncAccountSelectionUI();
+        toast('请先勾选需要检测的账号', 'success');
         return;
       }
-      if (!window.confirm('确认立即检测所有 ' + count + ' 个非健康状态账号？\n检测会发起真实模型请求并可能产生额度消耗；外部禁用账号会跳过，插件冷却、额度耗尽或凭据失效账号会先自动恢复再检测。')) return;
+      if (!window.confirm('确认立即检测当前已选 ' + count + ' 个账号？\n检测会发起真实模型请求并可能产生额度消耗；需要恢复的账号会在同一任务内先恢复再检测，外部禁用账号会跳过。')) return;
       setBusy(button, true);
       try {
-        const task = await api('accounts.probe_non_healthy');
+        const task = await api('accounts.probe_selected', { auth_ids: authIDs });
         toast('检测任务已提交，后台执行中…');
-        const result = await waitForTask(task, '检测非健康账号');
+        const result = await waitForTask(task, '检测已选账号');
         const probed = Number(result && result.probed || 0);
+        const restored = Number(result && result.restored || 0);
         const skipped = Number(result && result.skipped || 0);
         const failed = Number(result && result.failed || 0);
         let message = '已检测 ' + probed + ' 个账号';
+        if (restored) message += '，其中 ' + restored + ' 个先恢复后检测';
         if (skipped) message += '，跳过 ' + skipped + ' 个不可检测账号';
         if (failed) {
           message += '，' + failed + ' 个失败';
@@ -3159,32 +3204,36 @@
           if (firstError && firstError.error) message += '：' + firstError.error;
         }
         toast(message, failed > 0 ? 'error' : 'success');
+        state.accountSelection.clear();
         await refreshAll(true);
       } catch (error) {
         toast(error.message, 'error');
       } finally {
         setBusy(button, false);
-        syncAccountBatchButtons();
+        syncAccountSelectionUI();
       }
     });
     document.getElementById('accountRestoreAllBtn').addEventListener('click', async (event) => {
       const button = event.currentTarget;
-      const count = nonHealthyAccountCount();
+      const authIDs = selectedAccountIDs();
+      const count = authIDs.length;
       if (!count) {
-        syncAccountBatchButtons();
-        toast('当前没有需要恢复的非健康账号', 'success');
+        syncAccountSelectionUI();
+        toast('请先勾选需要恢复的账号', 'success');
         return;
       }
-      if (!window.confirm('确认恢复所有 ' + count + ' 个非健康状态账号？\n已由插件冷却、额度耗尽、凭据失效或隔离的账号会重新启用；外部禁用账号只会清理插件状态，不会修改 OAuth 的 disabled 标记。')) return;
+      if (!window.confirm('确认恢复当前已选 ' + count + ' 个账号？\n已由插件冷却、额度耗尽、凭据失效或隔离的账号会重新启用；健康账号会跳过，外部禁用账号只会清理插件状态，不会修改 OAuth 的 disabled 标记。')) return;
       setBusy(button, true);
       try {
-        const task = await api('accounts.restore_non_healthy');
+        const task = await api('accounts.restore_selected', { auth_ids: authIDs });
         toast('恢复任务已提交，后台执行中…');
-        const result = await waitForTask(task, '恢复非健康账号');
+        const result = await waitForTask(task, '恢复已选账号');
         const restored = Number(result && result.restored || 0);
+        const skipped = Number(result && result.skipped || 0);
         const external = Number(result && result.external_left_disabled || 0);
         const failed = Number(result && result.failed || 0);
         let message = restored > 0 ? ('已恢复 ' + restored + ' 个账号') : '没有账号被恢复';
+        if (skipped) message += '，跳过 ' + skipped + ' 个健康账号';
         if (external) message += '，' + external + ' 个外部禁用账号仅清理插件状态';
         if (failed) {
           message += '，' + failed + ' 个失败';
@@ -3192,15 +3241,15 @@
           if (firstError && firstError.error) message += '：' + firstError.error;
         }
         toast(message, failed > 0 ? 'error' : 'success');
+        state.accountSelection.clear();
         await refreshAll(true);
       } catch (error) {
         toast(error.message, 'error');
       } finally {
         setBusy(button, false);
-        syncAccountBatchButtons();
+        syncAccountSelectionUI();
       }
     });
-
     document.getElementById('accountSearch').addEventListener('input', (event) => { state.accountQuery = event.target.value; state.accountPage = 1; renderAccounts(); });
     document.getElementById('accountStateFilter').addEventListener('change', (event) => { state.accountState = event.target.value; state.accountPage = 1; renderAccounts(); });
     document.getElementById('leaseSearch').addEventListener('input', (event) => { state.leaseQuery = event.target.value; state.leasePage = 1; renderResin(); });
@@ -3212,6 +3261,40 @@
       if (open) { openAccountDrawer(open.dataset.openAccount); return; }
       const action = event.target.closest('[data-account-action]');
       if (action) runAccountAction(action.dataset.accountAction, action.dataset.auth, action);
+    });
+    document.getElementById('accountRows').addEventListener('change', (event) => {
+      const checkbox = event.target.closest('[data-account-select]');
+      if (!checkbox) return;
+      if (checkbox.checked) state.accountSelection.add(checkbox.dataset.accountSelect);
+      else state.accountSelection.delete(checkbox.dataset.accountSelect);
+      syncAccountSelectionUI();
+    });
+    document.getElementById('accountSelectAll').addEventListener('change', (event) => {
+      const checked = event.currentTarget.checked;
+      pagedItems('accounts').items.forEach((account) => {
+        if (checked) state.accountSelection.add(account.auth_id);
+        else state.accountSelection.delete(account.auth_id);
+      });
+      document.querySelectorAll('#accountRows [data-account-select]').forEach((checkbox) => {
+        checkbox.checked = state.accountSelection.has(checkbox.dataset.accountSelect);
+      });
+      syncAccountSelectionUI();
+    });
+    document.getElementById('accountSelectFilteredBtn').addEventListener('click', () => {
+      const filtered = accountFilteredList();
+      if (!window.confirm('确认全选当前筛选结果中的 ' + filtered.length + ' 个账号？')) return;
+      filtered.forEach((account) => state.accountSelection.add(account.auth_id));
+      renderAccounts();
+    });
+    document.getElementById('accountSelectAllBtn').addEventListener('click', () => {
+      const all = state.accounts.length;
+      if (!window.confirm('确认全选全部 ' + all + ' 个账号？此操作会忽略当前搜索和筛选')) return;
+      state.accounts.forEach((account) => state.accountSelection.add(account.auth_id));
+      renderAccounts();
+    });
+    document.getElementById('accountClearSelectionBtn').addEventListener('click', () => {
+      state.accountSelection.clear();
+      renderAccounts();
     });
     document.getElementById('drawerBody').addEventListener('click', (event) => {
       const accountAction = event.target.closest('[data-account-action]');

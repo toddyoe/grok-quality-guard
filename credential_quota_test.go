@@ -62,12 +62,10 @@ func TestCredentialInvalidDisablesAccountEvenInObserveMode(t *testing.T) {
 	if errDecode != nil {
 		t.Fatal(errDecode)
 	}
-	if !authDisabled(saved) || guardMeta(saved).DisableKind != DisableKindCredentialInvalid {
-		t.Fatalf("auth was not disabled with credential-invalid metadata: %#v", saved)
+	if !authDisabled(saved) {
+		t.Fatalf("auth was not disabled for credential-invalid state: %#v", saved)
 	}
-	if state := authDisabledState(saved); state != StateCredentialInvalid {
-		t.Fatalf("authDisabledState = %q, want %q", state, StateCredentialInvalid)
-	}
+	assertNoGuardMetadata(t, saved)
 }
 
 func TestQuotaExhaustedCoolsFor24HoursEvenInObserveMode(t *testing.T) {
@@ -98,13 +96,10 @@ func TestQuotaExhaustedCoolsFor24HoursEvenInObserveMode(t *testing.T) {
 	if errDecode != nil {
 		t.Fatal(errDecode)
 	}
-	meta := guardMeta(saved)
-	if !authDisabled(saved) || meta.DisableKind != DisableKindQuota || meta.CooldownUntil == "" {
-		t.Fatalf("auth was not disabled with quota metadata: %#v", saved)
+	if !authDisabled(saved) {
+		t.Fatalf("auth was not disabled for quota state: %#v", saved)
 	}
-	if state := authDisabledState(saved); state != StateQuotaExhausted {
-		t.Fatalf("authDisabledState = %q, want %q", state, StateQuotaExhausted)
-	}
+	assertNoGuardMetadata(t, saved)
 }
 func TestProbeUnauthorizedMarksCredentialInvalid(t *testing.T) {
 	entries, auths := singleGrokAuth(t, "auth-1", "user@example.com", nil)
@@ -126,9 +121,10 @@ func TestProbeUnauthorizedMarksCredentialInvalid(t *testing.T) {
 	if errDecode != nil {
 		t.Fatal(errDecode)
 	}
-	if !authDisabled(saved) || guardMeta(saved).DisableKind != DisableKindCredentialInvalid {
+	if !authDisabled(saved) {
 		t.Fatalf("probe did not disable credential-invalid auth: %#v", saved)
 	}
+	assertNoGuardMetadata(t, saved)
 }
 
 func TestProbeQuota429MarksQuotaExhausted(t *testing.T) {
@@ -155,10 +151,10 @@ func TestProbeQuota429MarksQuotaExhausted(t *testing.T) {
 	if errDecode != nil {
 		t.Fatal(errDecode)
 	}
-	meta := guardMeta(saved)
-	if !authDisabled(saved) || meta.DisableKind != DisableKindQuota || meta.CooldownUntil == "" {
+	if !authDisabled(saved) {
 		t.Fatalf("probe did not cool quota-exhausted auth: %#v", saved)
 	}
+	assertNoGuardMetadata(t, saved)
 }
 func TestProbeUnauthorizedWithoutStreamIDMarksCredentialInvalid(t *testing.T) {
 	entries, auths := singleGrokAuth(t, "auth-1", "user@example.com", nil)
@@ -216,8 +212,8 @@ func TestProbeModelCooldownMarksQuotaExhausted(t *testing.T) {
 	if errDecode != nil {
 		t.Fatal(errDecode)
 	}
-	meta := guardMeta(saved)
-	if !authDisabled(saved) || meta.DisableKind != DisableKindQuota || meta.CooldownUntil == "" {
+	if !authDisabled(saved) {
 		t.Fatalf("probe did not cool quota-exhausted auth: %#v", saved)
 	}
+	assertNoGuardMetadata(t, saved)
 }

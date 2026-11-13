@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"strings"
 	"time"
 )
@@ -31,16 +30,6 @@ const (
 const quotaExhaustedCooldown = 24 * time.Hour
 
 const probeHeader = "X-Grok-Quality-Probe"
-
-type GuardMeta struct {
-	Managed               bool   `json:"managed,omitempty"`
-	ResinAccount          string `json:"resin_account,omitempty"`
-	ResinGeneration       int64  `json:"resin_generation,omitempty"`
-	DisableKind           string `json:"disable_kind,omitempty"`
-	CooldownUntil         string `json:"cooldown_until,omitempty"`
-	PreviousDisabled      bool   `json:"previous_disabled,omitempty"`
-	StrikeMissingThinking bool   `json:"strike_missing_thinking,omitempty"`
-}
 
 func isGrokProvider(value string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(value))
@@ -154,29 +143,6 @@ func authDisabled(raw map[string]json.RawMessage) bool {
 	return authRawBool(raw, "disabled")
 }
 
-func guardMeta(raw map[string]json.RawMessage) GuardMeta {
-	value := authRawMap(raw, "grok_quality_guard")
-	if value == nil {
-		return GuardMeta{}
-	}
-	var meta GuardMeta
-	encoded, _ := json.Marshal(value)
-	_ = json.Unmarshal(encoded, &meta)
-	return meta
-}
-
-func setGuardMeta(raw map[string]json.RawMessage, meta GuardMeta) error {
-	if raw == nil {
-		return fmt.Errorf("auth payload is nil")
-	}
-	encoded, errMarshal := json.Marshal(meta)
-	if errMarshal != nil {
-		return errMarshal
-	}
-	raw["grok_quality_guard"] = encoded
-	return nil
-}
-
 func setRawBool(raw map[string]json.RawMessage, key string, value bool) {
 	if raw == nil {
 		return
@@ -263,23 +229,4 @@ func stateForDisableKind(kind string) string {
 
 func isAccountStatusClass(class string) bool {
 	return class == ClassCredentialInvalid || class == ClassQuotaExhausted
-}
-
-func authDisabledState(raw map[string]json.RawMessage) string {
-	meta := guardMeta(raw)
-	if authDisabled(raw) {
-		switch meta.DisableKind {
-		case DisableKindCooldown:
-			return StateCooling
-		case DisableKindQuota:
-			return StateQuotaExhausted
-		case DisableKindCredentialInvalid:
-			return StateCredentialInvalid
-		case DisableKindPermanent:
-			return StateDisabledByGuard
-		default:
-			return StateExternallyDisabled
-		}
-	}
-	return ""
 }

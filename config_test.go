@@ -62,3 +62,22 @@ func TestDecodeConfigCooldownOnly(t *testing.T) {
 		t.Fatalf("auto_action = %q", cfg.AutoAction)
 	}
 }
+
+func TestProbeQueueConfigDefaultsAndBounds(t *testing.T) {
+	cfg, errDecode := decodeConfig([]byte("probe:\n  concurrency: 2\n"))
+	if errDecode != nil {
+		t.Fatalf("decodeConfig() error = %v", errDecode)
+	}
+	if cfg.Probe.QueueSize != defaultProbeQueueSize {
+		t.Fatalf("probe.queue_size = %d, want %d", cfg.Probe.QueueSize, defaultProbeQueueSize)
+	}
+	if cfg.Probe.UnknownJitter.Duration != defaultProbeUnknownJitter {
+		t.Fatalf("probe.unknown_jitter = %s, want %s", cfg.Probe.UnknownJitter.Duration, defaultProbeUnknownJitter)
+	}
+
+	tooLarge := DefaultConfig()
+	tooLarge.Probe.QueueSize = maxProbeQueueSize + 1
+	if errNormalize := normalizeConfig(&tooLarge); errNormalize == nil {
+		t.Fatal("expected oversized probe queue error")
+	}
+}

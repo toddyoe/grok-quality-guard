@@ -9,7 +9,6 @@ import (
 	"os"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -42,6 +41,7 @@ type restoreBatchResult struct {
 	Items                []restoreBatchItem `json:"items"`
 	Count                int                `json:"count"`
 	Restored             int                `json:"restored"`
+	Skipped              int                `json:"skipped"`
 	ExternalLeftDisabled int                `json:"external_left_disabled"`
 	Failed               int                `json:"failed"`
 }
@@ -51,20 +51,22 @@ type probeBatchItem struct {
 	StateBefore string `json:"state_before"`
 	StateAfter  string `json:"state_after,omitempty"`
 	Status      string `json:"status"`
+	Restored    bool   `json:"restored,omitempty"`
 	Error       string `json:"error,omitempty"`
 }
 
 type probeBatchResult struct {
-	Items   []probeBatchItem `json:"items"`
-	Count   int              `json:"count"`
-	Probed  int              `json:"probed"`
-	Skipped int              `json:"skipped"`
-	Failed  int              `json:"failed"`
+	Items    []probeBatchItem `json:"items"`
+	Count    int              `json:"count"`
+	Probed   int              `json:"probed"`
+	Restored int              `json:"restored"`
+	Skipped  int              `json:"skipped"`
+	Failed   int              `json:"failed"`
 }
 
-type nonHealthyCandidate struct {
-	authID      string
-	stateBefore string
+type accountCandidate struct {
+	authID  string
+	account Account
 }
 
 type accountView struct {
@@ -149,16 +151,16 @@ func (p *Plugin) handleAction(ctx context.Context, action actionRequest) (any, i
 		return p.actionAccountGet(ctx, action.Params)
 	case "accounts.probe":
 		return p.actionProbe(ctx, action.Params)
-	case "accounts.probe_non_healthy":
-		return p.actionProbeNonHealthy(ctx, action.Params)
+	case "accounts.probe_selected":
+		return p.actionProbeSelected(ctx, action.Params)
 	case "accounts.cooldown":
 		return p.actionCooldown(ctx, action.Params)
 	case "accounts.disable":
 		return p.actionDisable(ctx, action.Params)
 	case "accounts.restore":
 		return p.actionRestore(ctx, action.Params)
-	case "accounts.restore_non_healthy":
-		return p.actionRestoreNonHealthy(ctx, action.Params)
+	case "accounts.restore_selected":
+		return p.actionRestoreSelected(ctx, action.Params)
 	case "resin.bind":
 		return p.actionResinBind(ctx, action.Params)
 	case "resin.bind_unbound":
@@ -210,9 +212,9 @@ func (p *Plugin) actionOverview(ctx context.Context) (any, int, error) {
 		if errResolve != nil {
 			continue
 		}
-		meta := guardMeta(raw)
+		stateAccount := state.Accounts[account.ID]
 		proxy := strings.TrimSpace(authRawString(raw, "proxy_url"))
-		if meta.ResinAccount != "" {
+		if stateAccount != nil && stateAccount.Resin.Account != "" {
 			resinBound++
 		} else if proxy != "" {
 			resinConflicts++
@@ -316,28 +318,40 @@ func catalogAccountMatches(account Account, query string) bool {
 	return strings.Contains(text, query)
 }
 
-func (p *Plugin) nonHealthyCandidates(ctx context.Context) []nonHealthyCandidate {
-	_ = p.RefreshCatalog(ctx)
-	state := p.stateStore().Snapshot()
-	catalog := p.catalogSnapshot()
-	candidates := make([]nonHealthyCandidate, 0, len(catalog))
-	for _, account := range catalog {
-		stateBefore := catalogAccountState(account, state)
-		if stateBefore == StateHealthy {
-			continue
-		}
-		candidates = append(candidates, nonHealthyCandidate{authID: account.ID, stateBefore: stateBefore})
+func (p *Plugin) selectedAccountCandidates(ctx context.Context, authIDs []string) ([]accountCandidate, error) {
+	if errRefresh := p.RefreshCatalog(ctx); errRefresh != nil {
+		return nil, fmt.Errorf("refresh auth catalog: %w", errRefresh)
 	}
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].authID < candidates[j].authID })
-	return candidates
+	if p.stateStore() == nil {
+		return nil, fmt.Errorf("state store is not initialized")
+	}
+	catalog := p.catalogSnapshot()
+	byID := make(map[string]Account, len(catalog))
+	for _, account := range catalog {
+		byID[account.ID] = account
+	}
+	candidates := make([]accountCandidate, 0, len(authIDs))
+	for _, authID := range authIDs {
+		account, okAccount := byID[authID]
+		if !okAccount {
+			return nil, fmt.Errorf("auth not found: %s", authID)
+		}
+		candidates = append(candidates, accountCandidate{
+			authID:  authID,
+			account: account,
+		})
+	}
+	return candidates, nil
 }
 
-func nonHealthyCandidateAuthIDs(candidates []nonHealthyCandidate) []string {
-	authIDs := make([]string, 0, len(candidates))
-	for _, candidate := range candidates {
-		authIDs = append(authIDs, candidate.authID)
+func (p *Plugin) accountCandidateState(candidate accountCandidate) string {
+	if stateAccount, okState := p.stateAccount(candidate.authID); okState && stateAccount.State != "" {
+		return stateAccount.State
 	}
-	return authIDs
+	if candidate.account.Disabled {
+		return StateExternallyDisabled
+	}
+	return StateUnknown
 }
 
 func (p *Plugin) actionAccountGet(ctx context.Context, params map[string]any) (any, int, error) {
@@ -389,69 +403,79 @@ func (p *Plugin) actionProbe(ctx context.Context, params map[string]any) (any, i
 }
 
 func (p *Plugin) restoreBeforeManualProbe(ctx context.Context, authID, stateBefore string) error {
+	if !requiresRestoreBeforeProbe(stateBefore) {
+		return nil
+	}
+	return p.ManualRestore(ctx, authID)
+}
+
+func requiresRestoreBeforeProbe(stateBefore string) bool {
 	switch stateBefore {
 	case StateCooling, StateQuotaExhausted, StateCredentialInvalid, StateDisabledByGuard:
-		return p.ManualRestore(ctx, authID)
+		return true
 	default:
-		return nil
+		return false
 	}
 }
 
-func (p *Plugin) actionProbeNonHealthy(ctx context.Context, _ map[string]any) (any, int, error) {
-	if p.hasActiveTask("accounts.probe_non_healthy", "") {
+func (p *Plugin) actionProbeSelected(ctx context.Context, params map[string]any) (any, int, error) {
+	authIDs := authIDsFromParams(params)
+	if len(authIDs) == 0 {
+		return nil, http.StatusBadRequest, fmt.Errorf("auth_ids is required")
+	}
+	candidates, errCandidates := p.selectedAccountCandidates(ctx, authIDs)
+	if errCandidates != nil {
+		return nil, http.StatusBadRequest, errCandidates
+	}
+	if p.hasActiveTask("accounts.probe_selected", "") {
 		return nil, http.StatusConflict, fmt.Errorf("probe task is already running")
 	}
-	candidates := p.nonHealthyCandidates(ctx)
-	authIDs := nonHealthyCandidateAuthIDs(candidates)
-	task := p.startTask("accounts.probe_non_healthy", authIDs, fmt.Sprintf("正在检测 %d 个非健康账号", len(candidates)), func(taskCtx context.Context) (any, error) {
+	task := p.startTask("accounts.probe_selected", authIDs, fmt.Sprintf("正在检测 %d 个已选账号", len(candidates)), func(taskCtx context.Context) (any, error) {
 		result := probeBatchResult{
 			Items: make([]probeBatchItem, len(candidates)),
 			Count: len(candidates),
 		}
-		var wg sync.WaitGroup
-		for index, candidate := range candidates {
-			result.Items[index] = probeBatchItem{AuthID: candidate.authID, StateBefore: candidate.stateBefore}
-			if candidate.stateBefore == StateExternallyDisabled {
-				result.Items[index].Status = "skipped"
-				continue
+		indices := make([]int, len(candidates))
+		for index := range candidates {
+			indices[index] = index
+		}
+		errRun := runBoundedQueue(taskCtx, indices, p.probeQueueSize(), p.probeConcurrency(), func(jobCtx context.Context, index int) {
+			candidate := candidates[index]
+			stateBefore := p.accountCandidateState(candidate)
+			entry := probeBatchItem{AuthID: candidate.authID, StateBefore: stateBefore}
+			if stateBefore == StateExternallyDisabled {
+				entry.Status = "skipped"
+				result.Items[index] = entry
+				return
 			}
-			wg.Add(1)
-			go func(index int, candidate nonHealthyCandidate) {
-				defer wg.Done()
-				entry := probeBatchItem{AuthID: candidate.authID, StateBefore: candidate.stateBefore}
-				if errRestore := p.restoreBeforeManualProbe(taskCtx, candidate.authID, candidate.stateBefore); errRestore != nil {
+			if requiresRestoreBeforeProbe(stateBefore) {
+				if errRestore := p.restoreBeforeManualProbe(jobCtx, candidate.authID, stateBefore); errRestore != nil {
 					entry.Status = "failed"
 					entry.Error = sanitizeError(errRestore)
 					result.Items[index] = entry
 					return
 				}
-				if errProbe := p.ProbeAccount(taskCtx, candidate.authID, true, ""); errProbe != nil {
-					entry.Status = "failed"
-					entry.Error = sanitizeError(errProbe)
-					result.Items[index] = entry
-					return
-				}
-				account, okAccount := p.findAccount(candidate.authID)
-				if !okAccount {
-					entry.Status = "failed"
-					entry.Error = "auth not found"
-					result.Items[index] = entry
-					return
-				}
-				view, errView := p.accountView(taskCtx, account)
-				if errView != nil {
-					entry.Status = "failed"
-					entry.Error = sanitizeError(errView)
-					result.Items[index] = entry
-					return
-				}
-				entry.StateAfter = view.State
-				entry.Status = "probed"
+				entry.Restored = true
+			}
+			if errProbe := p.ProbeAccount(jobCtx, candidate.authID, true, ""); errProbe != nil {
+				entry.Status = "failed"
+				entry.Error = sanitizeError(errProbe)
 				result.Items[index] = entry
-			}(index, candidate)
+				return
+			}
+			if stateAfter, okState := p.stateAccount(candidate.authID); okState {
+				entry.StateAfter = stateAfter.State
+			}
+			entry.Status = "probed"
+			result.Items[index] = entry
+		})
+		if errRun != nil {
+			return nil, errRun
 		}
-		wg.Wait()
 		for _, item := range result.Items {
+			if item.Restored {
+				result.Restored++
+			}
 			switch item.Status {
 			case "probed":
 				result.Probed++
@@ -465,7 +489,6 @@ func (p *Plugin) actionProbeNonHealthy(ctx context.Context, _ map[string]any) (a
 	})
 	return task, http.StatusAccepted, nil
 }
-
 func (p *Plugin) actionCooldown(ctx context.Context, params map[string]any) (any, int, error) {
 	authID := strings.TrimSpace(asString(params["auth_id"]))
 	if authID == "" {
@@ -507,37 +530,68 @@ func (p *Plugin) actionRestore(ctx context.Context, params map[string]any) (any,
 	return p.actionAccountGet(ctx, map[string]any{"auth_id": authID})
 }
 
-func (p *Plugin) actionRestoreNonHealthy(ctx context.Context, _ map[string]any) (any, int, error) {
-	if p.hasActiveTask("accounts.restore_non_healthy", "") {
+func (p *Plugin) actionRestoreSelected(ctx context.Context, params map[string]any) (any, int, error) {
+	authIDs := authIDsFromParams(params)
+	if len(authIDs) == 0 {
+		return nil, http.StatusBadRequest, fmt.Errorf("auth_ids is required")
+	}
+	candidates, errCandidates := p.selectedAccountCandidates(ctx, authIDs)
+	if errCandidates != nil {
+		return nil, http.StatusBadRequest, errCandidates
+	}
+	if p.hasActiveTask("accounts.restore_selected", "") {
 		return nil, http.StatusConflict, fmt.Errorf("restore task is already running")
 	}
-	candidates := p.nonHealthyCandidates(ctx)
-	authIDs := nonHealthyCandidateAuthIDs(candidates)
-	task := p.startTask("accounts.restore_non_healthy", authIDs, fmt.Sprintf("正在恢复 %d 个非健康账号", len(candidates)), func(taskCtx context.Context) (any, error) {
+	task := p.startTask("accounts.restore_selected", authIDs, fmt.Sprintf("正在恢复 %d 个已选账号", len(candidates)), func(taskCtx context.Context) (any, error) {
 		result := restoreBatchResult{
-			Items: make([]restoreBatchItem, 0, len(candidates)),
+			Items: make([]restoreBatchItem, len(candidates)),
 			Count: len(candidates),
 		}
-		for _, item := range candidates {
-			entry := restoreBatchItem{AuthID: item.authID, StateBefore: item.stateBefore}
-			if errRestore := p.ManualRestore(taskCtx, item.authID); errRestore != nil {
+		indices := make([]int, len(candidates))
+		for index := range candidates {
+			indices[index] = index
+		}
+		errRun := runBoundedQueue(taskCtx, indices, p.probeQueueSize(), p.probeConcurrency(), func(jobCtx context.Context, index int) {
+			candidate := candidates[index]
+			stateBefore := p.accountCandidateState(candidate)
+			entry := restoreBatchItem{AuthID: candidate.authID, StateBefore: stateBefore}
+			if stateBefore == StateHealthy {
+				entry.Status = "skipped"
+				result.Items[index] = entry
+				return
+			}
+			if errRestore := p.ManualRestore(jobCtx, candidate.authID); errRestore != nil {
 				entry.Status = "failed"
 				entry.Error = sanitizeError(errRestore)
-				result.Failed++
-			} else if item.stateBefore == StateExternallyDisabled {
+				result.Items[index] = entry
+				return
+			}
+			if stateBefore == StateExternallyDisabled {
 				entry.Status = "external_left_disabled"
-				result.ExternalLeftDisabled++
 			} else {
 				entry.Status = "restored"
-				result.Restored++
 			}
-			result.Items = append(result.Items, entry)
+			result.Items[index] = entry
+		})
+		if errRun != nil {
+			return nil, errRun
+		}
+		for _, item := range result.Items {
+			switch item.Status {
+			case "restored":
+				result.Restored++
+			case "external_left_disabled":
+				result.ExternalLeftDisabled++
+			case "skipped":
+				result.Skipped++
+			case "failed":
+				result.Failed++
+			}
 		}
 		return result, nil
 	})
 	return task, http.StatusAccepted, nil
 }
-
 func (p *Plugin) actionResinBind(_ context.Context, params map[string]any) (any, int, error) {
 	authIDs := authIDsFromParams(params)
 	if len(authIDs) == 0 {
@@ -763,12 +817,7 @@ func (p *Plugin) accountView(ctx context.Context, account Account) (accountView,
 	if errResolve != nil {
 		return accountView{}, errResolve
 	}
-	meta := guardMeta(raw)
 	stateAccount, _ := p.stateAccount(account.ID)
-	resinGeneration := stateAccount.Resin.Generation
-	if meta.ResinGeneration > resinGeneration {
-		resinGeneration = meta.ResinGeneration
-	}
 	displayFull := strings.TrimSpace(firstNonEmpty(account.Email, account.Label, account.ID))
 	displayLabel := strings.TrimSpace(account.Label)
 	if strings.Contains(displayLabel, "@") {
@@ -794,9 +843,9 @@ func (p *Plugin) accountView(ctx context.Context, account Account) (accountView,
 		SoftStrikes:           stateAccount.SoftStrikes,
 		ErrorStrikes:          stateAccount.ErrorStrikes,
 		ThinkingStrikes:       stateAccount.ThinkingStrikes,
-		ResinManaged:          meta.Managed || stateAccount.Resin.Managed,
-		ResinAccount:          firstNonEmpty(meta.ResinAccount, stateAccount.Resin.Account),
-		ResinGeneration:       resinGeneration,
+		ResinManaged:          stateAccount.Resin.Managed,
+		ResinAccount:          stateAccount.Resin.Account,
+		ResinGeneration:       stateAccount.Resin.Generation,
 		ProxyStatus:           "unbound",
 		Proxy:                 maskProxyURL(authRawString(raw, "proxy_url")),
 		TPS:                   stateAccount.Metrics.TPS,
@@ -809,9 +858,9 @@ func (p *Plugin) accountView(ctx context.Context, account Account) (accountView,
 		HasRefreshToken:       strings.TrimSpace(authRawString(raw, "refresh_token")) != "",
 	}
 	if view.State == "" {
-		view.State = authDisabledState(raw)
-		if view.State == "" {
-			view.State = StateUnknown
+		view.State = StateUnknown
+		if authDisabled(raw) {
+			view.State = StateExternallyDisabled
 		}
 	}
 	if view.ResinAccount != "" {

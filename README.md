@@ -194,7 +194,9 @@ plugins:
         timeout: "90s"
         max_output_tokens: 768
         concurrency: 1
+        queue_size: 10000
         unknown_delay: "30s"
+        unknown_jitter: "30s"
         suspect_backoff: "15m"
         max_backoff: "1h"
 
@@ -232,6 +234,8 @@ plugins:
 - `ignored`、`probe_error`、`proxy_error` 不覆盖上一次真实质量指标；详情页会分别展示最近尝试和最近质量证据
 - `soft_cross_verify=true` 或 `thinking_cross_verify=true`：被动样本达到阈值后先启动后台主动探测，由探测结果确认后再处置；默认关闭
 - 任一健康样本会清零 `soft_strikes`、`error_strikes`、`thinking_strikes`，与旧插件的连续计数语义一致
+
+主动探测调度会先过滤出当前到期的非健康账号，再放入有界队列。`probe.queue_size` 默认 `10000`，最大 `1000000`；`probe.concurrency` 控制实际执行探测的 worker 数。`probe.unknown_jitter` 为 `unknown` 账号的首次探测增加稳定抖动，避免大量账号在同一时刻到期。
 
 ### 透明保护
 
@@ -331,9 +335,11 @@ curl -X POST \
 | `accounts.list` | 分页账号列表 |
 | `accounts.get` | 账号详情 |
 | `accounts.probe` | 提交异步固定 prompt 探测任务 |
+| `accounts.probe_selected` | 检测选中的账号；需要恢复时在同一任务内先恢复再检测 |
 | `accounts.cooldown` | 手动冷却 |
 | `accounts.disable` | 手动永久禁用 |
 | `accounts.restore` | 恢复 guard-owned 账号并清除 strike |
+| `accounts.restore_selected` | 恢复选中的账号 |
 | `resin.bind` | 提交异步绑定任务；仅 API 模式可用 |
 | `resin.bind_unbound` | 提交异步批量绑定任务 |
 | `resin.rotate` | 提交异步轮换任务；本地模式只改写已有代理用户名 |
@@ -384,6 +390,17 @@ services:
 管理页“设置 / 守护策略”中的状态文件路径可以直接编辑。保存新路径时，插件会把当前完整 state 写入目标文件并立即切换；为避免覆盖已有数据，目标文件必须尚不存在。引导路径旁会生成 `<state_file>.location` 指针文件，使插件重启后继续使用新路径。修改 YAML 中的 `state_file` 会产生新的引导位置，因此可以借此重新指定路径；如要回退到旧引导文件，需要先删除对应指针文件。
 
 状态文件使用版本化 schema、原子替换写入，Unix 权限为目录 `0700`、文件 `0600`。策略首次从 YAML 初始化，之后管理页修改会持久化到 state；`policy.reset` 会恢复为当前 YAML 的默认值。通过管理页保存的 Resin 配置和 API 模式 token 也存储在 state 中，API 与页面只返回是否已设置的布尔标记。管理页设置区会显示当前实际使用的状态文件路径。
+
+插件运行时只会修改 auth 文件中的原生字段 `disabled` 和 `proxy_url`。冷却原因、strike、禁用所有权、Resin 租约及其他控制信息全部保存在 `state.json`，不再向 auth 写入 `grok_quality_guard` 或其他插件私有字段。
+
+从旧版本升级时，应先停止插件，再使用迁移脚本把历史 auth 元数据合并进 state，并清理 auth 文件：
+
+```powershell
+python scripts/migrate_auth_metadata_to_state.py /path/to/auths /path/to/state.json --dry-run
+python scripts/migrate_auth_metadata_to_state.py /path/to/auths /path/to/state.json
+```
+
+脚本会先原子写入 state，再清理 auth 中的 `grok_quality_guard`，可以重复执行。迁移完成后重新启动插件。
 
 ## 开发与测试
 

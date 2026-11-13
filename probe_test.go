@@ -14,12 +14,6 @@ import (
 func TestProbeFailureAfterStrikePermanentlyDisablesWithoutDeadlock(t *testing.T) {
 	entries, auths := singleGrokAuth(t, "auth-1", "alice@example.com", map[string]any{
 		"disabled": true,
-		"grok_quality_guard": map[string]any{
-			"managed":                 true,
-			"disable_kind":            DisableKindCooldown,
-			"cooldown_until":          "2020-01-01T00:00:00Z",
-			"strike_missing_thinking": true,
-		},
 	})
 	host := newMockHostCall(entries, auths)
 	visible := strings.Repeat("degraded probe answer. ", 8) + "\\nQUALITY_OK"
@@ -29,6 +23,16 @@ func TestProbeFailureAfterStrikePermanentlyDisablesWithoutDeadlock(t *testing.T)
 		{Done: true},
 	}...)
 	plugin := newTestPlugin(t, host, func(cfg *Config) { cfg.AutoAction = "cooldown_then_disable" })
+	if errUpdate := plugin.stateStore().Update(func(state *State) error {
+		account := state.Accounts["auth-1"]
+		account.State = StateCooling
+		account.DisableKind = DisableKindCooldown
+		account.CooldownUntil = time.Now().UTC().Add(-time.Minute)
+		account.QualityStrikeMissingThinking = true
+		return nil
+	}); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
 	done := make(chan error, 1)
 	go func() {
 		done <- plugin.ProbeAccount(context.Background(), "auth-1", true, "callback-1")
@@ -49,20 +53,15 @@ func TestProbeFailureAfterStrikePermanentlyDisablesWithoutDeadlock(t *testing.T)
 	if errDecode != nil {
 		t.Fatal(errDecode)
 	}
-	if !authDisabled(saved) || guardMeta(saved).DisableKind != DisableKindPermanent {
+	if !authDisabled(saved) {
 		t.Fatalf("auth was not permanently disabled: %#v", saved)
 	}
+	assertNoGuardMetadata(t, saved)
 }
 
 func TestProbeSuccessReenablesCooldownAndClearsStrikes(t *testing.T) {
 	entries, auths := singleGrokAuth(t, "auth-1", "alice@example.com", map[string]any{
 		"disabled": true,
-		"grok_quality_guard": map[string]any{
-			"managed":                 true,
-			"disable_kind":            DisableKindCooldown,
-			"cooldown_until":          "2020-01-01T00:00:00Z",
-			"strike_missing_thinking": true,
-		},
 	})
 	host := newMockHostCall(entries, auths)
 	visible := strings.Repeat("reliable systems need careful design. ", 10) + "\\nQUALITY_OK"
@@ -76,6 +75,16 @@ func TestProbeSuccessReenablesCooldownAndClearsStrikes(t *testing.T) {
 		cfg.Quality.SoftTPS = 1e9
 		cfg.Quality.HardTPS = 2e9
 	})
+	if errUpdate := plugin.stateStore().Update(func(state *State) error {
+		account := state.Accounts["auth-1"]
+		account.State = StateCooling
+		account.DisableKind = DisableKindCooldown
+		account.CooldownUntil = time.Now().UTC().Add(-time.Minute)
+		account.QualityStrikeMissingThinking = true
+		return nil
+	}); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
 	if errProbe := plugin.ProbeAccount(context.Background(), "auth-1", true, "callback-1"); errProbe != nil {
 		t.Fatal(errProbe)
 	}
@@ -90,13 +99,7 @@ func TestProbeSuccessReenablesCooldownAndClearsStrikes(t *testing.T) {
 	if authDisabled(saved) {
 		t.Fatal("successful probe left auth disabled")
 	}
-	meta := guardMeta(saved)
-	if meta.DisableKind != "" || meta.CooldownUntil != "" {
-		t.Fatalf("probe success did not clear cooldown metadata: %#v", meta)
-	}
-	if meta.StrikeMissingThinking {
-		t.Fatal("probe success did not clear the missing-thinking strike")
-	}
+	assertNoGuardMetadata(t, saved)
 }
 
 func TestProbeParsesHostLineChunksWithoutNewlines(t *testing.T) {
@@ -348,6 +351,17 @@ func assertNoProbeEntry(t *testing.T, entered <-chan string) {
 	}
 }
 
+func newDueProbeScheduler(t *testing.T, plugin *Plugin) *probeScheduler {
+	t.Helper()
+	scheduler := newProbeScheduler(plugin, context.Background())
+	plugin.mu.RLock()
+	policy := plugin.policy
+	plugin.mu.RUnlock()
+	scheduler.enqueueDue(plugin.catalogSnapshot(), plugin.stateStore().Snapshot(), policy, time.Now().UTC())
+	scheduler.dispatch()
+	return scheduler
+}
+
 func TestProbeConcurrencyRunsDistinctAccountsTogether(t *testing.T) {
 	entries, auths := twoGrokAuths(t)
 	host := newMockHostCall(entries, auths)
@@ -360,9 +374,11 @@ func TestProbeConcurrencyRunsDistinctAccountsTogether(t *testing.T) {
 	entered := make(chan string, 4)
 	release := make(chan struct{})
 	installStreamHold(entered, release)
+	scheduler := newDueProbeScheduler(t, plugin)
 	done := make(chan error, 1)
 	go func() {
-		done <- plugin.runDueProbes(context.Background())
+		scheduler.waitIdle()
+		done <- nil
 	}()
 	got := waitForProbeEntries(t, entered, 2)
 	if len(uniqueStrings(got)) != 2 {
@@ -375,7 +391,7 @@ func TestProbeConcurrencyRunsDistinctAccountsTogether(t *testing.T) {
 			t.Fatal(errRun)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("runDueProbes did not finish")
+		t.Fatal("probe scheduler did not finish")
 	}
 }
 
@@ -391,9 +407,11 @@ func TestProbeConcurrencyLimitsParallelAccounts(t *testing.T) {
 	entered := make(chan string, 4)
 	release := make(chan struct{})
 	installStreamHold(entered, release)
+	scheduler := newDueProbeScheduler(t, plugin)
 	done := make(chan error, 1)
 	go func() {
-		done <- plugin.runDueProbes(context.Background())
+		scheduler.waitIdle()
+		done <- nil
 	}()
 	first := waitForProbeEntries(t, entered, 1)
 	assertNoProbeEntry(t, entered)
@@ -408,10 +426,70 @@ func TestProbeConcurrencyLimitsParallelAccounts(t *testing.T) {
 			t.Fatal(errRun)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("runDueProbes did not finish")
+		t.Fatal("probe scheduler did not finish")
 	}
 }
 
+func TestForceProbeTakesPriorityForNextSlot(t *testing.T) {
+	plugin := NewPlugin()
+	plugin.policy.Probe.Concurrency = 1
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if errAcquire := plugin.acquireProbeSlot(ctx, false); errAcquire != nil {
+		t.Fatal(errAcquire)
+	}
+
+	priorityAcquired := make(chan struct{})
+	releasePriority := make(chan struct{})
+	go func() {
+		if errAcquire := plugin.acquireProbeSlot(ctx, true); errAcquire == nil {
+			close(priorityAcquired)
+			<-releasePriority
+			plugin.releaseProbeSlot()
+		}
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		plugin.probeGate.Lock()
+		waiting := plugin.probePriorityWaiters
+		plugin.probeGate.Unlock()
+		if waiting == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("priority probe did not enter the wait queue")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	normalAcquired := make(chan struct{})
+	go func() {
+		if errAcquire := plugin.acquireProbeSlot(ctx, false); errAcquire == nil {
+			close(normalAcquired)
+			plugin.releaseProbeSlot()
+		}
+	}()
+	plugin.releaseProbeSlot()
+
+	select {
+	case <-priorityAcquired:
+	case <-normalAcquired:
+		t.Fatal("normal probe acquired the released slot before the priority probe")
+	case <-ctx.Done():
+		t.Fatal("priority probe did not acquire the next slot")
+	}
+	select {
+	case <-normalAcquired:
+		t.Fatal("normal probe started before the priority probe released its slot")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releasePriority)
+	select {
+	case <-normalAcquired:
+	case <-ctx.Done():
+		t.Fatal("normal probe did not acquire the slot after priority release")
+	}
+}
 func TestProbeSameAccountDoesNotTakeSecondSlot(t *testing.T) {
 	entries, auths := twoGrokAuths(t)
 	host := newMockHostCall(entries, auths)
@@ -458,6 +536,94 @@ func TestProbeSameAccountDoesNotTakeSecondSlot(t *testing.T) {
 	}
 }
 
+func TestProbeSchedulerFiltersHealthyAccountsBeforeQueue(t *testing.T) {
+	entries, auths := twoGrokAuths(t)
+	host := newMockHostCall(entries, auths)
+	plugin := newTestPlugin(t, host, nil)
+	ageAccountsForProbe(t, plugin)
+	if errUpdate := plugin.stateStore().Update(func(state *State) error {
+		state.Accounts["auth-1"].State = StateHealthy
+		return nil
+	}); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+
+	scheduler := newProbeScheduler(plugin, context.Background())
+	plugin.mu.RLock()
+	policy := plugin.policy
+	plugin.mu.RUnlock()
+	added := scheduler.enqueueDue(plugin.catalogSnapshot(), plugin.stateStore().Snapshot(), policy, time.Now().UTC())
+
+	if added != 1 || len(scheduler.queue) != 1 || scheduler.queue[0] != "auth-2" {
+		t.Fatalf("queued probes = %#v, added = %d, want only auth-2", scheduler.queue, added)
+	}
+}
+
+func TestProbeSchedulerBoundsQueue(t *testing.T) {
+	entries, auths := twoGrokAuths(t)
+	host := newMockHostCall(entries, auths)
+	plugin := newTestPlugin(t, host, func(cfg *Config) {
+		cfg.Probe.QueueSize = 1
+	})
+	ageAccountsForProbe(t, plugin)
+
+	scheduler := newProbeScheduler(plugin, context.Background())
+	plugin.mu.RLock()
+	policy := plugin.policy
+	plugin.mu.RUnlock()
+	added := scheduler.enqueueDue(plugin.catalogSnapshot(), plugin.stateStore().Snapshot(), policy, time.Now().UTC())
+
+	if added != 1 || len(scheduler.queue) != 1 {
+		t.Fatalf("queue size = %d, added = %d, want bounded queue of 1", len(scheduler.queue), added)
+	}
+}
+
+func TestProbeSchedulerDeduplicatesAccounts(t *testing.T) {
+	entries, auths := twoGrokAuths(t)
+	host := newMockHostCall(entries, auths)
+	plugin := newTestPlugin(t, host, nil)
+	ageAccountsForProbe(t, plugin)
+
+	scheduler := newProbeScheduler(plugin, context.Background())
+	plugin.mu.RLock()
+	policy := plugin.policy
+	plugin.mu.RUnlock()
+	state := plugin.stateStore().Snapshot()
+	accounts := plugin.catalogSnapshot()
+	first := scheduler.enqueueDue(accounts, state, policy, time.Now().UTC())
+	second := scheduler.enqueueDue(accounts, state, policy, time.Now().UTC())
+
+	if first != 2 || second != 0 || len(scheduler.queue) != 2 {
+		t.Fatalf("first = %d, second = %d, queue = %#v", first, second, scheduler.queue)
+	}
+}
+
+func TestProbeDueUnknownRespectsBackoff(t *testing.T) {
+	now := time.Now().UTC()
+	account := &AccountState{
+		State:             StateUnknown,
+		FirstSeenAt:       now.Add(-time.Hour),
+		ProbeBackoffUntil: now.Add(time.Minute),
+	}
+	if probeDueForAccount(account, true, "auth-1", PolicyFromConfig(DefaultConfig()), now) {
+		t.Fatal("unknown account with active probe backoff must not be due")
+	}
+}
+
+func TestUnknownProbeJitterIsStableAndBounded(t *testing.T) {
+	const max = 30 * time.Second
+	first := unknownProbeJitter("auth-1", max)
+	second := unknownProbeJitter("auth-1", max)
+	if first != second {
+		t.Fatalf("jitter is not stable: %s != %s", first, second)
+	}
+	if first < 0 || first >= max {
+		t.Fatalf("jitter = %s, want [0, %s)", first, max)
+	}
+	if unknownProbeJitter("auth-1", 0) != 0 {
+		t.Fatal("disabled jitter must be zero")
+	}
+}
 func uniqueStrings(values []string) []string {
 	seen := make(map[string]struct{}, len(values))
 	out := make([]string, 0, len(values))

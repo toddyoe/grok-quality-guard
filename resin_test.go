@@ -11,6 +11,17 @@ import (
 	"testing"
 )
 
+func seedResinState(t *testing.T, plugin *Plugin, account string, generation int64) {
+	t.Helper()
+	if errUpdate := plugin.stateStore().Update(func(state *State) error {
+		accountState := state.Accounts["auth-1"]
+		accountState.Resin = ResinState{Managed: true, Account: account, Generation: generation}
+		return nil
+	}); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+}
+
 func TestBindResinPreservesTokensAndMasksResult(t *testing.T) {
 	t.Setenv("RESIN_ADMIN_TOKEN", "admin-secret")
 	t.Setenv("RESIN_PROXY_TOKEN", "proxy-secret")
@@ -60,10 +71,11 @@ func TestBindResinPreservesTokensAndMasksResult(t *testing.T) {
 	if strings.Contains(proxy, "Stale.") {
 		t.Fatalf("saved proxy URL used stale configured platform name: %q", proxy)
 	}
-	meta := guardMeta(saved)
-	if !meta.Managed || meta.ResinAccount != result.Account || meta.ResinGeneration != 1 {
-		t.Fatalf("unexpected metadata: %#v", meta)
+	stateAccount, okState := plugin.stateAccount("auth-1")
+	if !okState || !stateAccount.Resin.Managed || stateAccount.Resin.Account != result.Account || stateAccount.Resin.Generation != 1 {
+		t.Fatalf("unexpected resin state: %#v", stateAccount)
 	}
+	assertNoGuardMetadata(t, saved)
 }
 
 func TestBindResinRefusesForeignProxy(t *testing.T) {
@@ -107,11 +119,6 @@ func TestRotateResinDeletesLeaseAndWritesNewAccount(t *testing.T) {
 	oldProxy := "socks5h://Default.grok-alice-old1:proxy-secret@resin:2260"
 	entries, auths := singleGrokAuth(t, "auth-1", "alice@example.com", map[string]any{
 		"proxy_url": oldProxy,
-		"grok_quality_guard": map[string]any{
-			"managed":          true,
-			"resin_account":    "grok-alice-old1",
-			"resin_generation": 1,
-		},
 	})
 	host := newMockHostCall(entries, auths)
 	plugin := newTestPlugin(t, host, func(cfg *Config) {
@@ -120,6 +127,7 @@ func TestRotateResinDeletesLeaseAndWritesNewAccount(t *testing.T) {
 		cfg.Resin.PlatformID = testResinPlatformID
 		cfg.Resin.AdminURL = server.URL
 	})
+	seedResinState(t, plugin, "grok-alice-old1", 1)
 	if errRotate := plugin.RotateResin(context.Background(), "auth-1"); errRotate != nil {
 		t.Fatal(errRotate)
 	}
@@ -130,12 +138,12 @@ func TestRotateResinDeletesLeaseAndWritesNewAccount(t *testing.T) {
 	if errDecode != nil {
 		t.Fatal(errDecode)
 	}
-	meta := guardMeta(saved)
-	if meta.ResinAccount == "grok-alice-old1" || meta.ResinGeneration != 2 {
-		t.Fatalf("resin account was not rotated: %#v", meta)
+	stateAccount, okState := plugin.stateAccount("auth-1")
+	if !okState || stateAccount.Resin.Account == "grok-alice-old1" || stateAccount.Resin.Generation != 2 {
+		t.Fatalf("resin account was not rotated: %#v", stateAccount)
 	}
 	proxy := authRawString(saved, "proxy_url")
-	if !strings.Contains(proxy, "Canonical."+meta.ResinAccount) {
+	if !strings.Contains(proxy, "Canonical."+stateAccount.Resin.Account) {
 		t.Fatalf("proxy_url did not use canonical platform name: %q", proxy)
 	}
 	if strings.Contains(proxy, "Stale.") {
@@ -155,10 +163,11 @@ func TestRotateResinDeletesLeaseAndWritesNewAccount(t *testing.T) {
 	if rotationIndex < 0 {
 		t.Fatal("resin rotation event was not recorded")
 	}
-	wantDetail := "旧租约：grok-alice-old1 → 新租约：" + meta.ResinAccount
+	wantDetail := "旧租约：grok-alice-old1 → 新租约：" + stateAccount.Resin.Account
 	if state.Events[rotationIndex].Detail != wantDetail {
 		t.Fatalf("rotation event detail = %q, want %q", state.Events[rotationIndex].Detail, wantDetail)
 	}
+	assertNoGuardMetadata(t, saved)
 }
 
 func TestClearResinProxyDeletesLeaseAndClearsAuth(t *testing.T) {
@@ -188,11 +197,6 @@ func TestClearResinProxyDeletesLeaseAndClearsAuth(t *testing.T) {
 	oldProxy := "socks5h://Default.grok-alice-old1:proxy-secret@resin:2260"
 	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", map[string]any{
 		"proxy_url": oldProxy,
-		"grok_quality_guard": map[string]any{
-			"managed":          true,
-			"resin_account":    "grok-alice-old1",
-			"resin_generation": 2,
-		},
 	})
 	host := newMockHostCall(entries, auths)
 	plugin := newTestPlugin(t, host, func(cfg *Config) {
@@ -201,6 +205,7 @@ func TestClearResinProxyDeletesLeaseAndClearsAuth(t *testing.T) {
 		cfg.Resin.PlatformID = testResinPlatformID
 		cfg.Resin.AdminURL = server.URL
 	})
+	seedResinState(t, plugin, "grok-alice-old1", 2)
 	result, errClear := plugin.ClearResinProxy(context.Background(), "auth-1")
 	if errClear != nil {
 		t.Fatal(errClear)
@@ -221,10 +226,7 @@ func TestClearResinProxyDeletesLeaseAndClearsAuth(t *testing.T) {
 	if authRawString(saved, "proxy_url") != "" {
 		t.Fatalf("proxy_url was not cleared: %q", authRawString(saved, "proxy_url"))
 	}
-	meta := guardMeta(saved)
-	if meta.Managed || meta.ResinAccount != "" || meta.ResinGeneration != 2 {
-		t.Fatalf("unexpected metadata after clear: %#v", meta)
-	}
+	assertNoGuardMetadata(t, saved)
 	if authRawString(saved, "access_token") != "access-auth-1" || authRawString(saved, "refresh_token") != "refresh-auth-1" {
 		t.Fatal("token fields were not preserved")
 	}
@@ -286,10 +288,6 @@ func TestClearManagedProxyLeaseFailureLeavesAuthUntouched(t *testing.T) {
 	defer server.Close()
 	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", map[string]any{
 		"proxy_url": "socks5h://Default.grok-alice-old1:proxy-secret@resin:2260",
-		"grok_quality_guard": map[string]any{
-			"managed":       true,
-			"resin_account": "grok-alice-old1",
-		},
 	})
 	host := newMockHostCall(entries, auths)
 	plugin := newTestPlugin(t, host, func(cfg *Config) {
@@ -298,6 +296,7 @@ func TestClearManagedProxyLeaseFailureLeavesAuthUntouched(t *testing.T) {
 		cfg.Resin.PlatformID = testResinPlatformID
 		cfg.Resin.AdminURL = server.URL
 	})
+	seedResinState(t, plugin, "grok-alice-old1", 0)
 	result, errClear := plugin.ClearResinProxy(context.Background(), "auth-1")
 	if errClear == nil {
 		t.Fatalf("expected lease delete failure, result=%#v", result)
@@ -320,6 +319,7 @@ func TestRotateResinLocalOnlyRewritesProxyWithoutAPI(t *testing.T) {
 		cfg.Resin.Enabled = true
 		cfg.Resin.LocalOnly = true
 	})
+	seedResinState(t, plugin, "grok-alice-old1", 0)
 	if errRotate := plugin.RotateResin(context.Background(), "auth-1"); errRotate != nil {
 		t.Fatal(errRotate)
 	}
@@ -327,18 +327,15 @@ func TestRotateResinLocalOnlyRewritesProxyWithoutAPI(t *testing.T) {
 	if errDecode != nil {
 		t.Fatal(errDecode)
 	}
-	meta := guardMeta(saved)
-	if !meta.Managed || meta.ResinAccount == "" || meta.ResinAccount == "grok-alice-old1" || meta.ResinGeneration != 1 {
-		t.Fatalf("unexpected local rotation metadata: %#v", meta)
-	}
-	rotatedProxy := authRawString(saved, "proxy_url")
-	if !strings.Contains(rotatedProxy, "Default."+meta.ResinAccount) || !strings.Contains(rotatedProxy, "proxy-secret") {
-		t.Fatalf("local rotation did not preserve platform and password: %q", rotatedProxy)
-	}
 	stateAccount, okState := plugin.stateAccount("auth-1")
-	if !okState || !stateAccount.Resin.Managed || stateAccount.Resin.Account != meta.ResinAccount {
+	if !okState || !stateAccount.Resin.Managed || stateAccount.Resin.Account == "" || stateAccount.Resin.Account == "grok-alice-old1" || stateAccount.Resin.Generation != 1 {
 		t.Fatalf("unexpected local rotation state: %#v", stateAccount)
 	}
+	rotatedProxy := authRawString(saved, "proxy_url")
+	if !strings.Contains(rotatedProxy, "Default."+stateAccount.Resin.Account) || !strings.Contains(rotatedProxy, "proxy-secret") {
+		t.Fatalf("local rotation did not preserve platform and password: %q", rotatedProxy)
+	}
+	assertNoGuardMetadata(t, saved)
 	state := plugin.store.Snapshot()
 	foundEvent := false
 	for _, event := range state.Events {
@@ -354,16 +351,13 @@ func TestRotateResinLocalOnlyRewritesProxyWithoutAPI(t *testing.T) {
 func TestClearResinProxyLocalOnlySkipsRemoteLease(t *testing.T) {
 	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", map[string]any{
 		"proxy_url": "socks5h://Default.grok-alice-old1:proxy-secret@resin:2260",
-		"grok_quality_guard": map[string]any{
-			"managed":       true,
-			"resin_account": "grok-alice-old1",
-		},
 	})
 	host := newMockHostCall(entries, auths)
 	plugin := newTestPlugin(t, host, func(cfg *Config) {
 		cfg.Resin.Enabled = true
 		cfg.Resin.LocalOnly = true
 	})
+	seedResinState(t, plugin, "grok-alice-old1", 0)
 	result, errClear := plugin.ClearResinProxy(context.Background(), "auth-1")
 	if errClear != nil {
 		t.Fatal(errClear)
@@ -402,6 +396,7 @@ func TestRotateAfterFailureLocalOnlyRewritesProxy(t *testing.T) {
 		cfg.Resin.LocalOnly = true
 		cfg.Resin.AutoRotateAfterQualityFailure = true
 	})
+	seedResinState(t, plugin, "grok-alice-old1", 0)
 	rotated, errRotate := plugin.rotateAfterFailure(context.Background(), "auth-1", ClassMissingThinking)
 	if errRotate != nil {
 		t.Fatal(errRotate)
@@ -416,10 +411,11 @@ func TestRotateAfterFailureLocalOnlyRewritesProxy(t *testing.T) {
 	if errDecode != nil {
 		t.Fatal(errDecode)
 	}
-	meta := guardMeta(saved)
-	if !meta.Managed || meta.ResinAccount == "" || meta.ResinAccount == "grok-alice-old1" {
-		t.Fatalf("unexpected auto-rotation metadata: %#v", meta)
+	stateAccount, okState := plugin.stateAccount("auth-1")
+	if !okState || !stateAccount.Resin.Managed || stateAccount.Resin.Account == "" || stateAccount.Resin.Account == "grok-alice-old1" {
+		t.Fatalf("unexpected auto-rotation state: %#v", stateAccount)
 	}
+	assertNoGuardMetadata(t, saved)
 	if authRawString(saved, "access_token") != "access-auth-1" {
 		t.Fatal("auto-rotation removed token fields")
 	}
@@ -522,10 +518,6 @@ func TestRotateResinAdminAuthFailureLeavesAuthUntouched(t *testing.T) {
 	defer server.Close()
 	entries, auths := singleGrokAuth(t, "auth-1", "alice@example.com", map[string]any{
 		"proxy_url": "socks5h://Default.grok-alice-old1:proxy-secret@resin:2260",
-		"grok_quality_guard": map[string]any{
-			"managed":       true,
-			"resin_account": "grok-alice-old1",
-		},
 	})
 	host := newMockHostCall(entries, auths)
 	plugin := newTestPlugin(t, host, func(cfg *Config) {
@@ -534,6 +526,7 @@ func TestRotateResinAdminAuthFailureLeavesAuthUntouched(t *testing.T) {
 		cfg.Resin.PlatformID = testResinPlatformID
 		cfg.Resin.AdminURL = server.URL
 	})
+	seedResinState(t, plugin, "grok-alice-old1", 0)
 	if errRotate := plugin.RotateResin(context.Background(), "auth-1"); errRotate == nil {
 		t.Fatal("expected admin authentication failure")
 	}
