@@ -22,29 +22,31 @@ type mockHostCall struct {
 	saves   map[string]json.RawMessage
 	saveErr error
 
-	nextStream   int
-	streams      map[string][]pluginapi.HostModelStreamReadResponse
-	streamStatus map[string]int
-	streamNoID   map[string]bool
-	streamByID   map[string]string
-	emitted      map[string][][]byte
-	closes       map[string]*pluginabi.Error
-	modelCalls   []pluginapi.HostModelExecutionRequest
-	callbacks    []string
-	authGets     []string
+	nextStream    int
+	streams       map[string][]pluginapi.HostModelStreamReadResponse
+	streamScripts map[string][][]pluginapi.HostModelStreamReadResponse
+	streamStatus  map[string]int
+	streamNoID    map[string]bool
+	streamByID    map[string]string
+	emitted       map[string][][]byte
+	closes        map[string]*pluginabi.Error
+	modelCalls    []pluginapi.HostModelExecutionRequest
+	callbacks     []string
+	authGets      []string
 }
 
 func newMockHostCall(entries []pluginapi.HostAuthFileEntry, auths map[string]json.RawMessage) *mockHostCall {
 	return &mockHostCall{
-		entries:      append([]pluginapi.HostAuthFileEntry(nil), entries...),
-		auths:        cloneRawMap(auths),
-		saves:        make(map[string]json.RawMessage),
-		streams:      make(map[string][]pluginapi.HostModelStreamReadResponse),
-		streamStatus: make(map[string]int),
-		streamNoID:   make(map[string]bool),
-		streamByID:   make(map[string]string),
-		emitted:      make(map[string][][]byte),
-		closes:       make(map[string]*pluginabi.Error),
+		entries:       append([]pluginapi.HostAuthFileEntry(nil), entries...),
+		auths:         cloneRawMap(auths),
+		saves:         make(map[string]json.RawMessage),
+		streams:       make(map[string][]pluginapi.HostModelStreamReadResponse),
+		streamScripts: make(map[string][][]pluginapi.HostModelStreamReadResponse),
+		streamStatus:  make(map[string]int),
+		streamNoID:    make(map[string]bool),
+		streamByID:    make(map[string]string),
+		emitted:       make(map[string][][]byte),
+		closes:        make(map[string]*pluginabi.Error),
 	}
 }
 
@@ -60,6 +62,16 @@ func (m *mockHostCall) scriptStream(authID string, reads ...pluginapi.HostModelS
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.streams[authID] = append([]pluginapi.HostModelStreamReadResponse(nil), reads...)
+}
+
+func (m *mockHostCall) scriptStreamSequence(authID string, scripts ...[]pluginapi.HostModelStreamReadResponse) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	queued := make([][]pluginapi.HostModelStreamReadResponse, 0, len(scripts))
+	for _, script := range scripts {
+		queued = append(queued, append([]pluginapi.HostModelStreamReadResponse(nil), script...))
+	}
+	m.streamScripts[authID] = queued
 }
 
 func (m *mockHostCall) scriptStreamStatus(authID string, status int, reads ...pluginapi.HostModelStreamReadResponse) {
@@ -147,6 +159,11 @@ func (m *mockHostCall) call(method string, payload any) (json.RawMessage, error)
 		m.modelCalls = append(m.modelCalls, req.HostModelExecutionRequest)
 		m.callbacks = append(m.callbacks, req.HostCallbackID)
 		reads, ok := m.streams[req.AuthID]
+		if queued := m.streamScripts[req.AuthID]; len(queued) > 0 {
+			reads = append([]pluginapi.HostModelStreamReadResponse(nil), queued[0]...)
+			m.streamScripts[req.AuthID] = append([][]pluginapi.HostModelStreamReadResponse(nil), queued[1:]...)
+			ok = true
+		}
 		if !ok {
 			return nil, fmt.Errorf("mock stream for auth %s not configured", req.AuthID)
 		}

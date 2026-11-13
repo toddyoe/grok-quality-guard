@@ -492,14 +492,6 @@ func resolveResinPlatformByName(ctx context.Context, settings ResinSettings) (Re
 	}
 }
 
-func resolveResinAdminForOperation(ctx context.Context, settings ResinSettings) (ResinSettings, error) {
-	normalized, errNormalize := normalizeResinAdminSettings(settings)
-	if errNormalize != nil {
-		return ResinSettings{}, errNormalize
-	}
-	return resolveResinPlatformReference(ctx, normalized)
-}
-
 func resolveResinPlatformForOperation(ctx context.Context, settings ResinSettings) (ResinSettings, error) {
 	normalized, errNormalize := normalizeResinSettings(settings)
 	if errNormalize != nil {

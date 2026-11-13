@@ -80,19 +80,22 @@ type Plugin struct {
 	tasksMu sync.Mutex
 	tasks   map[string]*taskRecord
 	taskWG  sync.WaitGroup
+
+	resinLeaseDeleteWake chan struct{}
 }
 
 func NewPlugin() *Plugin {
 	plugin := &Plugin{
-		cfg:           DefaultConfig(),
-		policy:        PolicyFromConfig(DefaultConfig()),
-		accountLocks:  make(map[string]*sync.Mutex),
-		pending:       make(map[string]*PendingObservation),
-		probeSkip:     make(map[string]time.Time),
-		recentSuccess: make(map[string]time.Time),
-		modelStreams:  make(map[string]struct{}),
-		tasks:         make(map[string]*taskRecord),
-		probing:       make(map[string]struct{}),
+		cfg:                  DefaultConfig(),
+		policy:               PolicyFromConfig(DefaultConfig()),
+		accountLocks:         make(map[string]*sync.Mutex),
+		pending:              make(map[string]*PendingObservation),
+		probeSkip:            make(map[string]time.Time),
+		recentSuccess:        make(map[string]time.Time),
+		modelStreams:         make(map[string]struct{}),
+		tasks:                make(map[string]*taskRecord),
+		probing:              make(map[string]struct{}),
+		resinLeaseDeleteWake: make(chan struct{}, 1),
 	}
 	plugin.probeCond = sync.NewCond(&plugin.probeGate)
 	return plugin
@@ -230,7 +233,7 @@ func (p *Plugin) startWorkersLocked() {
 	p.ctx = ctx
 	p.cancel = cancel
 	p.workersActive = true
-	p.wg.Add(2)
+	p.wg.Add(3)
 	go func() {
 		defer p.wg.Done()
 		p.refreshLoop(ctx)
@@ -238,6 +241,10 @@ func (p *Plugin) startWorkersLocked() {
 	go func() {
 		defer p.wg.Done()
 		p.probeLoop(ctx)
+	}()
+	go func() {
+		defer p.wg.Done()
+		p.resinLeaseDeleteLoop(ctx)
 	}()
 }
 

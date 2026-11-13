@@ -26,6 +26,15 @@ func TestStateStorePersistsAndReloads(t *testing.T) {
 			CooldownUntil:      time.Now().UTC().Add(time.Hour),
 			AuthDisabledIntent: &intent,
 		}
+		state.ResinLeaseDeletes = []ResinLeaseDelete{{
+			AuthID:        "auth-1",
+			AdminURL:      "http://resin.test",
+			AdminToken:    "admin-secret",
+			PlatformID:    "platform-1",
+			Account:       "grok-alice-old1",
+			CreatedAt:     time.Now().UTC(),
+			NextAttemptAt: time.Now().UTC().Add(time.Minute),
+		}}
 		return nil
 	}); errUpdate != nil {
 		t.Fatal(errUpdate)
@@ -38,7 +47,7 @@ func TestStateStorePersistsAndReloads(t *testing.T) {
 	if errUnmarshal := json.Unmarshal(raw, &persisted); errUnmarshal != nil {
 		t.Fatalf("state file is not valid JSON: %v", errUnmarshal)
 	}
-	if persisted.SchemaVersion != stateSchemaVersion || persisted.Accounts["auth-1"] == nil {
+	if persisted.SchemaVersion != stateSchemaVersion || persisted.Accounts["auth-1"] == nil || len(persisted.ResinLeaseDeletes) != 1 {
 		t.Fatalf("unexpected persisted state: %#v", persisted)
 	}
 	reloaded := NewStateStore(path)
@@ -49,6 +58,9 @@ func TestStateStorePersistsAndReloads(t *testing.T) {
 	account := snapshot.Accounts["auth-1"]
 	if account == nil || account.State != StateCooling || account.CooldownUntil.IsZero() || account.AuthDisabledIntent == nil || *account.AuthDisabledIntent {
 		t.Fatalf("reloaded account mismatch: %#v", account)
+	}
+	if len(snapshot.ResinLeaseDeletes) != 1 || snapshot.ResinLeaseDeletes[0].Account != "grok-alice-old1" {
+		t.Fatalf("reloaded lease delete queue mismatch: %#v", snapshot.ResinLeaseDeletes)
 	}
 	matches, errGlob := filepath.Glob(filepath.Join(filepath.Dir(path), ".state-*.tmp"))
 	if errGlob != nil {

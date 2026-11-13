@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync/atomic"
@@ -25,6 +27,24 @@ func seedResinState(t *testing.T, plugin *Plugin, account string, generation int
 	}); errUpdate != nil {
 		t.Fatal(errUpdate)
 	}
+}
+
+func failResinStateWrites(t *testing.T, plugin *Plugin) {
+	t.Helper()
+	blocker := filepath.Join(t.TempDir(), "state-blocker")
+	if errWrite := os.WriteFile(blocker, []byte("blocker"), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	store := plugin.stateStore()
+	store.mu.Lock()
+	originalPath := store.path
+	store.path = filepath.Join(blocker, "state.json")
+	store.mu.Unlock()
+	t.Cleanup(func() {
+		store.mu.Lock()
+		store.path = originalPath
+		store.mu.Unlock()
+	})
 }
 
 func newResinConcurrencyServer(t *testing.T) (*httptest.Server, *atomic.Int32) {
@@ -130,7 +150,7 @@ func TestBindResinRefusesForeignProxy(t *testing.T) {
 	}
 }
 
-func TestRotateResinDeletesLeaseAndWritesNewAccount(t *testing.T) {
+func TestRotateResinQueuesLeaseDeleteAndWritesNewAccount(t *testing.T) {
 	t.Setenv("RESIN_ADMIN_TOKEN", "admin-secret")
 	t.Setenv("RESIN_PROXY_TOKEN", "proxy-secret")
 	var deleted []string
@@ -138,19 +158,12 @@ func TestRotateResinDeletesLeaseAndWritesNewAccount(t *testing.T) {
 		if request.Header.Get("Authorization") != "Bearer admin-secret" {
 			t.Errorf("authorization header not forwarded")
 		}
-		switch request.Method {
-		case http.MethodGet:
-			if request.URL.Path != "/api/v1/platforms/"+testResinPlatformID {
-				t.Errorf("platform path = %s", request.URL.Path)
-			}
-			writer.Header().Set("Content-Type", "application/json")
-			_, _ = writer.Write([]byte(`{"id":"` + testResinPlatformID + `","name":"Canonical"}`))
-		case http.MethodDelete:
-			deleted = append(deleted, request.URL.Path)
-			writer.WriteHeader(http.StatusNoContent)
-		default:
+		if request.Method != http.MethodDelete {
 			t.Errorf("method = %s", request.Method)
+			return
 		}
+		deleted = append(deleted, request.URL.Path)
+		writer.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
 	oldProxy := "socks5h://Default.grok-alice-old1:proxy-secret@resin:2260"
@@ -160,7 +173,7 @@ func TestRotateResinDeletesLeaseAndWritesNewAccount(t *testing.T) {
 	host := newMockHostCall(entries, auths)
 	plugin := newTestPlugin(t, host, func(cfg *Config) {
 		cfg.Resin.Enabled = true
-		cfg.Resin.Platform = "Stale"
+		cfg.Resin.Platform = "Canonical"
 		cfg.Resin.PlatformID = testResinPlatformID
 		cfg.Resin.AdminURL = server.URL
 	})
@@ -168,8 +181,11 @@ func TestRotateResinDeletesLeaseAndWritesNewAccount(t *testing.T) {
 	if errRotate := plugin.RotateResin(context.Background(), "auth-1"); errRotate != nil {
 		t.Fatal(errRotate)
 	}
-	if len(deleted) != 1 || !strings.Contains(deleted[0], "grok-alice-old1") {
-		t.Fatalf("unexpected deleted paths: %#v", deleted)
+	if len(deleted) != 0 {
+		t.Fatalf("rotation called the Resin admin API synchronously: %#v", deleted)
+	}
+	if jobs := plugin.store.Snapshot().ResinLeaseDeletes; len(jobs) != 1 || jobs[0].Account != "grok-alice-old1" {
+		t.Fatalf("old lease was not queued for deletion: %#v", jobs)
 	}
 	saved, errDecode := rawAuthToMap(host.saves["auth-1"])
 	if errDecode != nil {
@@ -200,14 +216,23 @@ func TestRotateResinDeletesLeaseAndWritesNewAccount(t *testing.T) {
 	if rotationIndex < 0 {
 		t.Fatal("resin rotation event was not recorded")
 	}
-	wantDetail := "旧租约：grok-alice-old1 → 新租约：" + stateAccount.Resin.Account
+	wantDetail := "旧租约：grok-alice-old1 → 新租约：" + stateAccount.Resin.Account + "，旧租约删除已入队"
 	if state.Events[rotationIndex].Detail != wantDetail {
 		t.Fatalf("rotation event detail = %q, want %q", state.Events[rotationIndex].Detail, wantDetail)
+	}
+	if processed := plugin.processDueResinLeaseDeletes(context.Background(), time.Now().UTC()); processed != 1 {
+		t.Fatalf("processed deletes = %d, want 1", processed)
+	}
+	if len(deleted) != 1 || !strings.Contains(deleted[0], "grok-alice-old1") {
+		t.Fatalf("unexpected deleted paths: %#v", deleted)
+	}
+	if jobs := plugin.store.Snapshot().ResinLeaseDeletes; len(jobs) != 0 {
+		t.Fatalf("successful delete was not removed from the queue: %#v", jobs)
 	}
 	assertNoGuardMetadata(t, saved)
 }
 
-func TestClearResinProxyDeletesLeaseAndClearsAuth(t *testing.T) {
+func TestClearResinProxyQueuesLeaseDeleteAndClearsAuth(t *testing.T) {
 	t.Setenv("RESIN_ADMIN_TOKEN", "admin-secret")
 	t.Setenv("RESIN_PROXY_TOKEN", "")
 	var deleted []string
@@ -216,19 +241,12 @@ func TestClearResinProxyDeletesLeaseAndClearsAuth(t *testing.T) {
 			writer.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		switch request.Method {
-		case http.MethodGet:
-			if request.URL.Path != "/api/v1/platforms/"+testResinPlatformID {
-				t.Errorf("platform path = %s", request.URL.Path)
-			}
-			writer.Header().Set("Content-Type", "application/json")
-			_, _ = writer.Write([]byte(`{"id":"` + testResinPlatformID + `","name":"Canonical"}`))
-		case http.MethodDelete:
-			deleted = append(deleted, request.URL.Path)
-			writer.WriteHeader(http.StatusNoContent)
-		default:
+		if request.Method != http.MethodDelete {
 			t.Errorf("method = %s", request.Method)
+			return
 		}
+		deleted = append(deleted, request.URL.Path)
+		writer.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
 	oldProxy := "socks5h://Default.grok-alice-old1:proxy-secret@resin:2260"
@@ -247,14 +265,17 @@ func TestClearResinProxyDeletesLeaseAndClearsAuth(t *testing.T) {
 	if errClear != nil {
 		t.Fatal(errClear)
 	}
-	if !result.Cleared || !result.RemoteLeaseDeleted || result.Account != "grok-alice-old1" {
+	if !result.Cleared || !result.RemoteLeaseDeleteQueued || result.Account != "grok-alice-old1" {
 		t.Fatalf("unexpected clear result: %#v", result)
 	}
 	if strings.Contains(result.ProxyURL, "proxy-secret") || strings.Contains(result.ProxyURL, "alice") {
 		t.Fatalf("clear result leaked proxy credentials: %q", result.ProxyURL)
 	}
-	if len(deleted) != 1 || !strings.Contains(deleted[0], "grok-alice-old1") {
-		t.Fatalf("unexpected deleted paths: %#v", deleted)
+	if len(deleted) != 0 {
+		t.Fatalf("clear called the Resin admin API synchronously: %#v", deleted)
+	}
+	if jobs := plugin.store.Snapshot().ResinLeaseDeletes; len(jobs) != 1 || jobs[0].Account != "grok-alice-old1" {
+		t.Fatalf("old lease was not queued for deletion: %#v", jobs)
 	}
 	saved, errDecode := rawAuthToMap(host.saves["auth-1"])
 	if errDecode != nil {
@@ -274,12 +295,18 @@ func TestClearResinProxyDeletesLeaseAndClearsAuth(t *testing.T) {
 	state := plugin.store.Snapshot()
 	foundEvent := false
 	for _, event := range state.Events {
-		if event.Action == "resin_clear" && event.Result == "cleared" {
+		if event.Action == "resin_clear" && event.Result == "cleared" && strings.Contains(event.Detail, "remote_lease=delete_queued") {
 			foundEvent = true
 		}
 	}
 	if !foundEvent {
 		t.Fatal("resin clear event was not recorded")
+	}
+	if processed := plugin.processDueResinLeaseDeletes(context.Background(), time.Now().UTC()); processed != 1 {
+		t.Fatalf("processed deletes = %d, want 1", processed)
+	}
+	if len(deleted) != 1 || !strings.Contains(deleted[0], "grok-alice-old1") {
+		t.Fatalf("unexpected deleted paths: %#v", deleted)
 	}
 }
 
@@ -290,20 +317,12 @@ func TestClearResinProxyInfersLeaseFromSavedConfig(t *testing.T) {
 			writer.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		switch request.Method {
-		case http.MethodGet:
-			if request.URL.Path != "/api/v1/platforms/"+testResinPlatformID {
-				writer.WriteHeader(http.StatusNotFound)
-				return
-			}
-			writer.Header().Set("Content-Type", "application/json")
-			_, _ = writer.Write([]byte(`{"id":"` + testResinPlatformID + `","name":"Default"}`))
-		case http.MethodDelete:
-			deleted = append(deleted, request.URL.Path)
-			writer.WriteHeader(http.StatusNoContent)
-		default:
+		if request.Method != http.MethodDelete {
 			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
 		}
+		deleted = append(deleted, request.URL.Path)
+		writer.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
 
@@ -334,8 +353,14 @@ func TestClearResinProxyInfersLeaseFromSavedConfig(t *testing.T) {
 	if errClear != nil {
 		t.Fatal(errClear)
 	}
-	if !result.Cleared || !result.RemoteLeaseDeleted || result.Account != "grok-alice-old1" {
+	if !result.Cleared || !result.RemoteLeaseDeleteQueued || result.Account != "grok-alice-old1" {
 		t.Fatalf("unexpected inferred clear result: %#v", result)
+	}
+	if len(deleted) != 0 {
+		t.Fatalf("clear called the Resin admin API synchronously: %#v", deleted)
+	}
+	if processed := plugin.processDueResinLeaseDeletes(context.Background(), time.Now().UTC()); processed != 1 {
+		t.Fatalf("processed deletes = %d, want 1", processed)
 	}
 	if len(deleted) != 1 || !strings.HasSuffix(deleted[0], "/grok-alice-old1") {
 		t.Fatalf("managed lease was not deleted: %#v", deleted)
@@ -408,7 +433,7 @@ func TestResinBindUnboundUsesBoundedQueue(t *testing.T) {
 	}
 }
 
-func TestResinClearSelectedUsesBoundedQueue(t *testing.T) {
+func TestResinClearSelectedQueuesLeaseDeletes(t *testing.T) {
 	t.Setenv("RESIN_ADMIN_TOKEN", "admin-secret")
 	t.Setenv("RESIN_PROXY_TOKEN", "proxy-secret")
 	server, maxActive := newResinConcurrencyServer(t)
@@ -454,8 +479,20 @@ func TestResinClearSelectedUsesBoundedQueue(t *testing.T) {
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d body=%s", response.StatusCode, response.Body)
 	}
-	if got := maxActive.Load(); got != 2 {
-		t.Fatalf("max concurrent resin requests = %d, want 2", got)
+	if got := maxActive.Load(); got != 0 {
+		t.Fatalf("clear called the Resin admin API synchronously: %d", got)
+	}
+	if jobs := plugin.store.Snapshot().ResinLeaseDeletes; len(jobs) != len(authIDs) {
+		t.Fatalf("queued deletes = %d, want %d: %#v", len(jobs), len(authIDs), jobs)
+	}
+	if processed := plugin.processDueResinLeaseDeletes(context.Background(), time.Now().UTC()); processed != len(authIDs) {
+		t.Fatalf("processed deletes = %d, want %d", processed, len(authIDs))
+	}
+	if got := maxActive.Load(); got != 1 {
+		t.Fatalf("max concurrent lease deletes = %d, want 1", got)
+	}
+	if jobs := plugin.store.Snapshot().ResinLeaseDeletes; len(jobs) != 0 {
+		t.Fatalf("successful deletes were not removed from the queue: %#v", jobs)
 	}
 }
 
@@ -469,7 +506,7 @@ func TestClearExternalProxyDoesNotRequireResin(t *testing.T) {
 	if errClear != nil {
 		t.Fatal(errClear)
 	}
-	if !result.Cleared || result.RemoteLeaseDeleted || result.Account != "" {
+	if !result.Cleared || result.RemoteLeaseDeleteQueued || result.Account != "" {
 		t.Fatalf("unexpected clear result: %#v", result)
 	}
 	saved, errDecode := rawAuthToMap(host.saves["auth-1"])
@@ -484,19 +521,15 @@ func TestClearExternalProxyDoesNotRequireResin(t *testing.T) {
 	}
 }
 
-func TestClearManagedProxyLeaseFailureLeavesAuthUntouched(t *testing.T) {
+func TestClearManagedProxyLeaseFailureQueuesRetryAndClearsAuth(t *testing.T) {
 	t.Setenv("RESIN_ADMIN_TOKEN", "admin-secret")
 	t.Setenv("RESIN_PROXY_TOKEN", "proxy-secret")
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		switch request.Method {
-		case http.MethodGet:
-			writer.Header().Set("Content-Type", "application/json")
-			_, _ = writer.Write([]byte(`{"id":"` + testResinPlatformID + `","name":"Default"}`))
-		case http.MethodDelete:
-			writer.WriteHeader(http.StatusInternalServerError)
-		default:
+		if request.Method != http.MethodDelete {
 			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
 		}
+		writer.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer server.Close()
 	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", map[string]any{
@@ -511,14 +544,97 @@ func TestClearManagedProxyLeaseFailureLeavesAuthUntouched(t *testing.T) {
 	})
 	seedResinState(t, plugin, "grok-alice-old1", 0)
 	result, errClear := plugin.ClearResinProxy(context.Background(), "auth-1")
-	if errClear == nil {
-		t.Fatalf("expected lease delete failure, result=%#v", result)
+	if errClear != nil {
+		t.Fatal(errClear)
 	}
-	if result.RemoteLeaseDeleted {
-		t.Fatalf("lease was reported deleted after failure: %#v", result)
+	if !result.Cleared || !result.RemoteLeaseDeleteQueued {
+		t.Fatalf("unexpected clear result: %#v", result)
 	}
-	if len(host.saves) != 0 {
-		t.Fatal("auth was written after failed lease deletion")
+	if len(host.saves) != 1 {
+		t.Fatalf("expected local auth clear save, got %d", len(host.saves))
+	}
+	if processed := plugin.processDueResinLeaseDeletes(context.Background(), time.Now().UTC()); processed != 1 {
+		t.Fatalf("processed deletes = %d, want 1", processed)
+	}
+	state := plugin.store.Snapshot()
+	if len(state.ResinLeaseDeletes) != 1 {
+		t.Fatalf("failed delete was not retained for retry: %#v", state.ResinLeaseDeletes)
+	}
+	job := state.ResinLeaseDeletes[0]
+	if job.Attempts != 1 || job.NextAttemptAt.IsZero() || job.LastError == "" {
+		t.Fatalf("unexpected retry state: %#v", job)
+	}
+}
+
+func TestManagedResinBindingPrefersProxyAccountOverStaleState(t *testing.T) {
+	raw, errDecode := rawAuthToMap(makeAuthJSON(t, map[string]any{
+		"proxy_url": "socks5h://Default.grok-alice-new1:proxy-secret@resin:2260",
+	}))
+	if errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	account, managed := managedResinBinding(raw, AccountState{
+		Resin: ResinState{Managed: true, Account: "grok-alice-old1"},
+	}, ResinSettings{})
+	if !managed || account != "grok-alice-new1" {
+		t.Fatalf("managed binding = %q, %t; want proxy account", account, managed)
+	}
+}
+
+func TestRotateResinKeepsAuthSwitchWhenStateWriteFails(t *testing.T) {
+	oldProxy := "socks5h://Default.grok-alice-old1:proxy-secret@resin:2260"
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", map[string]any{
+		"proxy_url": oldProxy,
+	})
+	host := newMockHostCall(entries, auths)
+	plugin := newTestPlugin(t, host, func(cfg *Config) {
+		cfg.Resin.Enabled = true
+		cfg.Resin.LocalOnly = true
+	})
+	seedResinState(t, plugin, "grok-alice-old1", 0)
+	failResinStateWrites(t, plugin)
+
+	if errRotate := plugin.RotateResin(context.Background(), "auth-1"); errRotate != nil {
+		t.Fatalf("state persistence failure made a committed rotation look failed: %v", errRotate)
+	}
+	saved, errDecode := rawAuthToMap(host.saves["auth-1"])
+	if errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	rotatedProxy := authRawString(saved, "proxy_url")
+	if rotatedProxy == "" || rotatedProxy == oldProxy || strings.Contains(rotatedProxy, "grok-alice-old1") {
+		t.Fatalf("auth did not keep the new proxy after state write failure: %q", rotatedProxy)
+	}
+	if len(host.saves) != 1 {
+		t.Fatalf("expected one auth save, got %d", len(host.saves))
+	}
+}
+
+func TestClearResinProxyKeepsAuthClearWhenStateWriteFails(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", map[string]any{
+		"proxy_url": "socks5h://Default.grok-alice-old1:proxy-secret@resin:2260",
+	})
+	host := newMockHostCall(entries, auths)
+	plugin := newTestPlugin(t, host, func(cfg *Config) {
+		cfg.Resin.Enabled = true
+		cfg.Resin.LocalOnly = true
+	})
+	seedResinState(t, plugin, "grok-alice-old1", 0)
+	failResinStateWrites(t, plugin)
+
+	result, errClear := plugin.ClearResinProxy(context.Background(), "auth-1")
+	if errClear != nil {
+		t.Fatalf("state persistence failure made a committed clear look failed: %v", errClear)
+	}
+	if !result.Cleared || result.RemoteLeaseDeleteQueued || result.Error != "" {
+		t.Fatalf("unexpected clear result after state write failure: %#v", result)
+	}
+	saved, errDecode := rawAuthToMap(host.saves["auth-1"])
+	if errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if authRawString(saved, "proxy_url") != "" {
+		t.Fatalf("auth proxy_url was not cleared after state write failure: %q", authRawString(saved, "proxy_url"))
 	}
 }
 
@@ -575,7 +691,7 @@ func TestClearResinProxyLocalOnlySkipsRemoteLease(t *testing.T) {
 	if errClear != nil {
 		t.Fatal(errClear)
 	}
-	if !result.Cleared || result.RemoteLeaseDeleted {
+	if !result.Cleared || result.RemoteLeaseDeleteQueued {
 		t.Fatalf("unexpected local clear result: %#v", result)
 	}
 	saved, errDecode := rawAuthToMap(host.saves["auth-1"])
@@ -631,6 +747,111 @@ func TestRotateAfterFailureLocalOnlyRewritesProxy(t *testing.T) {
 	assertNoGuardMetadata(t, saved)
 	if authRawString(saved, "access_token") != "access-auth-1" {
 		t.Fatal("auto-rotation removed token fields")
+	}
+}
+
+func TestTransparentResinRotationRetriesSameAuthWithNewProxy(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", map[string]any{
+		"proxy_url": "socks5h://Default.grok-alice-old1:proxy-secret@resin:2260",
+	})
+	host := newMockHostCall(entries, auths)
+	host.scriptStreamSequence("auth-1", badStreamScript(), goodStreamScript())
+	plugin := newTestPlugin(t, host, func(cfg *Config) {
+		enableTransparentForTest(cfg)
+		cfg.AutoAction = "cooldown_only"
+		cfg.Resin.Enabled = true
+		cfg.Resin.LocalOnly = true
+		cfg.Resin.AutoRotateAfterQualityFailure = true
+	})
+	seedResinState(t, plugin, "grok-alice-old1", 0)
+
+	plugin.runTransparentStreamBridge(context.Background(), streamRequestForTest(), "plugin-stream-rotation-success")
+
+	if len(host.modelCalls) != 2 {
+		t.Fatalf("expected two upstream attempts, got %d", len(host.modelCalls))
+	}
+	firstProxy := host.modelCalls[0].ProxyURL
+	secondProxy := host.modelCalls[1].ProxyURL
+	if firstProxy == secondProxy {
+		t.Fatalf("retry reused the old proxy: %q", firstProxy)
+	}
+	if !strings.Contains(secondProxy, "grok-email-") || strings.Contains(secondProxy, "grok-alice-old1") {
+		t.Fatalf("retry did not use the rotated lease: %q", secondProxy)
+	}
+	account, okAccount := plugin.stateAccount("auth-1")
+	if !okAccount || account.State != StateHealthy {
+		t.Fatalf("account should stay healthy after rotated retry: %#v", account)
+	}
+	if len(host.saves) != 1 {
+		t.Fatalf("expected only the rotation auth save, got %d", len(host.saves))
+	}
+	rotations := 0
+	disables := 0
+	for _, event := range plugin.stateStore().Snapshot().Events {
+		switch event.Action {
+		case "resin_rotate":
+			rotations++
+		case "guard_disable":
+			disables++
+		}
+	}
+	if rotations != 1 || disables != 0 {
+		t.Fatalf("unexpected rotation/disable events: rotations=%d disables=%d", rotations, disables)
+	}
+}
+
+func TestTransparentResinRotationCoolsAfterRetryFails(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", map[string]any{
+		"proxy_url": "socks5h://Default.grok-alice-old1:proxy-secret@resin:2260",
+	})
+	host := newMockHostCall(entries, auths)
+	host.scriptStreamSequence("auth-1", badStreamScript(), badStreamScript())
+	plugin := newTestPlugin(t, host, func(cfg *Config) {
+		enableTransparentForTest(cfg)
+		cfg.AutoAction = "cooldown_only"
+		cfg.Resin.Enabled = true
+		cfg.Resin.LocalOnly = true
+		cfg.Resin.AutoRotateAfterQualityFailure = true
+	})
+	seedResinState(t, plugin, "grok-alice-old1", 0)
+
+	plugin.runTransparentStreamBridge(context.Background(), streamRequestForTest(), "plugin-stream-rotation-failure")
+
+	if len(host.modelCalls) != 2 {
+		t.Fatalf("expected two upstream attempts, got %d", len(host.modelCalls))
+	}
+	firstProxy := host.modelCalls[0].ProxyURL
+	secondProxy := host.modelCalls[1].ProxyURL
+	if firstProxy == secondProxy {
+		t.Fatalf("retry reused the old proxy: %q", firstProxy)
+	}
+	account, okAccount := plugin.stateAccount("auth-1")
+	if !okAccount || account.State != StateCooling || account.DisableKind != DisableKindCooldown {
+		t.Fatalf("account was not cooled after rotated retry failed: %#v", account)
+	}
+	if account.CooldownUntil.IsZero() {
+		t.Fatal("cooldown deadline was not set")
+	}
+	rotateIndex := -1
+	disableIndex := -1
+	events := plugin.stateStore().Snapshot().Events
+	for index, event := range events {
+		if event.Action == "resin_rotate" && rotateIndex < 0 {
+			rotateIndex = index
+		}
+		if event.Action == "guard_disable" && disableIndex < 0 {
+			disableIndex = index
+		}
+	}
+	if rotateIndex < 0 || disableIndex < 0 || rotateIndex > disableIndex {
+		t.Fatalf("rotation must precede cooldown: events=%#v", events)
+	}
+	saved, errDecode := rawAuthToMap(host.saves["auth-1"])
+	if errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if !authRawBool(saved, "disabled") {
+		t.Fatal("cooldown did not persist disabled=true")
 	}
 }
 
@@ -722,7 +943,7 @@ func TestDeleteResinLeaseStatusHandling(t *testing.T) {
 	}
 }
 
-func TestRotateResinAdminAuthFailureLeavesAuthUntouched(t *testing.T) {
+func TestRotateResinQueuesAdminAuthFailureForRetry(t *testing.T) {
 	t.Setenv("RESIN_ADMIN_TOKEN", "admin-secret")
 	t.Setenv("RESIN_PROXY_TOKEN", "proxy-secret")
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -740,11 +961,18 @@ func TestRotateResinAdminAuthFailureLeavesAuthUntouched(t *testing.T) {
 		cfg.Resin.AdminURL = server.URL
 	})
 	seedResinState(t, plugin, "grok-alice-old1", 0)
-	if errRotate := plugin.RotateResin(context.Background(), "auth-1"); errRotate == nil {
-		t.Fatal("expected admin authentication failure")
+	if errRotate := plugin.RotateResin(context.Background(), "auth-1"); errRotate != nil {
+		t.Fatal(errRotate)
 	}
-	if len(host.saves) != 0 {
-		t.Fatal("auth was written after failed lease deletion")
+	if len(host.saves) != 1 {
+		t.Fatalf("expected one auth save, got %d", len(host.saves))
+	}
+	if processed := plugin.processDueResinLeaseDeletes(context.Background(), time.Now().UTC()); processed != 1 {
+		t.Fatalf("processed deletes = %d, want 1", processed)
+	}
+	jobs := plugin.store.Snapshot().ResinLeaseDeletes
+	if len(jobs) != 1 || jobs[0].Attempts != 1 || jobs[0].NextAttemptAt.IsZero() {
+		t.Fatalf("admin auth failure was not retained for retry: %#v", jobs)
 	}
 }
 

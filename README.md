@@ -264,16 +264,19 @@ API 模式用于创建新的代理绑定，并管理 Resin 远端租约。Admin 
 
 任一步失败都不会保存配置。已保存的 token 不会回填到页面，也不会通过管理页或 JSON API 返回；再次保存时留空 Secret 输入框会保留已有值。YAML 中的 `admin_token_env` 和 `proxy_token_env` 仅作为 state 尚未配置时的环境变量回退来源。
 
-Resin 平台名称在 Resin 中唯一。管理页只要求填写名称，保存时通过平台列表接口解析出 `platform_id` 并写入状态文件；管理员不需要手工填写 UUID。绑定和轮换运行时仍会按内部 `platform_id` 重新查询规范名称，并让 DELETE 租约和代理模板使用同一次解析结果。
+Resin 平台名称在 Resin 中唯一。管理页只要求填写名称，保存时通过平台列表接口解析出 `platform_id` 并写入状态文件；管理员不需要手工填写 UUID。绑定操作仍会按内部 `platform_id` 重新查询规范名称；轮换使用已保存的规范平台名称和代理模板，不在请求关键路径调用平台接口。
 
 Resin 绑定必须由管理员显式触发，不会在首次启动时自动覆盖已有 `proxy_url`。API 模式轮换顺序固定为：
 
-1. 删除旧 Resin 租约，`204` 和 `404` 都视为成功
-2. 生成新的 `grok-<email-local>-<4位随机 base36>` account
-3. 写回 auth 的 `proxy_url`
-4. 保留 access/refresh token 等所有非代理字段
+1. 生成新的 `grok-<email-local>-<4位随机 base36>` account
+2. 写回 auth 的 `proxy_url`
+3. 保留 access/refresh token 等所有非代理字段
+4. 将旧租约删除任务写入 state 队列
+5. 后台 worker 调用 `DELETE /api/v1/platforms/{platform_id}/leases/{account}`，`204` 和 `404` 都视为成功
 
-API 模式清除 `proxy_url` 时，插件管理的 Resin 租约会先调用 `DELETE /api/v1/platforms/{platform_id}/leases/{account}`，`204` 或 `404` 后才会清空 auth 中的 `proxy_url`。如果旧 state 缺少 Resin 租约字段，但 auth 代理端点与已保存的 Resin 代理模板一致，插件会从代理用户名反推租约 account，仍执行远端删除。
+租约删除不在 CPA 请求关键路径上。删除失败时任务保留在 state 中，按 30 秒起步的指数退避重试，最长间隔 1 小时；插件重启后会继续处理。管理页事件日志会记录 `resin_lease_delete` 的 queued、retry_scheduled 和 succeeded 结果。
+
+API 模式清除 `proxy_url` 时，插件会先清空本地 auth 并写入 state，再异步排队删除旧 Resin 租约，不会等待管理接口。auth 保存失败仍会使操作失败；auth 已保存但 state 写入失败时，本地清除仍然有效，只记录 `internal_error`。如果旧 state 缺少 Resin 租约字段，但 auth 代理端点与已保存的 Resin 代理模板一致，插件会从代理用户名反推租约 account 并排队删除。
 
 ### 仅本地轮换
 
@@ -344,7 +347,7 @@ curl -X POST \
 | `resin.bind` | 提交异步绑定任务；仅 API 模式可用 |
 | `resin.bind_unbound` | 提交异步批量绑定任务 |
 | `resin.rotate` | 提交异步轮换任务；本地模式只改写已有代理用户名 |
-| `resin.clear` | 提交异步清除任务；API 模式先删除管理租约，本地模式不处理远端租约 |
+| `resin.clear` | 提交异步清除任务；API 模式清除代理后异步排队删除管理租约，本地模式不处理远端租约 |
 | `resin.config.get` | 查看脱敏的 Resin 配置与 Secret 是否已设置 |
 | `resin.config.validate` | 提交异步 Resin 配置验证任务 |
 | `resin.config.save` | 提交异步验证并保存任务 |

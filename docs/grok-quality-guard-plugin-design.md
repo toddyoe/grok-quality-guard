@@ -852,7 +852,7 @@ host.stream.close(
 透明模式中检测到 `missing_thinking` 后：
 
 1. 记录异常
-2. 如果代理轮换和自动轮换开启，API 模式删除旧租约并重绑，本地模式只改写已有代理用户名并写回
+2. 如果代理轮换和自动轮换开启，API 模式使用已保存的平台名称改写新代理并异步排队删除旧租约，本地模式只改写已有代理用户名并写回
 3. 同一账号可用新代理重试一次
 4. 新代理仍异常则换下一个账号
 5. 每个请求对每个账号最多轮换一次
@@ -1106,13 +1106,13 @@ grok-auth_7f3a82d1-3n5q
 
 API 模式固定顺序：
 
-1. 使用 `platform_id` 调用 `GET /api/v1/platforms/{platform_id}`，取得规范平台名
-2. 使用同一份解析结果执行 `DELETE /api/v1/platforms/{platform_id}/leases/{account}`
-3. `204` 或 `404` 视为成功
-4. `401/403` 立即停止，记录配置错误，不循环
-5. `5xx` 或网络错误标记轮换失败并冷却，不无限重试
-6. 使用步骤 1 得到的规范平台名渲染新 `proxy_url`
-7. 不调用 GET lease 查询 egress IP
+1. 使用 state 中已保存的规范平台名称、`platform_id` 和代理模板渲染新 `proxy_url`
+2. 写回 auth 并更新 state 中的 Resin 租约信息
+3. 将旧租约删除任务写入 state 的持久化队列
+4. 后台 worker 执行 `DELETE /api/v1/platforms/{platform_id}/leases/{account}`
+5. `204` 或 `404` 视为成功并移除任务
+6. 网络错误、`401/403`、`429` 和 `5xx` 保留任务并按指数退避重试，最长间隔 1 小时
+7. 不调用 GET lease 查询 egress IP，不同步等待租约删除
 
 仅本地轮换固定顺序：
 
@@ -1137,12 +1137,13 @@ socks5h://Default.grok-alice-old1:proxy-secret@resin:2260
 
 | 场景 | 处理 |
 | --- | --- |
-| DELETE 204 | 继续生成新 account |
-| DELETE 404 | 继续生成新 account |
-| DELETE 401/403 | 停止，记录配置错误，不重试 |
-| DELETE 429 | 按 Retry-After 失败返回，不循环 |
-| DELETE 5xx | 标记 `proxy_error`，冷却，不轮换 |
-| 网络超时 | 标记 `proxy_error`，冷却，不轮换 |
+| DELETE 204 | 删除任务完成 |
+| DELETE 404 | 删除任务完成 |
+| DELETE 401/403 | 保留任务并退避重试，记录配置错误 |
+| DELETE 429 | 保留任务并退避重试 |
+| DELETE 5xx | 保留任务并退避重试 |
+| 网络超时 | 保留任务并退避重试 |
+| 删除队列写入失败 | 本次轮换仍以本地 proxy 切换为准，记录 internal error |
 | auth save 失败 | 不更新 state，记录失败，保持旧绑定 |
 | 随机 account 冲突 | 重试最多 32 次 |
 | 新 proxy 渲染失败 | 不修改旧 `proxy_url`，记录错误 |
@@ -1217,14 +1218,14 @@ API 模式的验证与保存都执行同一套服务端验证逻辑。`resin.con
 
 批量清除通过 `resin.clear` 的 `auth_ids` 参数完成：
 
-1. API 模式下，插件管理的租约先按 `platform_id` 解析平台并调用 `DELETE /api/v1/platforms/{platform_id}/leases/{account}`
-2. `204` 或 `404` 视为远端租约已删除
-3. 删除成功后移除 auth 中的 `proxy_url`，清除 state 中的 Resin `managed` 和 `account`，保留租约代数和其他 token 字段
+1. 先移除 auth 中的 `proxy_url`，清除 state 中的 Resin `managed` 和 `account`，保留租约代数和其他 token 字段
+2. API 模式下，插件管理的旧租约写入 state 的持久化删除队列，由后台 worker 执行 `DELETE /api/v1/platforms/{platform_id}/leases/{account}`
+3. `204` 或 `404` 视为远端租约已删除；其他错误保留任务并指数退避重试
 4. 外部代理没有插件管理的租约，只移除 auth 中的 `proxy_url`，不删除外部代理服务
 5. 仅本地轮换模式只移除 auth 中的代理，不调用 Resin API，也不处理远端租约
 6. 任一账号失败只影响该账号，批量接口继续处理其他账号并在结果中返回逐项错误
 
-如果 state 中的 Resin 租约字段缺失，但 auth 的 `proxy_url` 端点与已保存的代理模板一致，插件会从代理用户名反推 account 并视为插件管理租约，确保清除代理时仍先删除远端租约。
+如果 state 中的 Resin 租约字段缺失，但 auth 的 `proxy_url` 端点与已保存的代理模板一致，插件会从代理用户名反推 account 并视为插件管理租约，确保清除代理时仍排队删除远端租约。
 
 ## 10. 管理页与 JSON API
 
@@ -1344,8 +1345,8 @@ Content-Type: application/json
 | `accounts.restore_selected` | `auth_ids` | 将有界队列中的选中账号恢复；健康账号跳过 |
 | `resin.bind` | `auth_id` 或 `auth_ids` | 提交有界队列异步绑定任务；仅本地轮换模式拒绝 |
 | `resin.bind_unbound` | `dry_run` | 提交有界队列异步批量绑定任务 |
-| `resin.rotate` | `auth_id` | 提交异步轮换任务；API 模式删除旧租约并重绑，本地模式只改写已有代理用户名 |
-| `resin.clear` | `auth_id` 或 `auth_ids` | 提交有界队列异步清除任务；API 模式删除插件管理的远端租约并清除代理，外部代理或本地模式只清除 auth 配置 |
+| `resin.rotate` | `auth_id` | 提交异步轮换任务；API 模式切换新代理并异步排队删除旧租约，本地模式只改写已有代理用户名 |
+| `resin.clear` | `auth_id` 或 `auth_ids` | 提交有界队列异步清除任务；API 模式清除代理并异步排队删除旧租约，外部代理或本地模式只清除 auth 配置 |
 | `resin.config.get` | 无 | 返回脱敏的 Resin 配置和 token 是否已设置 |
 | `resin.config.validate` | Resin 配置字段 | 提交异步验证任务 |
 | `resin.config.save` | Resin 配置字段 | 提交异步验证并保存任务 |
@@ -1650,7 +1651,7 @@ python scripts/migrate_auth_metadata_to_state.py <auth_dir> <state.json>
 3. CPA 不允许直接执行 disabled auth，恢复探测需要短暂重新启用。
 4. Resin 没有显式创建租约 API，删除后由下一次请求惰性创建。
 5. 删除租约不保证换到不同出口 IP。
-6. Platform 查询与后续 DELETE/代理渲染不是跨服务原子事务；插件用同一次 `GET platform` 的规范名称保证本次操作内一致，DELETE 始终使用不可变的 `platform_id`。
+6. 代理切换与异步 DELETE 不是跨服务原子事务；租约删除失败会保留在持久化队列中后台重试。
 7. Home 模式开启时插件 executor 路由不可用。
 8. hosted tool、stored response、compaction 等不可安全重放。
 9. auth 文件可能被管理员或其他进程并发修改；写回前必须重新读取并做字段级合并。
@@ -1701,6 +1702,8 @@ Resin：
 - 冲突重试
 - proxy template 渲染
 - DELETE 204/404/401/429/5xx
+- 持久化删除队列去重与指数退避
+- 删除成功后从队列移除，失败后保留并重试
 - auth save 保留 access/refresh token
 - 每个请求最多轮换一次
 - 并发轮换互斥
@@ -1733,11 +1736,11 @@ Resin：
 - 坏内容不 emit
 - 第一候选 deliver 后不再换号
 - 4 MiB buffer overflow 放行并记录
-- Resin DELETE 后 auth proxy_url 更新
+- Resin 轮换后 auth proxy_url 立即更新且旧租约删除异步入队
 - 本地模式轮换后 auth proxy_url 更新且旧租约接口未被调用
 - 新 account 与旧 account 不同
 - DELETE 404 仍继续
-- DELETE 401 不循环
+- DELETE 401 保留任务并退避重试
 - 插件 reload 后状态恢复
 - 并发请求状态一致
 - 大量账号加载不阻塞注册
@@ -1856,7 +1859,7 @@ git diff --check
 | 最大尝试次数 | 6 |
 | 主动探测 | 仅恢复性 |
 | Resin 首次绑定 | 管理员显式操作 |
-| Resin 轮换 | API 模式删除旧租约并重绑；本地模式只改写已有代理用户名，不查 IP |
+| Resin 轮换 | API 模式立即切换新代理并异步排队删除旧租约；本地模式只改写已有代理用户名，不查 IP |
 | 自动恢复 | 仅 guard-owned 冷却账号 |
 | OAuth/导入/导出 | 不支持 |
 | auth 写入字段 | 仅 `disabled`、`proxy_url` |

@@ -2092,7 +2092,7 @@
                         {platform}、{account} 和 {proxy_token}</span></div>
                     <label class="check-card full"><input id="r_auto_rotate" type="checkbox"><span
                         class="check-copy"><span class="check-title">质量异常后自动轮换</span><span
-                          class="check-desc">质量异常后会在下次尝试前轮换代理；API 模式会先删除旧租约，本地模式只改写已有代理用户名</span></span></label>
+                          class="check-desc">质量异常后会在下次尝试前轮换代理；API 模式立即切换新代理并异步清理旧租约，本地模式只改写已有代理用户名</span></span></label>
                   </div>
                 </div>
                 <div class="form-actions">
@@ -2125,7 +2125,7 @@
                   </svg><span>API 模式下验证通过后才允许保存；仅本地轮换无需 Admin API 或 Key。密钥仅写入本地状态文件，管理页只显示是否已配置</span></div>
                 <div class="notice"><svg class="icon">
                     <use href="#i-database"></use>
-                  </svg><span>API 模式下，平台 UUID 由名称自动解析，删除旧租约与代理模板使用同一次平台解析结果</span></div>
+                  </svg><span>API 模式下，平台 UUID 由名称自动解析；旧租约删除使用持久化队列在后台重试</span></div>
               </div>
             </aside>
           </form>
@@ -2260,7 +2260,7 @@
     };
     const ACTION_LABELS = {
       observe: '被动观测', probe: '主动探测', guard_disable: '自动处置', external_disable: '外部禁用',
-      restore: '恢复账号', resin_bind: '绑定租约', resin_rotate: '轮换租约', resin_clear: '清除代理',
+      restore: '恢复账号', resin_bind: '绑定租约', resin_rotate: '轮换租约', resin_clear: '清除代理', resin_lease_delete: '清理旧租约',
       resin_config_save: '保存 Resin 配置', transparent_attempt: '透明重试', internal_error: '内部错误',
       cross_verify_schedule: '调度交叉验证', 'quality.cross_verify': '交叉验证'
     };
@@ -2269,7 +2269,7 @@
       external_left_disabled: '保持外部禁用', bound: '已绑定', rotated: '已轮换', cleared: '已清除', local_mode: '本地模式',
       validated: '已验证', cooldown: '已冷却', permanent: '永久禁用', error: '错误', ignored: '已忽略',
       quota_exhausted: '额度耗尽', credential_invalid: '凭据失效', actioned: '已处置',
-      pending: '累计中', threshold_reached: '达到阈值', scheduled: '已调度'
+      pending: '累计中', threshold_reached: '达到阈值', scheduled: '已调度', queued: '已排队', succeeded: '已成功', retry_scheduled: '等待重试'
     };
     const esc = (value) => String(value == null ? '' : value).replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
     const icon = (name) => '<svg class="icon" aria-hidden="true"><use href="#i-' + name + '"></use></svg>';
@@ -3261,7 +3261,7 @@
           title: '清除所选代理',
           detail: localMode
             ? ('清除 ' + selected.length + ' 个账号代理，本地模式不删除远端租约')
-            : ('清除 ' + selected.length + ' 个账号代理，插件管理的租约会先删除远端租约'),
+            : ('清除 ' + selected.length + ' 个账号代理，插件管理的旧租约会进入后台清理队列'),
           confirmLabel: '清除代理',
           icon: 'x',
           tone: 'danger'
@@ -3298,7 +3298,7 @@
           title: '轮换代理租约',
           detail: localMode
             ? '本地轮换只修改 OAuth 文件中已有代理的用户名，不会调用 Resin API，也不会删除远端旧租约。'
-            : '轮换会删除旧 Resin 租约并重新写入代理，完成后 CPA 路由将使用新的租约账号。',
+            : '轮换会立即写入新代理，旧 Resin 租约将进入后台清理队列；CPA 路由会使用新的租约账号。',
           confirmLabel: localMode ? '本地轮换' : '轮换租约',
           icon: 'rotate',
           tone: 'danger'
@@ -3312,7 +3312,7 @@
           detail: localMode
             ? '将清除该账号的代理配置。本地轮换模式不会调用 Resin API，也不会删除远端旧租约。'
             : (account && account.resin_managed
-              ? '将先删除该账号的 Resin 远端租约，再清除代理配置。此操作会立即影响 CPA 路由。'
+              ? '将清除代理配置，并将旧 Resin 租约加入后台清理队列。此操作会立即影响 CPA 路由。'
               : '将清除该账号的外部代理配置。插件不会删除外部代理服务，只会移除 OAuth 文件中的代理设置。'),
           confirmLabel: '清除代理',
           icon: 'x',

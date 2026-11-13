@@ -85,6 +85,18 @@ type ResinState struct {
 	Generation int64  `json:"generation"`
 }
 
+type ResinLeaseDelete struct {
+	AuthID        string    `json:"auth_id,omitempty"`
+	AdminURL      string    `json:"admin_url,omitempty"`
+	AdminToken    string    `json:"admin_token,omitempty"`
+	PlatformID    string    `json:"platform_id,omitempty"`
+	Account       string    `json:"account"`
+	CreatedAt     time.Time `json:"created_at,omitempty"`
+	Attempts      int       `json:"attempts,omitempty"`
+	NextAttemptAt time.Time `json:"next_attempt_at,omitempty"`
+	LastError     string    `json:"last_error,omitempty"`
+}
+
 type AccountState struct {
 	AuthID                       string           `json:"auth_id"`
 	Email                        string           `json:"email,omitempty"`
@@ -126,6 +138,7 @@ type State struct {
 	Resin              ResinSettings            `json:"resin,omitempty"`
 	Accounts           map[string]*AccountState `json:"accounts"`
 	Events             []Event                  `json:"events"`
+	ResinLeaseDeletes  []ResinLeaseDelete       `json:"resin_lease_deletes,omitempty"`
 }
 
 type StateStore struct {
@@ -470,6 +483,9 @@ func cloneState(state State) State {
 	}
 	if state.Events != nil {
 		clone.Events = append([]Event{}, state.Events...)
+	}
+	if state.ResinLeaseDeletes != nil {
+		clone.ResinLeaseDeletes = append([]ResinLeaseDelete{}, state.ResinLeaseDeletes...)
 	}
 	return clone
 }
