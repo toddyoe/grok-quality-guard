@@ -433,18 +433,18 @@ func (p *Plugin) executeTransparentStreamAttempt(ctx context.Context, execution 
 		return transparentStreamAttempt{Class: class, Verdict: QualityVerdict{Class: class, Reason: sanitizeError(errExecute)}, Err: errExecute}
 	}
 	attemptCtx, cancelAttempt := context.WithCancel(ctx)
-	defer func() {
-		cancelAttempt()
-		_ = p.closeModelStream(stream.StreamID)
-	}()
 	if stream.StatusCode < 200 || stream.StatusCode >= 300 {
 		class, reason := classifyUpstreamStatus(stream.StatusCode, p.readModelStreamErrorBody(attemptCtx, stream.StreamID))
+		cancelAttempt()
+		_ = p.closeModelStream(stream.StreamID)
 		return transparentStreamAttempt{Class: class, Verdict: QualityVerdict{Class: class, Reason: reason}, Err: fmt.Errorf("%s", reason)}
 	}
 	analyzer := NewStreamAnalyzerWithProtocolAt(execution.ExitProtocol, attemptStartedAt)
 	analyzer.SetEncryptedConfig(cfg.MinEncryptedBytes, cfg.EncryptedBytesPerReasoningToken)
 	readEvents := make(chan streamReadEvent, 1)
+	readDone := make(chan struct{})
 	go func() {
+		defer close(readDone)
 		defer close(readEvents)
 		for {
 			read, errRead := p.readModelStream(context.Background(), stream.StreamID)
@@ -458,6 +458,11 @@ func (p *Plugin) executeTransparentStreamAttempt(ctx context.Context, execution 
 				return
 			}
 		}
+	}()
+	defer func() {
+		cancelAttempt()
+		_ = p.closeModelStream(stream.StreamID)
+		<-readDone
 	}()
 
 	holdTimeout := cfg.HoldTimeout.Duration
