@@ -128,6 +128,42 @@ func TestProbeParsesHostLineChunksWithoutNewlines(t *testing.T) {
 	}
 }
 
+func TestProbeTPSIncludesPreStreamLatency(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	visible := strings.Repeat("reliable systems need careful design. ", 10) + "\\nQUALITY_OK"
+	host.scriptStream("auth-1",
+		streamData("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"plan carefully\"}}]}\n\n"),
+		streamData("data: {\"choices\":[{\"delta\":{\"content\":\""+visible+"\"}}]}\n\n"),
+		streamData("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":120,\"completion_tokens_details\":{\"reasoning_tokens\":1}}}\n\n"),
+		pluginapi.HostModelStreamReadResponse{Done: true},
+	)
+	plugin := newTestPlugin(t, host, func(cfg *Config) {
+		cfg.Quality.SoftTPS = 1e9
+		cfg.Quality.HardTPS = 2e9
+	})
+
+	innerHostCall := hostCall
+	hostCall = func(method string, payload any) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostModelExecuteStream:
+			time.Sleep(200 * time.Millisecond)
+		case pluginabi.MethodHostModelStreamRead:
+			time.Sleep(10 * time.Millisecond)
+		}
+		return innerHostCall(method, payload)
+	}
+	if errProbe := plugin.ProbeAccount(context.Background(), "auth-1", true, "callback-1"); errProbe != nil {
+		t.Fatal(errProbe)
+	}
+	account, _ := plugin.stateAccount("auth-1")
+	if account.Metrics.DurationMS < 180 || account.Metrics.FirstTokenMS < 180 {
+		t.Fatalf("probe TPS clock started after the upstream wait: %#v", account.Metrics)
+	}
+	if account.Metrics.TPS <= 0 || account.Metrics.TPS > 500 {
+		t.Fatalf("probe TPS = %.1f, want a sane grok2api-scale value: %#v", account.Metrics.TPS, account.Metrics)
+	}
+}
 func TestProbeBodyUsesQualityMarkerProfilePrompt(t *testing.T) {
 	body := probeBody(DefaultProbeConfig())
 	var payload struct {

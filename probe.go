@@ -333,7 +333,7 @@ func (p *Plugin) ProbeAccount(ctx context.Context, authID string, force bool, ca
 		class, reason := classifyUpstreamStatus(stream.StatusCode, errorBody)
 		return p.handleProbeFailure(authID, raw, response, reEnabled, QualityVerdict{Class: class, Reason: reason}, fmt.Errorf("probe %s", reason))
 	}
-	analyzer := NewStreamAnalyzerWithProtocol(probeCfg.ExitProtocol)
+	analyzer := NewStreamAnalyzerWithProtocolAt(probeCfg.ExitProtocol, probeStartedAt)
 	analyzer.SetEncryptedConfig(qualityCfg.MinEncryptedBytes, qualityCfg.EncryptedBytesPerReasoningToken)
 	var bufferBytes int64
 	var terminal bool

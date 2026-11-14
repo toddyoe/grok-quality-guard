@@ -49,6 +49,8 @@ TPS = outputTokens * 1000 / generationWindow
 
 当 `reasoningTokens > 0`、`generationWindow < firstToken` 且 `generationWindow < 1000ms` 时，使用完整 `duration` 修正生成窗口。
 
+TPS 计时从发起上游模型调用前开始，而不是从首个 host stream chunk 可读时开始。透明保护会缓冲并延迟暴露首个 chunk，若从可读时才开始计时，会把上游 TTFT 从分母中排除并产生异常高 TPS。
+
 ### 与参考实现的对齐
 
 流式判定按 `references/grok2api` 的 `ClassifyQualityHold` 与 `egress-quality-guard` 的审计逻辑实现：

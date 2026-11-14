@@ -946,6 +946,39 @@ func TestExecuteStreamWithoutStreamIDFramesLineChunks(t *testing.T) {
 	}
 }
 
+func TestTransparentTPSIncludesPreStreamLatency(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	host.scriptStream("auth-1", goodResponsesStreamScript()...)
+	plugin := newTestPlugin(t, host, enableTransparentForTest)
+
+	innerHostCall := hostCall
+	hostCall = func(method string, payload any) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostModelExecuteStream:
+			time.Sleep(200 * time.Millisecond)
+		case pluginabi.MethodHostModelStreamRead:
+			time.Sleep(10 * time.Millisecond)
+		}
+		return innerHostCall(method, payload)
+	}
+	plugin.runTransparentStreamBridge(context.Background(), responsesRequestForTest("grok-4.6", true), "plugin-stream-tps-clock")
+
+	account, ok := plugin.stateAccount("auth-1")
+	if !ok {
+		t.Fatal("account state missing after transparent stream")
+	}
+	if account.Metrics.DurationMS < 180 || account.Metrics.FirstTokenMS < 180 {
+		t.Fatalf("TPS clock started after the upstream wait: %#v", account.Metrics)
+	}
+	if account.Metrics.GenerationMS != account.Metrics.DurationMS {
+		t.Fatalf("reasoning tail should use full request duration: %#v", account.Metrics)
+	}
+	if account.Metrics.TPS <= 0 || account.Metrics.TPS > 500 {
+		t.Fatalf("transparent TPS = %.1f, want a sane grok2api-scale value: %#v", account.Metrics.TPS, account.Metrics)
+	}
+}
+
 func TestTransparentUsesHostTranslatedExecutorPayload(t *testing.T) {
 	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
 	host := newMockHostCall(entries, auths)

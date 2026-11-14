@@ -239,6 +239,16 @@ func NewStreamAnalyzerWithProtocol(protocol string) *StreamAnalyzer {
 	return analyzer
 }
 
+// NewStreamAnalyzerWithProtocolAt keeps the TPS clock anchored to the request
+// start instead of when the first host stream chunk becomes readable.
+func NewStreamAnalyzerWithProtocolAt(protocol string, startedAt time.Time) *StreamAnalyzer {
+	analyzer := NewStreamAnalyzerWithProtocol(protocol)
+	if !startedAt.IsZero() {
+		analyzer.startedAt = startedAt
+	}
+	return analyzer
+}
+
 func normalizeQualityProtocol(value string) string {
 	normalized := strings.ToLower(strings.TrimSpace(value))
 	switch {

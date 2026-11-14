@@ -253,7 +253,7 @@ func (p *Plugin) executeTransparentOnce(ctx context.Context, execution pluginapi
 		class, reason := classifyUpstreamStatus(response.StatusCode, response.Body)
 		return transparentResult{}, QualityVerdict{Class: class, Reason: reason}, fmt.Errorf("%s", reason)
 	}
-	analyzer := NewStreamAnalyzerWithProtocol(execution.ExitProtocol)
+	analyzer := NewStreamAnalyzerWithProtocolAt(execution.ExitProtocol, startedAt)
 	analyzer.SetStreaming(false)
 	analyzer.SetEncryptedConfig(cfg.MinEncryptedBytes, cfg.EncryptedBytesPerReasoningToken)
 	analyzer.ObserveJSON(response.Body)
@@ -271,6 +271,9 @@ func (p *Plugin) executeTransparentOnce(ctx context.Context, execution pluginapi
 }
 
 func (p *Plugin) executeTransparentBufferedAttempt(ctx context.Context, execution pluginapi.HostModelExecutionRequest, callbackID string, requestBody []byte, cfg QualityConfig) (transparentResult, QualityVerdict, error) {
+	// The host returns the stream only after the first chunk is readable, so the
+	// TPS clock must start before the call to include upstream TTFT.
+	attemptStartedAt := time.Now()
 	stream, errExecute := p.executeModelStream(ctx, execution, callbackID)
 	if errExecute != nil {
 		class := classifyTransportError(errExecute)
@@ -281,7 +284,7 @@ func (p *Plugin) executeTransparentBufferedAttempt(ctx context.Context, executio
 		class, reason := classifyUpstreamStatus(stream.StatusCode, p.readModelStreamErrorBody(ctx, stream.StreamID))
 		return transparentResult{}, QualityVerdict{Class: class, Reason: reason}, fmt.Errorf("%s", reason)
 	}
-	analyzer := NewStreamAnalyzer()
+	analyzer := NewStreamAnalyzerWithProtocolAt(execution.ExitProtocol, attemptStartedAt)
 	outputNormalizer := &sseOutputNormalizer{}
 	chunks := make([]pluginapi.ExecutorStreamChunk, 0)
 	var bufferBytes int64
@@ -421,6 +424,9 @@ func (p *Plugin) runTransparentStreamBridge(ctx context.Context, req rpcExecutor
 }
 
 func (p *Plugin) executeTransparentStreamAttempt(ctx context.Context, execution pluginapi.HostModelExecutionRequest, callbackID string, requestBody []byte, cfg QualityConfig, streamID string) transparentStreamAttempt {
+	// The host returns the stream only after the first chunk is readable, so the
+	// TPS clock must start before the call to include upstream TTFT.
+	attemptStartedAt := time.Now()
 	stream, errExecute := p.executeModelStream(ctx, execution, callbackID)
 	if errExecute != nil {
 		class := classifyTransportError(errExecute)
@@ -435,7 +441,7 @@ func (p *Plugin) executeTransparentStreamAttempt(ctx context.Context, execution 
 		class, reason := classifyUpstreamStatus(stream.StatusCode, p.readModelStreamErrorBody(attemptCtx, stream.StreamID))
 		return transparentStreamAttempt{Class: class, Verdict: QualityVerdict{Class: class, Reason: reason}, Err: fmt.Errorf("%s", reason)}
 	}
-	analyzer := NewStreamAnalyzerWithProtocol(execution.ExitProtocol)
+	analyzer := NewStreamAnalyzerWithProtocolAt(execution.ExitProtocol, attemptStartedAt)
 	analyzer.SetEncryptedConfig(cfg.MinEncryptedBytes, cfg.EncryptedBytesPerReasoningToken)
 	readEvents := make(chan streamReadEvent, 1)
 	go func() {
