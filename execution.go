@@ -480,21 +480,7 @@ func (p *Plugin) executeTransparentStreamAttempt(ctx context.Context, execution 
 			}
 		case event, ok := <-readEvents:
 			if !ok {
-				sig := analyzer.Finalize(true)
-				sig.HoldExpired = holdExpired
-				verdict := classifyFinal(sig, cfg, reasoningNeeded, cfg.MinHoldOutputTokens, true)
-				if emitted {
-					_ = p.ApplyVerdict(ctx, execution.AuthID, verdict, "transparent", callbackID)
-					return transparentStreamAttempt{Class: verdict.Class, Verdict: verdict, Emitted: true}
-				}
-				if verdict.Class == ClassNone {
-					if errEmit := p.emitPluginChunks(streamID, buffer); errEmit != nil {
-						return transparentStreamAttempt{Class: ClassProbeError, Verdict: QualityVerdict{Class: ClassProbeError, Reason: sanitizeError(errEmit)}, Err: errEmit, Available: true}
-					}
-					_ = p.ApplyVerdict(ctx, execution.AuthID, verdict, "transparent", callbackID)
-					return transparentStreamAttempt{Emitted: true}
-				}
-				return transparentStreamAttempt{Class: verdict.Class, Verdict: verdict, Err: fmt.Errorf("quality gate rejected stream: %s", verdict.Class), Buffered: buffer, Available: true}
+				return p.finishTransparentStreamAttempt(ctx, execution, callbackID, requestBody, cfg, streamID, analyzer, buffer, emitted, holdExpired)
 			}
 			if event.Err != nil {
 				class := classifyTransportError(event.Err)
@@ -519,6 +505,9 @@ func (p *Plugin) executeTransparentStreamAttempt(ctx context.Context, execution 
 					}
 				}
 				analyzer.ObserveChunk(payload)
+				if analyzer.Preview().Terminal {
+					return p.finishTransparentStreamAttempt(ctx, execution, callbackID, requestBody, cfg, streamID, analyzer, buffer, emitted, holdExpired)
+				}
 			}
 			if event.Response.Error != "" {
 				errRead := fmt.Errorf("%s", event.Response.Error)
@@ -530,21 +519,7 @@ func (p *Plugin) executeTransparentStreamAttempt(ctx context.Context, execution 
 				return transparentStreamAttempt{Class: class, Verdict: verdict, Err: errRead}
 			}
 			if event.Response.Done {
-				sig := analyzer.Finalize(true)
-				sig.HoldExpired = holdExpired
-				verdict := classifyFinal(sig, cfg, reasoningNeeded, cfg.MinHoldOutputTokens, true)
-				if emitted {
-					_ = p.ApplyVerdict(ctx, execution.AuthID, verdict, "transparent", callbackID)
-					return transparentStreamAttempt{Class: verdict.Class, Verdict: verdict, Emitted: true}
-				}
-				if verdict.Class == ClassNone {
-					if errEmit := p.emitPluginChunks(streamID, buffer); errEmit != nil {
-						return transparentStreamAttempt{Class: ClassProbeError, Verdict: QualityVerdict{Class: ClassProbeError, Reason: sanitizeError(errEmit)}, Err: errEmit, Available: true}
-					}
-					_ = p.ApplyVerdict(ctx, execution.AuthID, verdict, "transparent", callbackID)
-					return transparentStreamAttempt{Emitted: true}
-				}
-				return transparentStreamAttempt{Class: verdict.Class, Verdict: verdict, Err: fmt.Errorf("quality gate rejected stream: %s", verdict.Class), Buffered: buffer, Available: true}
+				return p.finishTransparentStreamAttempt(ctx, execution, callbackID, requestBody, cfg, streamID, analyzer, buffer, emitted, holdExpired)
 			}
 			if emitted {
 				continue
@@ -569,6 +544,35 @@ func (p *Plugin) executeTransparentStreamAttempt(ctx context.Context, execution 
 			}
 		}
 	}
+}
+
+func (p *Plugin) finishTransparentStreamAttempt(
+	ctx context.Context,
+	execution pluginapi.HostModelExecutionRequest,
+	callbackID string,
+	requestBody []byte,
+	cfg QualityConfig,
+	streamID string,
+	analyzer *StreamAnalyzer,
+	buffer [][]byte,
+	emitted bool,
+	holdExpired bool,
+) transparentStreamAttempt {
+	sig := analyzer.Finalize(true)
+	sig.HoldExpired = holdExpired
+	verdict := classifyFinal(sig, cfg, reasoningRequiredForModel(execution.Model, requestBody), cfg.MinHoldOutputTokens, true)
+	if emitted {
+		_ = p.ApplyVerdict(ctx, execution.AuthID, verdict, "transparent", callbackID)
+		return transparentStreamAttempt{Class: verdict.Class, Verdict: verdict, Emitted: true}
+	}
+	if verdict.Class == ClassNone {
+		if errEmit := p.emitPluginChunks(streamID, buffer); errEmit != nil {
+			return transparentStreamAttempt{Class: ClassProbeError, Verdict: QualityVerdict{Class: ClassProbeError, Reason: sanitizeError(errEmit)}, Err: errEmit, Available: true}
+		}
+		_ = p.ApplyVerdict(ctx, execution.AuthID, verdict, "transparent", callbackID)
+		return transparentStreamAttempt{Emitted: true}
+	}
+	return transparentStreamAttempt{Class: verdict.Class, Verdict: verdict, Err: fmt.Errorf("quality gate rejected stream: %s", verdict.Class), Buffered: buffer, Available: true}
 }
 
 func (p *Plugin) executableAuth(ctx context.Context, authID string) (Account, map[string]json.RawMessage, bool) {

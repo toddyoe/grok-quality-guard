@@ -474,6 +474,61 @@ func TestTransparentCodexResponsesThinkingStreamDelivered(t *testing.T) {
 	}
 }
 
+func TestTransparentCodexResponsesTerminalIgnoresTrailingReadError(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	script := goodResponsesStreamScript()
+	script = script[:len(script)-1]
+	script = append(script, pluginapi.HostModelStreamReadResponse{
+		Error: "unexpected EOF after response.completed",
+		Done:  true,
+	})
+	host.scriptStream("auth-1", script...)
+	plugin := newTestPlugin(t, host, enableTransparentForTest)
+	plugin.runTransparentStreamBridge(context.Background(), responsesRequestForTest("grok-4.6", true), "plugin-stream-responses-terminal-error")
+
+	joined := strings.Builder{}
+	for _, payload := range host.emitted["plugin-stream-responses-terminal-error"] {
+		joined.Write(payload)
+	}
+	if !strings.Contains(joined.String(), "good answer") || !strings.Contains(joined.String(), "response.completed") {
+		t.Fatalf("complete terminal response was not delivered: %s", joined.String())
+	}
+	if detail := host.closes["plugin-stream-responses-terminal-error"]; detail != nil {
+		t.Fatalf("terminal response closed with trailing error: %#v", detail)
+	}
+	if len(host.modelCalls) != 1 {
+		t.Fatalf("terminal response used %d attempts, want 1", len(host.modelCalls))
+	}
+}
+
+func TestTransparentCodexResponsesHeldBufferSurvivesTrailingReadError(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	host.scriptStream("auth-1",
+		streamData("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_short\",\"model\":\"grok-4.6\"}}\n\n"),
+		streamData("data: {\"type\":\"response.output_text.delta\",\"delta\":\"short\"}\n\n"),
+		streamData("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_short\",\"usage\":{\"output_tokens\":3,\"output_tokens_details\":{\"reasoning_tokens\":0}}}}\n\n"),
+		pluginapi.HostModelStreamReadResponse{Error: "unexpected EOF after response.completed", Done: true},
+	)
+	plugin := newTestPlugin(t, host, enableTransparentForTest)
+	plugin.runTransparentStreamBridge(context.Background(), responsesRequestForTest("grok-4.6", true), "plugin-stream-responses-held-terminal-error")
+
+	joined := strings.Builder{}
+	for _, payload := range host.emitted["plugin-stream-responses-held-terminal-error"] {
+		joined.Write(payload)
+	}
+	if !strings.Contains(joined.String(), "short") || !strings.Contains(joined.String(), "response.completed") {
+		t.Fatalf("held terminal response was not delivered: %s", joined.String())
+	}
+	if detail := host.closes["plugin-stream-responses-held-terminal-error"]; detail != nil {
+		t.Fatalf("held terminal response closed with trailing error: %#v", detail)
+	}
+	if len(host.modelCalls) != 1 {
+		t.Fatalf("held terminal response used %d attempts, want 1", len(host.modelCalls))
+	}
+}
+
 func TestTransparentCodexResponsesMissingThinkingFailsOver(t *testing.T) {
 	entries, auths := twoGrokAuths(t)
 	host := newMockHostCall(entries, auths)
