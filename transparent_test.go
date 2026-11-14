@@ -903,3 +903,82 @@ func TestTransparentCodexResponsesLineChunkStreamDelivered(t *testing.T) {
 		t.Fatalf("line-chunked Responses stream used %d accounts, want 1", len(host.modelCalls))
 	}
 }
+
+func TestExecuteStreamWithoutStreamIDFramesLineChunks(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	host.scriptStream("auth-1", lineChunkedResponsesStreamScript()...)
+	plugin := newTestPlugin(t, host, enableTransparentForTest)
+	req := responsesRequestForTest("grok-4.6", true)
+	req.StreamID = ""
+	encoded, errMarshal := json.Marshal(req)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	raw, errExecute := plugin.ExecuteStream(encoded)
+	if errExecute != nil {
+		t.Fatal(errExecute)
+	}
+	var envelope struct {
+		OK     bool                   `json:"ok"`
+		Result executorStreamResponse `json:"result"`
+	}
+	if errUnmarshal := json.Unmarshal(raw, &envelope); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if !envelope.OK {
+		t.Fatalf("buffered stream failed: %s", raw)
+	}
+	joined := strings.Builder{}
+	for _, chunk := range envelope.Result.Chunks {
+		joined.Write(chunk.Payload)
+	}
+	output := joined.String()
+	if !strings.Contains(output, "event: response.output_text.delta\ndata: ") ||
+		!strings.Contains(output, "good answer") ||
+		!strings.Contains(output, "response.completed") {
+		t.Fatalf("buffered line chunks were not framed or delivered: %s", output)
+	}
+	for _, concatenated := range []string{"createddata:", "deltadata:", "completeddata:"} {
+		if strings.Contains(output, concatenated) {
+			t.Fatalf("buffered SSE fields were concatenated as %q: %s", concatenated, output)
+		}
+	}
+}
+
+func TestTransparentUsesHostTranslatedExecutorPayload(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	host.scriptStream("auth-1", lineChunkedResponsesStreamScript()...)
+	plugin := newTestPlugin(t, host, enableTransparentForTest)
+	req := responsesRequestForTest("grok-4.6", true)
+	req.OriginalRequest = []byte(`{"model":"grok-4.6","messages":[{"role":"user","content":"original client format"}]}`)
+	req.Payload = []byte(`{"model":"grok-4.6","stream":true,"input":"host translated payload"}`)
+	req.Format = "codex"
+	req.SourceFormat = "codex"
+	plugin.runTransparentStreamBridge(context.Background(), req, "plugin-stream-translated-payload")
+
+	if len(host.modelCalls) != 1 {
+		t.Fatalf("transparent request used %d attempts, want 1", len(host.modelCalls))
+	}
+	execution := host.modelCalls[0]
+	if !strings.Contains(string(execution.Body), "host translated payload") || strings.Contains(string(execution.Body), "original client format") {
+		t.Fatalf("plugin used the original client body instead of the host-translated payload: %s", execution.Body)
+	}
+	if execution.EntryProtocol != "codex" || execution.ExitProtocol != "codex" {
+		t.Fatalf("unexpected execution protocols: entry=%q exit=%q", execution.EntryProtocol, execution.ExitProtocol)
+	}
+}
+
+func TestSSEOutputNormalizerPairsEventWithData(t *testing.T) {
+	normalizer := &sseOutputNormalizer{}
+	if output := normalizer.Feed([]byte("event: response.completed")); len(output) != 0 {
+		t.Fatalf("event line emitted before its data line: %q", output)
+	}
+	output := normalizer.Feed([]byte(`data: {"type":"response.completed","response":{"id":"resp_1"}}`))
+	want := "event: response.completed\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n"
+	if len(output) != 1 || string(output[0]) != want {
+		t.Fatalf("event and data were not emitted as one complete frame: %q", output)
+	}
+}

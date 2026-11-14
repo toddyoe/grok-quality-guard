@@ -6,10 +6,11 @@ import (
 )
 
 // sseOutputNormalizer turns CPA line-oriented executor chunks into complete SSE
-// field lines. The plugin host assembles events from blank-line boundaries, so
-// every data line must carry the terminating blank line itself.
+// events. Plugin host adapters expect each emitted payload to contain one event,
+// so event and data lines are paired before they reach the host stream bridge.
 type sseOutputNormalizer struct {
 	pending []byte
+	prefix  []byte
 }
 
 func (n *sseOutputNormalizer) Feed(chunk []byte) [][]byte {
@@ -28,14 +29,14 @@ func (n *sseOutputNormalizer) Feed(chunk []byte) [][]byte {
 		}
 		line := bytes.TrimSuffix(n.pending[:idx], []byte{'\r'})
 		n.pending = n.pending[idx+1:]
-		if normalized := normalizeSSEOutputLine(line); len(normalized) > 0 {
+		if normalized := n.normalizeLine(line); len(normalized) > 0 {
 			output = append(output, normalized)
 		}
 	}
 	if len(n.pending) > 0 && sseOutputLineComplete(n.pending) {
 		line := bytes.TrimSuffix(n.pending, []byte{'\r'})
 		n.pending = nil
-		if normalized := normalizeSSEOutputLine(line); len(normalized) > 0 {
+		if normalized := n.normalizeLine(line); len(normalized) > 0 {
 			output = append(output, normalized)
 		}
 	}
@@ -43,15 +44,58 @@ func (n *sseOutputNormalizer) Feed(chunk []byte) [][]byte {
 }
 
 func (n *sseOutputNormalizer) Flush() [][]byte {
-	if n == nil || len(n.pending) == 0 {
+	if n == nil {
 		return nil
 	}
-	pending := bytes.Clone(n.pending)
-	n.pending = nil
-	if normalized := normalizeSSEOutputLine(pending); len(normalized) > 0 {
-		return [][]byte{normalized}
+	var output [][]byte
+	if len(n.pending) > 0 {
+		pending := bytes.Clone(n.pending)
+		n.pending = nil
+		if sseOutputLineComplete(pending) {
+			if normalized := n.normalizeLine(bytes.TrimSuffix(pending, []byte{'\r'})); len(normalized) > 0 {
+				output = append(output, normalized)
+			}
+		}
 	}
-	return nil
+	n.prefix = nil
+	return output
+}
+
+func (n *sseOutputNormalizer) normalizeLine(line []byte) []byte {
+	line = bytes.TrimSuffix(line, []byte{'\r'})
+	trimmed := bytes.TrimSpace(line)
+	if len(trimmed) == 0 {
+		return nil
+	}
+	fieldLine := append([]byte(nil), line...)
+	switch {
+	case bytes.HasPrefix(trimmed, []byte("data:")):
+		frame := append([]byte(nil), n.prefix...)
+		frame = append(frame, fieldLine...)
+		n.prefix = nil
+		return append(frame, '\n', '\n')
+	case bytes.HasPrefix(trimmed, []byte("event:")) || bytes.HasPrefix(trimmed, []byte("id:")) ||
+		bytes.HasPrefix(trimmed, []byte("retry:")):
+		n.prefix = append(n.prefix, fieldLine...)
+		n.prefix = append(n.prefix, '\n')
+		return nil
+	case bytes.HasPrefix(trimmed, []byte(":")):
+		if len(n.prefix) > 0 {
+			n.prefix = append(n.prefix, fieldLine...)
+			n.prefix = append(n.prefix, '\n')
+			return nil
+		}
+		return append(fieldLine, '\n', '\n')
+	case bytes.Equal(trimmed, []byte("[DONE]")):
+		return append(fieldLine, '\n', '\n')
+	default:
+		if len(n.prefix) > 0 {
+			n.prefix = append(n.prefix, fieldLine...)
+			n.prefix = append(n.prefix, '\n')
+			return nil
+		}
+		return append(fieldLine, '\n')
+	}
 }
 
 func sseOutputCanStart(chunk []byte) bool {
@@ -91,26 +135,4 @@ func sseOutputLineComplete(line []byte) bool {
 		return json.Valid(trimmed)
 	}
 	return false
-}
-
-func normalizeSSEOutputLine(line []byte) []byte {
-	line = bytes.TrimSuffix(line, []byte{'\r'})
-	trimmed := bytes.TrimSpace(line)
-	if len(trimmed) == 0 {
-		return nil
-	}
-	output := append([]byte(nil), line...)
-	switch {
-	case bytes.HasPrefix(trimmed, []byte("data:")):
-		return append(output, '\n', '\n')
-	case bytes.HasPrefix(trimmed, []byte("event:")) || bytes.HasPrefix(trimmed, []byte("id:")) ||
-		bytes.HasPrefix(trimmed, []byte("retry:")):
-		return append(output, '\n')
-	case bytes.HasPrefix(trimmed, []byte(":")):
-		return append(output, '\n', '\n')
-	case bytes.Equal(trimmed, []byte("[DONE]")):
-		return append(output, '\n', '\n')
-	default:
-		return append(output, '\n')
-	}
 }

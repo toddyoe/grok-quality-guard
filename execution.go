@@ -282,6 +282,7 @@ func (p *Plugin) executeTransparentBufferedAttempt(ctx context.Context, executio
 		return transparentResult{}, QualityVerdict{Class: class, Reason: reason}, fmt.Errorf("%s", reason)
 	}
 	analyzer := NewStreamAnalyzer()
+	outputNormalizer := &sseOutputNormalizer{}
 	chunks := make([]pluginapi.ExecutorStreamChunk, 0)
 	var bufferBytes int64
 	for {
@@ -298,7 +299,9 @@ func (p *Plugin) executeTransparentBufferedAttempt(ctx context.Context, executio
 		if len(read.Payload) > 0 {
 			bufferBytes += int64(len(read.Payload))
 			analyzer.ObserveChunk(read.Payload)
-			chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: append([]byte(nil), read.Payload...)})
+			for _, payload := range outputNormalizer.Feed(read.Payload) {
+				chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: payload})
+			}
 			if bufferBytes > cfg.HoldMaxBufferBytes {
 				reason := fmt.Sprintf("transparent hold buffer exceeded %d bytes", cfg.HoldMaxBufferBytes)
 				return transparentResult{}, QualityVerdict{Action: QualityActionWithhold, Class: ClassProbeError, Reason: reason}, fmt.Errorf("%s", reason)
@@ -312,6 +315,9 @@ func (p *Plugin) executeTransparentBufferedAttempt(ctx context.Context, executio
 		if read.Done {
 			break
 		}
+	}
+	for _, payload := range outputNormalizer.Flush() {
+		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: payload})
 	}
 	sig := analyzer.Finalize(true)
 	verdict := classifyFinal(sig, cfg, reasoningRequiredForModel(execution.Model, requestBody), cfg.MinHoldOutputTokens, true)
@@ -635,17 +641,15 @@ func shouldRotateTransparentFailure(candidateCount int, class string) bool {
 }
 
 func executorRequestInput(req rpcExecutorRequest) ([]byte, string, error) {
-	body := req.OriginalRequest
-	if len(body) == 0 {
-		body = req.Payload
+	if len(req.Payload) > 0 {
+		sourceFormat := firstNonEmpty(req.Format, req.SourceFormat, "codex")
+		return req.Payload, sourceFormat, nil
 	}
+	body := req.OriginalRequest
 	if len(body) == 0 {
 		return nil, "", fmt.Errorf("request body is empty")
 	}
-	sourceFormat := firstNonEmpty(req.SourceFormat, req.Format)
-	if sourceFormat == "" {
-		sourceFormat = "codex"
-	}
+	sourceFormat := firstNonEmpty(req.SourceFormat, req.Format, "codex")
 	return body, sourceFormat, nil
 }
 
