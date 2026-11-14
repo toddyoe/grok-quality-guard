@@ -391,6 +391,31 @@ func TestUsageReasoningRequiredUsesModelEffortAndBody(t *testing.T) {
 	}
 }
 
+func TestStreamingSemanticOnlyOutputBypassesMissingThinking(t *testing.T) {
+	config := DefaultQualityConfig()
+	config.SoftTPS = 1e9
+	config.HardTPS = 2e9
+	analyzer := NewStreamAnalyzerWithProtocol(qualityProtocolResponses)
+	encrypted := strings.Repeat("A", 1331)
+	analyzer.ObserveChunk([]byte(`data: {"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","encrypted_content":"` + encrypted + `"}}` + "\n\n"))
+	analyzer.ObserveChunk([]byte(`data: {"type":"response.output_item.done","item":{"id":"call_1","type":"function_call","call_id":"call_1","name":"exec","arguments":"{}"}}` + "\n\n"))
+	analyzer.ObserveChunk([]byte(`data: {"type":"response.completed","response":{"id":"resp_1","usage":{"output_tokens":421,"output_tokens_details":{"reasoning_tokens":355}}}}` + "\n\n"))
+	signals := analyzer.Finalize(true)
+	if signals.HasThinking || !signals.SemanticOutput || signals.VisibleTokens != 0 {
+		t.Fatalf("unexpected semantic-only signals: %#v", signals)
+	}
+	verdict := classifyFinal(signals, config, true, 8, true)
+	if verdict.Class != ClassNone || verdict.Action != QualityActionDeliver {
+		t.Fatalf("semantic-only response was rejected: %#v", verdict)
+	}
+	if !verdict.Signals.ReasoningRequired {
+		t.Fatalf("reasoning requirement was not preserved in evidence: %#v", verdict.Signals)
+	}
+	if verdict.Signals.EncryptedFloor != 1420 {
+		t.Fatalf("encrypted floor = %d, want 1420", verdict.Signals.EncryptedFloor)
+	}
+}
+
 func TestThinkingGuardDisabledBypassesMissingThinkingInAllQualityPaths(t *testing.T) {
 	config := DefaultQualityConfig()
 	config.ThinkingGuard = false

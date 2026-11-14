@@ -466,6 +466,7 @@ func (p *Plugin) executeTransparentStreamAttempt(ctx context.Context, execution 
 			holdExpired = true
 			preview := analyzer.Preview()
 			preview.HoldExpired = true
+			preview.ReasoningRequired = reasoningNeeded
 			verdict := ClassifyQualityHold(preview, cfg.MinHoldOutputTokens)
 			if verdict.Action == QualityActionWithhold {
 				return transparentStreamAttempt{Class: verdict.Class, Verdict: verdict, Err: fmt.Errorf("quality gate rejected stream: %s", verdict.Class), Buffered: buffer, Available: true}
@@ -529,6 +530,7 @@ func (p *Plugin) executeTransparentStreamAttempt(ctx context.Context, execution 
 			}
 			preview := analyzer.Preview()
 			preview.HoldExpired = holdExpired
+			preview.ReasoningRequired = reasoningNeeded
 			holdVerdict := ClassifyQualityHold(preview, cfg.MinHoldOutputTokens)
 			if holdVerdict.Action == QualityActionWithhold {
 				return transparentStreamAttempt{Class: holdVerdict.Class, Verdict: holdVerdict, Err: fmt.Errorf("quality gate rejected stream: %s", holdVerdict.Class), Buffered: buffer, Available: true}

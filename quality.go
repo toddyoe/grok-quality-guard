@@ -1091,6 +1091,9 @@ func ClassifyQualityHold(sig Signals, minOutput int64) QualityVerdict {
 	case qualityIsFastReasoningRatioDump(sig):
 		return QualityVerdict{Action: QualityActionWithhold, Class: ClassFastReasoningRatio, Reason: "reasoning tokens dominate a fast visible dump", Signals: sig}
 	}
+	if isSemanticOnly(sig) {
+		return QualityVerdict{Action: QualityActionDeliver, Class: ClassNone, Reason: "semantic output without visible text", Signals: sig}
+	}
 	if sig.HasThinking {
 		if sig.HasReasoningDelta {
 			return QualityVerdict{Action: QualityActionDeliver, Class: ClassNone, Reason: "real reasoning delta observed", Signals: sig}
@@ -1161,6 +1164,7 @@ func classifyOutputSpeed(sig Signals, cfg QualityConfig, failClosed bool) (strin
 }
 
 func classifyFinal(sig Signals, cfg QualityConfig, reasoningRequired bool, minOutput int64, streaming bool) QualityVerdict {
+	sig.ReasoningRequired = reasoningRequired
 	sig.EncryptedFloor = encryptedFloor(sig.ReasoningTokens, cfg)
 	if sig.EncryptedBytes > 0 && sig.EncryptedBytes >= sig.EncryptedFloor {
 		sig.HasThinking = true
@@ -1228,6 +1232,7 @@ func probeStreamUnparsed(sig Signals) bool {
 }
 
 func classifyProbeResult(sig Signals, cfg QualityConfig, expectedMatched, thinkingRequired bool) QualityVerdict {
+	sig.ReasoningRequired = thinkingRequired
 	if probeStreamUnparsed(sig) {
 		return QualityVerdict{Action: QualityActionWithhold, Class: ClassProbeError, Reason: "probe stream produced no parseable events", Signals: sig}
 	}
@@ -1294,6 +1299,7 @@ func classifyPassiveAudit(sig Signals, cfg QualityConfig) QualityVerdict {
 }
 
 func classifyNonStreamResult(sig Signals, cfg QualityConfig, reasoningRequired bool, minOutput int64) QualityVerdict {
+	sig.ReasoningRequired = reasoningRequired
 	sig.Streaming = false
 	sig.Terminal = true
 	sig.EncryptedFloor = encryptedFloor(sig.ReasoningTokens, cfg)
