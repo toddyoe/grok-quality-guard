@@ -801,3 +801,105 @@ func TestRouteModelBypassesResponsesCompaction(t *testing.T) {
 		})
 	}
 }
+
+func TestSSEOutputNormalizerAddsLineAndFrameBoundaries(t *testing.T) {
+	normalizer := &sseOutputNormalizer{}
+	chunks := [][]byte{
+		[]byte("event: response.created"),
+		[]byte(`data: {"type":"response.created","response":{"id":"resp_1"}}`),
+		[]byte("event: response.output_text.delta"),
+		[]byte(`data: {"type":"response.output_text.delta","delta":"good answer"}`),
+	}
+	var output []byte
+	for _, chunk := range chunks {
+		for _, payload := range normalizer.Feed(chunk) {
+			output = append(output, payload...)
+		}
+	}
+	for _, payload := range normalizer.Flush() {
+		output = append(output, payload...)
+	}
+
+	want := "event: response.created\n" +
+		"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n" +
+		"event: response.output_text.delta\n" +
+		"data: {\"type\":\"response.output_text.delta\",\"delta\":\"good answer\"}\n\n"
+	if string(output) != want {
+		t.Fatalf("unexpected normalized SSE output:\nGot:  %q\nWant: %q", output, want)
+	}
+	if strings.Contains(string(output), "createddata:") || strings.Contains(string(output), "deltadata:") {
+		t.Fatalf("SSE field lines were concatenated: %q", output)
+	}
+}
+
+func TestSSEOutputNormalizerBuffersSplitDataLine(t *testing.T) {
+	normalizer := &sseOutputNormalizer{}
+	var output []byte
+	for _, chunk := range [][]byte{
+		[]byte(`data: {"type":"response.created",`),
+		[]byte(`"response":{"id":"resp_1"}}`),
+	} {
+		for _, payload := range normalizer.Feed(chunk) {
+			output = append(output, payload...)
+		}
+	}
+	for _, payload := range normalizer.Flush() {
+		output = append(output, payload...)
+	}
+	want := "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n"
+	if string(output) != want {
+		t.Fatalf("split data line was not framed: got %q want %q", output, want)
+	}
+}
+
+func lineChunkedResponsesStreamScript() []pluginapi.HostModelStreamReadResponse {
+	return []pluginapi.HostModelStreamReadResponse{
+		streamData("event: response.created"),
+		streamData(`data: {"type":"response.created","response":{"id":"resp_1","model":"grok-4.6"}}`),
+		streamData("event: response.reasoning_summary_text.delta"),
+		streamData(`data: {"type":"response.reasoning_summary_text.delta","delta":"plan the answer"}`),
+		streamData("event: response.output_text.delta"),
+		streamData(`data: {"type":"response.output_text.delta","delta":"good answer"}`),
+		streamData("event: response.completed"),
+		streamData(`data: {"type":"response.completed","response":{"id":"resp_1","usage":{"output_tokens":20,"output_tokens_details":{"reasoning_tokens":8}}}}`),
+		{Done: true},
+	}
+}
+
+func TestTransparentCodexResponsesLineChunkStreamDelivered(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	host.scriptStream("auth-1", lineChunkedResponsesStreamScript()...)
+	plugin := newTestPlugin(t, host, enableTransparentForTest)
+	plugin.runTransparentStreamBridge(context.Background(), responsesRequestForTest("grok-4.6", true), "plugin-stream-responses-line-chunks")
+
+	joined := strings.Builder{}
+	for _, payload := range host.emitted["plugin-stream-responses-line-chunks"] {
+		joined.Write(payload)
+	}
+	output := joined.String()
+	for _, event := range []string{
+		"response.created",
+		"response.reasoning_summary_text.delta",
+		"response.output_text.delta",
+		"response.completed",
+	} {
+		if !strings.Contains(output, "event: "+event+"\ndata: ") {
+			t.Fatalf("event %s lost its SSE line boundary: %s", event, output)
+		}
+	}
+	if !strings.Contains(output, "good answer") || !strings.Contains(output, "response.completed") {
+		t.Fatalf("line-chunked Responses stream was not delivered: %s", output)
+	}
+	for _, concatenated := range []string{"createddata:", "deltadata:", "completeddata:"} {
+		if strings.Contains(output, concatenated) {
+			t.Fatalf("SSE fields were concatenated as %q: %s", concatenated, output)
+		}
+	}
+	if detail := host.closes["plugin-stream-responses-line-chunks"]; detail != nil {
+		t.Fatalf("line-chunked Responses stream closed with error: %#v", detail)
+	}
+	if len(host.modelCalls) != 1 {
+		t.Fatalf("line-chunked Responses stream used %d accounts, want 1", len(host.modelCalls))
+	}
+}

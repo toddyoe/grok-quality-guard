@@ -458,6 +458,29 @@ func (p *Plugin) executeTransparentStreamAttempt(ctx context.Context, execution 
 	emitted := false
 	buffer := make([][]byte, 0)
 	var bufferBytes int64
+	outputNormalizer := &sseOutputNormalizer{}
+	appendOutput := func(payloads [][]byte) {
+		for _, payload := range payloads {
+			if len(payload) == 0 {
+				continue
+			}
+			buffer = append(buffer, payload)
+			bufferBytes += int64(len(payload))
+		}
+	}
+	finish := func() transparentStreamAttempt {
+		appendOutput(outputNormalizer.Flush())
+		if emitted && len(buffer) > 0 {
+			if errEmit := p.emitPluginChunks(streamID, buffer); errEmit != nil {
+				return transparentStreamAttempt{Class: ClassProbeError, Verdict: QualityVerdict{Class: ClassProbeError, Reason: sanitizeError(errEmit)}, Err: errEmit, Emitted: true}
+			}
+			buffer = nil
+			bufferBytes = 0
+		}
+		return p.finishTransparentStreamAttempt(
+			ctx, execution, callbackID, requestBody, cfg, streamID, analyzer, buffer, emitted, holdExpired,
+		)
+	}
 	reasoningNeeded := reasoningRequiredForModel(execution.Model, requestBody)
 
 	for {
@@ -487,7 +510,7 @@ func (p *Plugin) executeTransparentStreamAttempt(ctx context.Context, execution 
 			}
 		case event, ok := <-readEvents:
 			if !ok {
-				return p.finishTransparentStreamAttempt(ctx, execution, callbackID, requestBody, cfg, streamID, analyzer, buffer, emitted, holdExpired)
+				return finish()
 			}
 			if event.Err != nil {
 				class := classifyTransportError(event.Err)
@@ -499,13 +522,13 @@ func (p *Plugin) executeTransparentStreamAttempt(ctx context.Context, execution 
 			}
 			if len(event.Response.Payload) > 0 {
 				payload := append([]byte(nil), event.Response.Payload...)
+				framedPayloads := outputNormalizer.Feed(payload)
 				if emitted {
-					if errEmit := p.emitPluginStreamChunk(streamID, payload); errEmit != nil {
+					if errEmit := p.emitPluginChunks(streamID, framedPayloads); errEmit != nil {
 						return transparentStreamAttempt{Class: ClassProbeError, Verdict: QualityVerdict{Class: ClassProbeError, Reason: sanitizeError(errEmit)}, Err: errEmit, Emitted: true}
 					}
 				} else {
-					buffer = append(buffer, payload)
-					bufferBytes += int64(len(payload))
+					appendOutput(framedPayloads)
 					if bufferBytes > cfg.HoldMaxBufferBytes {
 						reason := fmt.Sprintf("transparent hold buffer exceeded %d bytes", cfg.HoldMaxBufferBytes)
 						return transparentStreamAttempt{Class: ClassProbeError, Verdict: QualityVerdict{Action: QualityActionWithhold, Class: ClassProbeError, Reason: reason}, Err: fmt.Errorf("%s", reason), Buffered: buffer, Available: true}
@@ -513,7 +536,7 @@ func (p *Plugin) executeTransparentStreamAttempt(ctx context.Context, execution 
 				}
 				analyzer.ObserveChunk(payload)
 				if analyzer.Preview().Terminal {
-					return p.finishTransparentStreamAttempt(ctx, execution, callbackID, requestBody, cfg, streamID, analyzer, buffer, emitted, holdExpired)
+					return finish()
 				}
 			}
 			if event.Response.Error != "" {
@@ -526,7 +549,7 @@ func (p *Plugin) executeTransparentStreamAttempt(ctx context.Context, execution 
 				return transparentStreamAttempt{Class: class, Verdict: verdict, Err: errRead}
 			}
 			if event.Response.Done {
-				return p.finishTransparentStreamAttempt(ctx, execution, callbackID, requestBody, cfg, streamID, analyzer, buffer, emitted, holdExpired)
+				return finish()
 			}
 			if emitted {
 				continue
