@@ -19,6 +19,14 @@ func resinLeaseDeleteKey(adminURL, platformID, account string) string {
 		strings.TrimSpace(platformID) + "\x00" + strings.TrimSpace(account)
 }
 
+func canDeleteResinLease(settings ResinSettings) bool {
+	return settings.Enabled &&
+		!settings.LocalOnly &&
+		strings.TrimSpace(settings.AdminURL) != "" &&
+		strings.TrimSpace(settings.PlatformID) != "" &&
+		strings.TrimSpace(settings.AdminToken) != ""
+}
+
 func queueResinLeaseDelete(state *State, authID string, settings ResinSettings, account string) bool {
 	account = strings.TrimSpace(account)
 	if state == nil || account == "" {

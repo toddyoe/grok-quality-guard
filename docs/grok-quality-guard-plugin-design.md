@@ -1215,6 +1215,8 @@ API 模式的验证与保存都执行同一套服务端验证逻辑。`resin.con
 
 如果 state 中的 Resin 租约字段缺失，但 auth 的 `proxy_url` 端点与已保存的代理模板一致，插件会从代理用户名反推 account 并视为插件管理租约，确保清除代理时仍排队删除远端租约。
 
+当 refresh catalog 发现某个 auth 已从 CPA 列表消失时，插件必须在删除该账号的 state 记录前读取 `Resin.Account`，并在 Resin API 模式启用且配置完整时写入 `resin_lease_deletes`。清理任务与显式清除和轮换共用同一持久化队列及后台 worker。`resin.enabled=false`、`local_only`、缺少 Admin URL、Platform ID 或 Admin Token，以及没有租约 account 的账号只删除 state 记录，不调用 Resin API。
+
 ## 10. 管理页与 JSON API
 
 ### 10.1 路径

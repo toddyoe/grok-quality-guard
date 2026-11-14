@@ -28,6 +28,129 @@ func TestResinLeaseDeleteBackoff(t *testing.T) {
 	}
 }
 
+func TestCatalogRemovalQueuesManagedResinLeaseDelete(t *testing.T) {
+	t.Setenv("RESIN_ADMIN_TOKEN", "admin-secret")
+	var deleted atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodDelete {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if request.Header.Get("Authorization") != "Bearer admin-secret" {
+			writer.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if request.URL.Path != "/api/v1/platforms/"+testResinPlatformID+"/leases/grok-alice-old1" {
+			writer.WriteHeader(http.StatusNotFound)
+			return
+		}
+		deleted.Add(1)
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	plugin := newTestPlugin(t, host, func(cfg *Config) {
+		cfg.Resin.Enabled = true
+		cfg.Resin.Platform = "Default"
+		cfg.Resin.PlatformID = testResinPlatformID
+		cfg.Resin.AdminURL = server.URL
+	})
+	if errUpdate := plugin.updateStateAccount("auth-1", func(account *AccountState) error {
+		account.Resin = ResinState{Managed: true, Account: "grok-alice-old1", Generation: 1}
+		return nil
+	}); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+
+	host.mu.Lock()
+	host.entries = nil
+	host.mu.Unlock()
+	if errRefresh := plugin.RefreshCatalog(context.Background()); errRefresh != nil {
+		t.Fatal(errRefresh)
+	}
+
+	state := plugin.store.Snapshot()
+	if _, exists := state.Accounts["auth-1"]; exists {
+		t.Fatalf("removed auth remained in state: %#v", state.Accounts["auth-1"])
+	}
+	if len(state.ResinLeaseDeletes) != 1 {
+		t.Fatalf("queued lease deletes = %d, want 1: %#v", len(state.ResinLeaseDeletes), state.ResinLeaseDeletes)
+	}
+	job := state.ResinLeaseDeletes[0]
+	if job.AuthID != "auth-1" || job.Account != "grok-alice-old1" || job.AdminURL != server.URL || job.PlatformID != testResinPlatformID {
+		t.Fatalf("unexpected lease delete job: %#v", job)
+	}
+	if deleted.Load() != 0 {
+		t.Fatalf("catalog refresh deleted the lease synchronously")
+	}
+	if processed := plugin.processDueResinLeaseDeletes(context.Background(), time.Now().UTC()); processed != 1 {
+		t.Fatalf("processed lease deletes = %d, want 1", processed)
+	}
+	if deleted.Load() != 1 {
+		t.Fatalf("resin delete calls = %d, want 1", deleted.Load())
+	}
+	if jobs := plugin.store.Snapshot().ResinLeaseDeletes; len(jobs) != 0 {
+		t.Fatalf("successful lease delete remained queued: %#v", jobs)
+	}
+}
+
+func TestCatalogRemovalSkipsResinLeaseDeleteWithoutAPIConfig(t *testing.T) {
+	tests := []struct {
+		name       string
+		disabled   bool
+		localOnly  bool
+		clearToken bool
+		resin      ResinState
+	}{
+		{name: "local only", localOnly: true, resin: ResinState{Managed: true, Account: "grok-alice-old1"}},
+		{name: "disabled", disabled: true, resin: ResinState{Managed: true, Account: "grok-alice-old1"}},
+		{name: "missing token", clearToken: true, resin: ResinState{Managed: true, Account: "grok-alice-old1"}},
+		{name: "unmanaged", resin: ResinState{}},
+		{name: "missing account", resin: ResinState{Managed: true}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.clearToken {
+				t.Setenv("RESIN_ADMIN_TOKEN", "")
+			} else {
+				t.Setenv("RESIN_ADMIN_TOKEN", "admin-secret")
+			}
+			entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+			host := newMockHostCall(entries, auths)
+			plugin := newTestPlugin(t, host, func(cfg *Config) {
+				cfg.Resin.Enabled = !tc.disabled
+				cfg.Resin.LocalOnly = tc.localOnly
+				cfg.Resin.Platform = "Default"
+				cfg.Resin.PlatformID = testResinPlatformID
+				cfg.Resin.AdminURL = "http://resin.test"
+			})
+			if errUpdate := plugin.updateStateAccount("auth-1", func(account *AccountState) error {
+				account.Resin = tc.resin
+				return nil
+			}); errUpdate != nil {
+				t.Fatal(errUpdate)
+			}
+
+			host.mu.Lock()
+			host.entries = nil
+			host.mu.Unlock()
+			if errRefresh := plugin.RefreshCatalog(context.Background()); errRefresh != nil {
+				t.Fatal(errRefresh)
+			}
+
+			state := plugin.store.Snapshot()
+			if _, exists := state.Accounts["auth-1"]; exists {
+				t.Fatalf("removed auth remained in state: %#v", state.Accounts["auth-1"])
+			}
+			if len(state.ResinLeaseDeletes) != 0 {
+				t.Fatalf("unexpected queued lease deletes: %#v", state.ResinLeaseDeletes)
+			}
+		})
+	}
+}
+
 func TestResinLeaseDeleteRetriesAfterBackoffAndDeduplicates(t *testing.T) {
 	t.Setenv("RESIN_ADMIN_TOKEN", "admin-secret")
 	var requests atomic.Int32

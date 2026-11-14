@@ -284,6 +284,8 @@ Resin 绑定必须由管理员显式触发，不会在首次启动时自动覆�
 
 API 模式清除 `proxy_url` 时，插件会先清空本地 auth 并写入 state，再异步排队删除旧 Resin 租约，不会等待管理接口。auth 保存失败仍会使操作失败；auth 已保存但 state 写入失败时，本地清除仍然有效，只记录 `internal_error`。如果旧 state 缺少 Resin 租约字段，但 auth 代理端点与已保存的 Resin 代理模板一致，插件会从代理用户名反推租约 account 并排队删除。
 
+当 CPA auth 列表中的账号消失时，插件会在删除对应 state 记录前，把该 state 中仍记录的 Resin 管理租约加入同一持久化删除队列。该清理只在 Resin API 模式启用且配置完整时执行；`resin.enabled=false`、`local_only`、缺少 Admin URL、Platform ID 或 Admin Token，以及没有记录租约 account 的账号不会访问 Resin API。
+
 ### 仅本地轮换
 
 仅本地轮换用于只修改 auth 中已有代理、但不管理 Resin 远端租约的场景。它不需要 Admin API URL、Platform ID、Admin Token、Proxy Token 或代理模板：

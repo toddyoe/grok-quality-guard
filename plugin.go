@@ -365,7 +365,8 @@ func (p *Plugin) RefreshCatalog(_ context.Context) error {
 }
 
 func (p *Plugin) syncCatalogState(accounts []Account) error {
-	if p.stateStore() == nil {
+	store := p.stateStore()
+	if store == nil {
 		return nil
 	}
 	now := time.Now().UTC()
@@ -373,9 +374,18 @@ func (p *Plugin) syncCatalogState(accounts []Account) error {
 	for _, account := range accounts {
 		live[account.ID] = struct{}{}
 	}
-	return p.stateStore().UpdateIfChanged(func(state *State) error {
-		for authID := range state.Accounts {
+	resinCfg := p.ResinConfig()
+	cleanupResinLeases := canDeleteResinLease(resinCfg)
+	leaseDeleteQueued := false
+	errSync := store.UpdateIfChanged(func(state *State) error {
+		for authID, account := range state.Accounts {
 			if _, ok := live[authID]; !ok {
+				if cleanupResinLeases && account != nil {
+					leaseAccount := strings.TrimSpace(account.Resin.Account)
+					if leaseAccount != "" && queueResinLeaseDeleteAndRecord(state, authID, resinCfg, leaseAccount) {
+						leaseDeleteQueued = true
+					}
+				}
 				delete(state.Accounts, authID)
 			}
 		}
@@ -408,6 +418,10 @@ func (p *Plugin) syncCatalogState(accounts []Account) error {
 		}
 		return nil
 	})
+	if errSync == nil && leaseDeleteQueued {
+		p.wakeResinLeaseDeleteLoop()
+	}
+	return errSync
 }
 
 func (p *Plugin) catalogSnapshot() []Account {
