@@ -648,7 +648,7 @@ func shouldRotateTransparentFailure(candidateCount int, class string) bool {
 
 func executorRequestInput(req rpcExecutorRequest) ([]byte, string, error) {
 	if len(req.Payload) > 0 {
-		sourceFormat := firstNonEmpty(req.Format, req.SourceFormat, "codex")
+		sourceFormat := firstNonEmpty(req.SourceFormat, req.Format, "codex")
 		return req.Payload, sourceFormat, nil
 	}
 	body := req.OriginalRequest
@@ -715,7 +715,7 @@ func buildHostExecution(req rpcExecutorRequest, body []byte, sourceFormat, authI
 	model := executionModel(req, body)
 	return pluginapi.HostModelExecutionRequest{
 		EntryProtocol:  sourceFormat,
-		ExitProtocol:   sourceFormat,
+		ExitProtocol:   firstNonEmpty(req.Format, sourceFormat),
 		Model:          model,
 		Stream:         stream,
 		Body:           body,

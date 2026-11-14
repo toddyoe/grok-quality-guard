@@ -97,7 +97,7 @@ func pluginRegistration() registration {
 			Executor:               true,
 			ExecutorModelScope:     pluginapi.ExecutorModelScopeBoth,
 			ExecutorInputFormats:   []string{"codex"},
-			ExecutorOutputFormats:  []string{"codex"},
+			ExecutorOutputFormats:  []string{"codex", "openai-response"},
 			ResponseInterceptor:    true,
 			StreamChunkInterceptor: true,
 			UsagePlugin:            true,
