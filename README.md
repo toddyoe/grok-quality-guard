@@ -405,15 +405,6 @@ services:
 
 插件运行时只会修改 auth 文件中的原生字段 `disabled` 和 `proxy_url`。冷却原因、strike、禁用所有权、Resin 租约及其他控制信息全部保存在 `state.json`，不再向 auth 写入 `grok_quality_guard` 或其他插件私有字段。
 
-从旧版本升级时，应先停止插件，再使用迁移脚本把历史 auth 元数据合并进 state，并清理 auth 文件：
-
-```powershell
-python scripts/migrate_auth_metadata_to_state.py /path/to/auths /path/to/state.json --dry-run
-python scripts/migrate_auth_metadata_to_state.py /path/to/auths /path/to/state.json
-```
-
-脚本会先原子写入 state，再清理 auth 中的 `grok_quality_guard`，可以重复执行。迁移完成后重新启动插件。
-
 ## 开发与测试
 
 ```bash

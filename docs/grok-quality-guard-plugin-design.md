@@ -1491,14 +1491,7 @@ plugin-data/grok-quality-guard/state.json
 
 Docker 部署必须将 `/CLIProxyAPI/plugin-data/grok-quality-guard` 挂载为宿主持久卷，否则容器重建后 state 会丢失。也允许通过 `state_file` 显式覆盖；显式路径不可写时不会静默替换。管理页可编辑实际状态文件路径；切换时先完整写入目标文件，再更新引导路径旁的 `<state_file>.location` 指针。目标文件已存在时拒绝覆盖。目录权限 `0700`，文件权限 `0600`。
 
-插件运行时只允许修改 auth JSON 的原生字段 `disabled` 和 `proxy_url`。禁用所有权、冷却原因、strike、Resin 租约等数据只保存在 state。旧版本的 `grok_quality_guard` auth 元数据使用独立脚本迁移，插件本身不执行迁移：
-
-```text
-python scripts/migrate_auth_metadata_to_state.py <auth_dir> <state.json> --dry-run
-python scripts/migrate_auth_metadata_to_state.py <auth_dir> <state.json>
-```
-
-脚本先原子写入 state，再清理 auth 元数据，可重复执行。
+插件运行时只允许修改 auth JSON 的原生字段 `disabled` 和 `proxy_url`。禁用所有权、冷却原因、strike、Resin 租约等数据只保存在 state。
 
 ### 12.2 Schema
 
