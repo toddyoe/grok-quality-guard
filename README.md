@@ -58,6 +58,7 @@ TPS = outputTokens * 1000 / generationWindow
 - `fake_encrypted_dump` 与 `fast_reasoning_ratio_dump` 只在首个可见块后 2 秒内触发
 - 聚合 message 文本计入 visible token，但不伪造流式首个可见块的 flush 时间
 - `: grok2api-reasoning-evidence <bytes>` 作为密文字节数证据，仍必须满足密文下限
+- Codex / Responses 请求会按 grok2api 的 Build/Console 边界补 `include: ["reasoning.encrypted_content"]`，避免客户端未声明密文时把正常响应误判为 `missing_thinking`
 - Chat、Responses 和 Anthropic Messages 的流式与非流式响应都使用同一套内容、thinking、密文下限、TPS 和空流规则
 
 被动审计对可确定要求推理的流式样本检查 `missing_thinking`：非流式、缺少 TTFT、输出不足 32 token 或生成窗口无效的样本记录为 `ignored`；未知模型能力或显式关闭推理时不推断。速度审计仍只对满足流式、TTFT、输出和生成窗口条件的样本生效。
@@ -240,6 +241,8 @@ plugins:
 ### 透明保护
 
 `transparent_guard: true` 时，所有将使用 xAI / Grok OAuth 的文本 chat / responses 请求都会先进入插件质量门，而不是只在可安全重放时才接管。模型可通过 `grok-*` 命名或 CPA 的 xAI auth model 列表识别。
+
+与 grok2api 一致，Responses compaction（包括 `compaction_trigger` 和 TUI 压缩摘要 prompt）不进入质量保持，避免系统摘要因没有 reasoning 而被误判换号。Codex / Responses 推理请求会在上游执行前补齐 `reasoning.encrypted_content` include，确保真实 thinking 证据可观测。
 
 不可安全重放的请求仍会执行一次质量判定，但不会换号或代理重试；质量门拒绝时返回 `503 quality_degraded`。这类请求包括图片、音频、视频等媒体输入、`previous_response_id` 或 stored response、compaction、可能产生副作用的 hosted tools，以及无法安全重放到其他账号的请求。
 

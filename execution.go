@@ -81,6 +81,9 @@ func (p *Plugin) RouteModel(request []byte) ([]byte, error) {
 	if !p.isGrokRouteModel(requestedModel) {
 		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false, Reason: "not_grok_model"})
 	}
+	if strings.Contains(strings.ToLower(strings.TrimSpace(req.Query.Get("alt"))), "compact") || isResponsesCompactionRequest(req.Body) {
+		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false, Reason: "responses_compaction"})
+	}
 	return okEnvelope(pluginapi.ModelRouteResponse{
 		Handled:    true,
 		TargetKind: pluginapi.ModelRouteTargetSelf,
@@ -133,6 +136,7 @@ func (p *Plugin) transparentExecute(ctx context.Context, req rpcExecutorRequest)
 	if errRequest != nil {
 		return transparentResult{}, errRequest
 	}
+	body = ensureTransparentReasoningEvidence(body, sourceFormat, executionModel(req, body))
 	replayable := safeReplayRequest(body, sourceFormat, firstNonEmpty(req.Model, req.Alt))
 	candidates, errCandidates := p.transparentCandidates(ctx)
 	if errCandidates != nil {
@@ -190,6 +194,7 @@ func (p *Plugin) transparentExecuteBufferedStream(ctx context.Context, req rpcEx
 	if errRequest != nil {
 		return transparentResult{}, errRequest
 	}
+	body = ensureTransparentReasoningEvidence(body, sourceFormat, executionModel(req, body))
 	replayable := safeReplayRequest(body, sourceFormat, firstNonEmpty(req.Model, req.Alt))
 	candidates, errCandidates := p.transparentCandidates(ctx)
 	if errCandidates != nil {
@@ -339,6 +344,7 @@ func (p *Plugin) runTransparentStreamBridge(ctx context.Context, req rpcExecutor
 		p.closePluginStream(streamID, "invalid_request", "request body is empty", http.StatusBadRequest)
 		return
 	}
+	body = ensureTransparentReasoningEvidence(body, sourceFormat, executionModel(req, body))
 	replayable := safeReplayRequest(body, sourceFormat, firstNonEmpty(req.Model, req.Alt))
 	candidates, errCandidates := p.transparentCandidates(ctx)
 	if errCandidates != nil {
@@ -620,8 +626,60 @@ func executorRequestInput(req rpcExecutorRequest) ([]byte, string, error) {
 	return body, sourceFormat, nil
 }
 
+func executionModel(req rpcExecutorRequest, body []byte) string {
+	return firstNonEmpty(req.Model, asString(req.Metadata["model"]), modelFromRequestBody(body), req.Alt)
+}
+
+// ensureTransparentReasoningEvidence mirrors the grok2api Build/Console request
+// boundary. Codex and Responses clients may omit encrypted reasoning from the
+// include list, which makes a healthy stream indistinguishable from a degraded
+// one. Add the include before the quality gate observes the upstream stream.
+func ensureTransparentReasoningEvidence(body []byte, sourceFormat, model string) []byte {
+	if len(body) == 0 {
+		return body
+	}
+	format := strings.ToLower(strings.TrimSpace(sourceFormat))
+	if !strings.Contains(format, "codex") && !strings.Contains(format, "response") {
+		return body
+	}
+	if !reasoningRequiredForModel(model, body) {
+		return body
+	}
+	var payload map[string]json.RawMessage
+	if errUnmarshal := json.Unmarshal(body, &payload); errUnmarshal != nil || payload == nil {
+		return body
+	}
+	if _, ok := payload["input"]; !ok {
+		return body
+	}
+	includes := make([]string, 0)
+	if raw, exists := payload["include"]; exists && len(raw) > 0 && string(raw) != "null" {
+		if errUnmarshal := json.Unmarshal(raw, &includes); errUnmarshal != nil {
+			return body
+		}
+		for _, name := range includes {
+			if strings.TrimSpace(name) == "" {
+				continue
+			}
+			if name == "reasoning.encrypted_content" {
+				return body
+			}
+		}
+	}
+	encodedInclude, errMarshalInclude := json.Marshal(append(includes, "reasoning.encrypted_content"))
+	if errMarshalInclude != nil {
+		return body
+	}
+	payload["include"] = encodedInclude
+	encoded, errMarshal := json.Marshal(payload)
+	if errMarshal != nil {
+		return body
+	}
+	return encoded
+}
+
 func buildHostExecution(req rpcExecutorRequest, body []byte, sourceFormat, authID, proxyURL string, stream bool) pluginapi.HostModelExecutionRequest {
-	model := firstNonEmpty(req.Model, asString(req.Metadata["model"]), modelFromRequestBody(body), req.Alt)
+	model := executionModel(req, body)
 	return pluginapi.HostModelExecutionRequest{
 		EntryProtocol:  sourceFormat,
 		ExitProtocol:   sourceFormat,
@@ -1020,6 +1078,67 @@ func containsCompactionTrigger(value any) bool {
 		return strings.EqualFold(strings.TrimSpace(typed), "compaction_trigger")
 	}
 	return false
+}
+
+const clientCompactionPromptMarker = "it is a system-generated compaction prompt, not a real user message"
+
+func isResponsesCompactionRequest(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	var payload map[string]any
+	if errUnmarshal := json.Unmarshal(body, &payload); errUnmarshal != nil || payload == nil {
+		return false
+	}
+	if hasCompactionTriggerItem(payload["input"]) {
+		return true
+	}
+	return lastItemLooksLikeCompactionPrompt(payload["input"]) || lastItemLooksLikeCompactionPrompt(payload["messages"])
+}
+
+func hasCompactionTriggerItem(value any) bool {
+	items, ok := value.([]any)
+	if !ok {
+		return false
+	}
+	for _, rawItem := range items {
+		item, _ := rawItem.(map[string]any)
+		if item != nil && strings.EqualFold(strings.TrimSpace(asString(item["type"])), "compaction_trigger") {
+			return true
+		}
+	}
+	return false
+}
+
+func lastItemLooksLikeCompactionPrompt(value any) bool {
+	items, ok := value.([]any)
+	if !ok || len(items) == 0 {
+		return false
+	}
+	item, _ := items[len(items)-1].(map[string]any)
+	if item == nil || !strings.EqualFold(strings.TrimSpace(asString(item["role"])), "user") {
+		return false
+	}
+	return strings.Contains(strings.ToLower(compactContentText(item["content"])), clientCompactionPromptMarker)
+}
+
+func compactContentText(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case []any:
+		var text strings.Builder
+		for _, rawPart := range typed {
+			part, _ := rawPart.(map[string]any)
+			if part == nil {
+				continue
+			}
+			text.WriteString(asString(part["text"]))
+		}
+		return text.String()
+	default:
+		return ""
+	}
 }
 
 func localShellTool(tool map[string]any) bool {

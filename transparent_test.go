@@ -682,3 +682,122 @@ func TestRouteModelHomeMetadataDoesNotBypassGate(t *testing.T) {
 		t.Fatalf("home metadata bypassed the transparent gate: %s", raw)
 	}
 }
+
+func TestEnsureTransparentReasoningEvidenceInclude(t *testing.T) {
+	body := []byte(`{"model":"grok-4.7","stream":true,"input":"hi","reasoning":{"effort":"xhigh"}}`)
+	updated := ensureTransparentReasoningEvidence(body, "codex", "grok-4.7")
+	var payload map[string]any
+	if errUnmarshal := json.Unmarshal(updated, &payload); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	includes, _ := payload["include"].([]any)
+	if len(includes) != 1 || includes[0] != "reasoning.encrypted_content" {
+		t.Fatalf("include = %#v, want reasoning.encrypted_content", payload["include"])
+	}
+
+	withOther := []byte(`{"model":"grok-4.7","input":"hi","include":["no_inline_citations"],"seed":9007199254740993}`)
+	updatedOther := ensureTransparentReasoningEvidence(withOther, "codex", "grok-4.7")
+	if !strings.Contains(string(updatedOther), `"seed":9007199254740993`) {
+		t.Fatalf("large integer was altered while adding include: %s", updatedOther)
+	}
+	if errUnmarshal := json.Unmarshal(updatedOther, &payload); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	includes, _ = payload["include"].([]any)
+	if len(includes) != 2 || includes[0] != "no_inline_citations" || includes[1] != "reasoning.encrypted_content" {
+		t.Fatalf("include = %#v, want existing include plus reasoning.encrypted_content", payload["include"])
+	}
+
+	existing := []byte(`{"model":"grok-4.7","input":"hi","include":["no_inline_citations","reasoning.encrypted_content"]}`)
+	if got := ensureTransparentReasoningEvidence(existing, "openai-response", "grok-4.7"); string(got) != string(existing) {
+		t.Fatalf("existing reasoning include was rewritten: %s", got)
+	}
+
+	disabled := []byte(`{"model":"grok-4.7","input":"hi","reasoning":{"effort":"none"}}`)
+	if got := ensureTransparentReasoningEvidence(disabled, "codex", "grok-4.7"); string(got) != string(disabled) {
+		t.Fatalf("reasoning-disabled request was rewritten: %s", got)
+	}
+
+	chat := []byte(`{"model":"grok-4.7","messages":[{"role":"user","content":"hi"}]}`)
+	if got := ensureTransparentReasoningEvidence(chat, "openai", "grok-4.7"); string(got) != string(chat) {
+		t.Fatalf("chat request was rewritten: %s", got)
+	}
+}
+
+func TestTransparentStreamAddsReasoningIncludeBeforeHostExecution(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	host.scriptStream("auth-1", goodResponsesStreamScript()...)
+	plugin := newTestPlugin(t, host, enableTransparentForTest)
+	request := responsesRequestForTest("grok-4.6", true)
+	request.SourceFormat = "codex"
+	request.Format = "codex"
+	plugin.runTransparentStreamBridge(context.Background(), request, "plugin-stream-reasoning-include")
+
+	if len(host.modelCalls) != 1 {
+		t.Fatalf("request used %d attempts, want 1", len(host.modelCalls))
+	}
+	var payload map[string]any
+	if errUnmarshal := json.Unmarshal(host.modelCalls[0].Body, &payload); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	includes, _ := payload["include"].([]any)
+	found := false
+	for _, value := range includes {
+		if value == "reasoning.encrypted_content" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("host execution omitted reasoning.encrypted_content: %s", host.modelCalls[0].Body)
+	}
+}
+
+func TestRouteModelBypassesResponsesCompaction(t *testing.T) {
+	entries, auths := singleGrokAuth(t, "auth-1", "[EMAIL]", nil)
+	host := newMockHostCall(entries, auths)
+	plugin := newTestPlugin(t, host, enableTransparentForTest)
+	const compactionPrompt = "Your task is to produce a faithful summary. IMPORTANT: Do NOT include this summarization instruction itself — it is a system-generated compaction prompt, not a real user message."
+
+	cases := []struct {
+		name        string
+		body        string
+		wantHandled bool
+	}{
+		{name: "remote trigger", body: `{"model":"grok-4.7","input":[{"role":"user","content":"continue"},{"type":"compaction_trigger"}]}`},
+		{name: "tui prompt", body: `{"model":"grok-4.7","input":[{"role":"user","content":"` + compactionPrompt + `"}]}`},
+		{name: "normal text mention", body: `{"model":"grok-4.7","input":[{"role":"user","content":"explain compaction_trigger"}]}`, wantHandled: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			request := rpcModelRouteRequest{ModelRouteRequest: pluginapi.ModelRouteRequest{
+				SourceFormat:   "openai-response",
+				RequestedModel: "grok-4.7",
+				Stream:         true,
+				Body:           []byte(tc.body),
+			}}
+			encoded, errMarshal := json.Marshal(request)
+			if errMarshal != nil {
+				t.Fatal(errMarshal)
+			}
+			raw, errRoute := plugin.RouteModel(encoded)
+			if errRoute != nil {
+				t.Fatal(errRoute)
+			}
+			var envelope struct {
+				OK     bool                         `json:"ok"`
+				Result pluginapi.ModelRouteResponse `json:"result"`
+			}
+			if errUnmarshal := json.Unmarshal(raw, &envelope); errUnmarshal != nil {
+				t.Fatal(errUnmarshal)
+			}
+			if envelope.Result.Handled != tc.wantHandled {
+				t.Fatalf("handled = %t, want %t: %s", envelope.Result.Handled, tc.wantHandled, raw)
+			}
+			if !tc.wantHandled && envelope.Result.Reason != "responses_compaction" {
+				t.Fatalf("compaction request missing bypass reason: %s", raw)
+			}
+		})
+	}
+}
