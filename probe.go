@@ -375,7 +375,6 @@ func (p *Plugin) ProbeAccount(ctx context.Context, authID string, force bool, ca
 		if errSuccess := p.markProbeSuccess(authID, sig); errSuccess != nil {
 			return errSuccess
 		}
-		p.markRecentSuccess(authID)
 		return nil
 	}
 	class := verdict.Class
@@ -388,7 +387,7 @@ func (p *Plugin) ProbeAccount(ctx context.Context, authID string, force bool, ca
 func (p *Plugin) markProbeSuccess(authID string, sig Signals) error {
 	now := time.Now().UTC()
 	verdict := QualityVerdict{Class: ClassNone, Reason: "probe passed", Signals: sig}
-	return p.stateStore().Update(func(state *State) error {
+	errUpdate := p.stateStore().Update(func(state *State) error {
 		account := p.ensureStateAccount(state, authID, "", "")
 		account.State = StateHealthy
 		account.LastProbeAt = now
@@ -418,6 +417,10 @@ func (p *Plugin) markProbeSuccess(authID string, sig Signals) error {
 		p.recordEvent(state, authID, "", "probe", "healthy", "probe passed")
 		return nil
 	})
+	if errUpdate == nil {
+		p.refreshSelectionAccount(authID)
+	}
+	return errUpdate
 }
 
 func (p *Plugin) handleProbeFailure(authID string, raw map[string]json.RawMessage, response pluginapi.HostAuthGetResponse, reEnabled bool, verdict QualityVerdict, errProbe error) error {

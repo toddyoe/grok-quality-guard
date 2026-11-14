@@ -16,8 +16,8 @@ func twoGrokAuths(t *testing.T) ([]pluginapi.HostAuthFileEntry, map[string]json.
 	t.Helper()
 	entries1, auths1 := singleGrokAuth(t, "auth-1", "alice@example.com", nil)
 	entries2, auths2 := singleGrokAuth(t, "auth-2", "bob@example.com", nil)
-	entries1[0].Priority = 1
-	entries2[0].Priority = 2
+	entries1[0].Priority = 2
+	entries2[0].Priority = 1
 	auths := make(map[string]json.RawMessage, 2)
 	for key, value := range auths1 {
 		auths[key] = value
@@ -110,8 +110,6 @@ func TestTransparentCandidatesSkipQualitySuspectAccounts(t *testing.T) {
 			}); errUpdate != nil {
 				t.Fatal(errUpdate)
 			}
-			plugin.markRecentSuccess("auth-1")
-
 			candidates, errCandidates := plugin.transparentCandidates(context.Background())
 			if errCandidates != nil {
 				t.Fatal(errCandidates)
@@ -166,8 +164,8 @@ func TestTransparentMissingThinkingSwitchesAccountBeforeProxyRotation(t *testing
 		"proxy_url": "socks5h://Default.grok-alice-old1:proxy-secret@resin:2260",
 	})
 	entries2, auths2 := singleGrokAuth(t, "auth-2", "[EMAIL]", nil)
-	entries1[0].Priority = 1
-	entries2[0].Priority = 2
+	entries1[0].Priority = 2
+	entries2[0].Priority = 1
 	auths := make(map[string]json.RawMessage, len(auths1)+len(auths2))
 	for key, value := range auths1 {
 		auths[key] = value

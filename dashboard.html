@@ -2020,6 +2020,26 @@
                 </div>
                 <div class="form-section">
                   <h3 class="section-title"><svg class="icon">
+                      <use href="#i-link"></use>
+                    </svg>透明鉴权选择与会话亲和</h3>
+                  <div class="field-grid">
+                    <div class="field"><label for="p_selection_strategy">层内选择策略</label><select id="p_selection_strategy">
+                        <option value="round_robin">Round Robin</option>
+                        <option value="random">Random</option>
+                        <option value="fill_first">Fill First</option>
+                      </select><span class="hint">仅在同一个质量/Priority 层内生效</span></div>
+                    <label class="check-card"><input id="p_prefer_last_success" type="checkbox"><span
+                        class="check-copy"><span class="check-title">优先复用上次成功账号</span><span class="check-desc">仅在该账号健康且空闲时优先使用；并发时自动分散</span></span></label>
+                    <label class="check-card"><input id="p_session_affinity" type="checkbox"><span
+                        class="check-copy"><span class="check-title">启用会话亲和</span><span class="check-desc">同一会话在账号正常时尽量固定到同一 auth</span></span></label>
+                    <div class="field"><label for="p_session_affinity_ttl">会话亲和 TTL</label><input id="p_session_affinity_ttl"
+                        type="text" placeholder="1h"><span class="hint">成功请求后刷新</span></div>
+                    <div class="field"><label for="p_session_affinity_max_entries">会话绑定上限</label><input
+                        id="p_session_affinity_max_entries" type="number" min="1" max="100000"></div>
+                  </div>
+                </div>
+                <div class="form-section">
+                  <h3 class="section-title"><svg class="icon">
                       <use href="#i-eye"></use>
                     </svg>透明流保护与主动探测</h3>
                   <div class="field-grid">
@@ -2978,12 +2998,18 @@
       const policy = state.policy || {};
       const quality = policy.quality || {};
       const probe = policy.probe || {};
+      const routing = policy.routing || {};
       setChecked('p_passive', policy.passive_guard !== false);
       setChecked('p_transparent', policy.transparent_guard === true);
       setValue('p_auto_action', policy.auto_action || 'observe');
       setValue('p_model_prefixes', (policy.model_prefixes || ['grok-']).join(', '));
       setValue('p_events_limit', policy.events_limit || 1000);
       setValue('p_state_file', (state.overview && state.overview.state_file) || '');
+      setValue('p_selection_strategy', routing.selection_strategy || 'round_robin');
+      setChecked('p_prefer_last_success', routing.prefer_last_success !== false);
+      setChecked('p_session_affinity', routing.session_affinity !== false);
+      setValue('p_session_affinity_ttl', routing.session_affinity_ttl || '1h');
+      setValue('p_session_affinity_max_entries', routing.session_affinity_max_entries || 10000);
       setValue('p_soft_tps', quality.soft_tps || 500);
       setValue('p_hard_tps', quality.hard_tps || 1000);
       setValue('p_consecutive_soft', quality.consecutive_soft || 2);
@@ -3023,6 +3049,12 @@
       policy.auto_action = valueOf('p_auto_action');
       policy.model_prefixes = (valueOf('p_model_prefixes') || '').split(',').map((item) => item.trim()).filter(Boolean);
       policy.events_limit = numberValue('p_events_limit', 1000);
+      policy.routing = policy.routing || {};
+      policy.routing.selection_strategy = valueOf('p_selection_strategy') || 'round_robin';
+      policy.routing.prefer_last_success = document.getElementById('p_prefer_last_success').checked;
+      policy.routing.session_affinity = document.getElementById('p_session_affinity').checked;
+      policy.routing.session_affinity_ttl = valueOf('p_session_affinity_ttl');
+      policy.routing.session_affinity_max_entries = numberValue('p_session_affinity_max_entries', 10000);
       policy.quality = policy.quality || {};
       policy.quality.soft_tps = numberValue('p_soft_tps', 500);
       policy.quality.hard_tps = numberValue('p_hard_tps', 1000);
@@ -3062,6 +3094,7 @@
       const nextStateFile = valueOf('p_state_file');
       if (!(policy.quality.soft_tps < policy.quality.hard_tps)) { toast('软 TPS 阈值必须低于硬 TPS 阈值', 'error'); return; }
       if (!(policy.probe.queue_size >= 1 && policy.probe.queue_size <= 1000000)) { toast('后台队列容量必须在 1 到 1000000 之间', 'error'); return; }
+      if (!policy.routing.session_affinity_ttl) { toast('会话亲和 TTL 不能为空', 'error'); return; }
       if (!nextStateFile) { toast('状态文件路径不能为空', 'error'); return; }
       setBusy(button, true);
       document.getElementById('policyStatus').textContent = '正在保存策略…';

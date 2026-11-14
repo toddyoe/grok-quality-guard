@@ -65,6 +65,10 @@ grok2api 的关键实现位于：
 - [quality_probe.go](https://github.com/chenyme/grok2api/blob/main/backend/internal/application/gateway/quality_probe.go)
 - [degrade.go](https://github.com/chenyme/grok2api/blob/main/backend/internal/domain/audit/degrade.go)
 - [bootstrap.go](https://github.com/chenyme/grok2api/blob/main/backend/internal/infra/qualityguard/bootstrap.go)
+- [selector.go](https://github.com/chenyme/grok2api/blob/main/backend/internal/application/gateway/selector.go)
+- [selector_plan.go](https://github.com/chenyme/grok2api/blob/main/backend/internal/application/gateway/selector_plan.go)
+- [selector_session.go](https://github.com/chenyme/grok2api/blob/main/backend/internal/application/gateway/selector_session.go)
+- [selector_test.go](https://github.com/chenyme/grok2api/blob/main/backend/internal/application/gateway/selector_test.go)
 
 必须保留的核心结论：
 
@@ -295,7 +299,9 @@ client request
 client request
   -> ModelRouter
   -> plugin Executor
-  -> candidate auth list
+  -> load immutable selection snapshot
+  -> healthy / unknown quality layers, Priority descending
+  -> preferred / session / layer strategy selection
   -> fixed AuthID + ProxyURL
   -> host.model.execute_stream
   -> hold stream and analyze
@@ -732,13 +738,16 @@ Router 处理条件：
 
 主动探测标记只用于识别没有请求级 pending observation 的内部 probe usage，不得按 AuthID 过滤透明候选，也不得丢弃同一窗口内真实请求的 usage。
 
-排序：
+分层：
 
-1. `healthy` 优先于 `unknown`
-2. 同状态下当前会话最近成功账号优先，TTL 1h
-3. 再按 auth priority 和稳定哈希轮转
+1. `healthy` 整体优先于 `unknown`
+2. 同一质量状态下，Auth Priority 数值越大越优先
+3. 每个 `(quality, priority)` 组合是独立选择层，层内按 AuthID 稳定排序
+4. 当前层未耗尽时不进入下一层
+5. 当前层全部失败后才 fallback 到下一层
 
 透明请求不得依赖 CPA 内置 auth selection 再次选号，必须显式传 `AuthID`。
+完整的分层索引、preferred、session affinity、in-flight 跟踪和层内策略见 6.10。
 
 ### 6.4 Executor 调用
 
@@ -859,6 +868,511 @@ host.stream.close(
 - Host 绕过插件 executor 的 WebSocket / realtime 请求
 - 客户端取消后无法重放
 
+### 6.10 透明 Auth 选择与并发路由
+
+本节是透明 Auth 选择与并发路由的唯一设计依据，描述当前实现和后续维护约束。
+
+#### 6.10.1 选择权归属
+
+透明模式下插件完全接管 Grok/xAI auth 选择：
+
+1. `RouteModel` 命中 Grok 请求后返回 `Handled=true`、`TargetKind=Self`
+2. 插件自己的透明执行器选择 auth
+3. 插件把选中的 `AuthID` 写入 `HostModelExecutionRequest`
+4. CPA 只负责使用指定 auth 执行，不再为这次请求重新选择 auth
+
+因此并发的首轮分发、会话亲和、preferred、失败切换和分层 fallback 都由插件完成，不能依赖 CPA 内置的 auth 选择或 `routing.session-affinity`。
+
+选择器需要同时满足：
+
+- 质量优先：`healthy` 整体优先于 `unknown`
+- Priority 优先：同一质量层内数值越大越优先
+- 并发分散：10 个以上空闲 auth 的并发首请求不能全部落到同一个 auth
+- 稳定填仓：顺序流量可以在健康且空闲时持续复用上次成功 auth
+- 会话连续性：同一稳定 session 在 auth 正常时尽量固定
+- 故障隔离：账号级失败立即退出候选，临时错误不误删健康偏好
+
+#### 6.10.2 grok2api 机制核查
+
+grok2api 没有把“上次执行成功账号”直接作为下一请求的全局第一候选。其实际机制包括：
+
+- `lastSelectedAt`：记录账号最近一次被成功取得并发起执行的时间
+- `lastSuccessAt`：记录最近成功时间，但主要用于限制持久化 `TouchLastUsed` 的写频率
+- `LastUsedAt`：持久化的最近使用时间
+- 候选评分：模型支持、额度、Web Tier、Priority、billing、in-flight、最近选择时间和稳定 AuthID 共同排序
+- 并发租约：达到 `MaxConcurrent` 的账号从候选计划中排除
+- sticky session：会话命中绑定账号时优先复用，绑定失效后重新选择
+
+关键参考位置：
+
+- `references/grok2api/backend/internal/application/gateway/selector.go`
+  - `Selector.lastSelectedAt`
+  - `Selector.lastSuccessAt`
+  - `markSuccess`
+- `references/grok2api/backend/internal/application/gateway/selector_plan.go`
+  - `candidateScoreBetter`
+  - `inFlight` 比较发生在 `lastSelected` 之前
+- `references/grok2api/backend/internal/application/gateway/selector_session.go`
+  - sticky session 命中、失效和 fallback
+- `references/grok2api/backend/internal/application/gateway/selector_test.go`
+  - `TestCandidatePlanExcludesSaturatedAccounts`
+  - `TestCandidatePlanPreservesSelectorOrdering`
+
+grok2api 的关键结论是：同 Priority 账号会随 in-flight 和 lastSelected 分散，高 Priority 账号可以被优先填满，但达到并发上限后会排除并继续使用下一账号。
+
+本插件吸收“优先复用上次成功账号”的收益，但增加两个比 grok2api 原行为更保守的约束：
+
+- 只有该 auth 仍属于当前最高可用层时才作为 preferred
+- 只有该 auth 健康且当前没有进行中的插件请求时才作为 preferred
+
+#### 6.10.3 候选资格
+
+透明选择索引只允许：
+
+- `healthy`
+- `unknown`
+- 状态为空但 catalog 可用，按 `unknown` 处理
+
+明确排除：
+
+- `Disabled`
+- `Unavailable`
+- 非 Grok provider/type
+- `suspect`
+- `degraded`
+- `cooling`
+- `quota_exhausted`
+- `credential_invalid`
+- `externally_disabled`
+- `disabled_by_guard`
+
+索引快照只是快速路径，真正执行前仍要做一次只看当前账号的 O(1) 最终检查：
+
+- auth 是否仍存在于 catalog
+- state 是否仍为透明候选状态
+- auth 是否仍可解析出有效 Grok payload
+- auth 是否已被当前请求尝试过
+
+最终检查失败时跳过该 candidate，并触发该 auth 的定向索引刷新，不扫描整个账号池。
+
+#### 6.10.4 分层规则
+
+先按质量状态分组，再按 Priority 分组：
+
+```text
+healthy / Priority=20
+healthy / Priority=10
+healthy / Priority=0
+unknown / Priority=20
+unknown / Priority=10
+unknown / Priority=0
+```
+
+规则：
+
+- `healthy` 整体优先于 `unknown`
+- 同一质量状态下 Priority 数值越大越优先
+- 每个 `(quality, priority)` 组合是独立层
+- 层内按 AuthID 稳定排序
+- 当前层还有未尝试候选时不进入下一层
+- 当前层全部失败后才进入下一层
+- 请求级 `max_attempts` 仍是硬上限，达到后立即停止
+- 非可安全重放请求仍只允许一次尝试
+
+Priority 的语义必须统一为“数值越大越优先”。旧的升序排序已经移除。
+
+#### 6.10.5 后台选择索引
+
+请求路径不得每次复制 catalog、读取全部状态、过滤排序并重新构造分层。
+
+选择索引由 `routingSelectionIndex` 维护：
+
+- `routingSelectionSnapshot`：不可变快照
+- `layers`：层键到 `(quality, priority, accounts)` 的映射
+- `layerByAuth`：auth 到层键的映射
+- `order`：已排序的非空层键列表
+- `total`：候选总数
+
+索引使用 `atomic.Pointer[routingSelectionSnapshot]` 发布。请求创建时只加载一次快照，并绑定该请求内的所有选择状态，后续后台更新不会改变正在执行的请求视图。
+
+全量构建时机：
+
+- 插件启动并完成 catalog 和 state 加载后
+- 每 30 秒 catalog 刷新完成后
+- catalog 新增、删除、Priority、Disabled、Unavailable 变化
+- 周期性校验或索引压缩
+
+全量构建复杂度为 O(n log n)，只发生在后台。
+
+增量更新规则：
+
+```text
+unknown -> healthy
+```
+
+1. 复制当前快照的层映射和 `layerByAuth`
+2. 从 `unknown / Priority=X` 层移除 auth
+3. 插入 `healthy / Priority=X` 层
+4. 更新 `layerByAuth`
+5. 重新计算非空层顺序
+6. 原子发布新快照
+
+其他状态变化同理：
+
+- `healthy -> suspect`：退出选择索引
+- `healthy -> degraded`：退出选择索引
+- `unknown -> quota_exhausted`：退出选择索引
+- auth 被删除或禁用：退出所有层
+- Priority 变化：移动到新的 Priority 层
+
+状态更新必须先在 state 提交成功，再发布索引快照。普通事件写入、请求错误日志等不改变账号候选层级的 state 更新不得触发索引全量重建。
+
+请求期复杂度：
+
+- 加载快照：O(1)
+- 层查找：O(1)
+- 策略起点：O(1)
+- 请求内候选遍历：O(attempts)
+- 单账号状态增量移动：只复制受影响层和索引元数据，不复制全部 Account 数据
+
+#### 6.10.6 Preferred Last-Success Auth
+
+插件维护进程内全局偏好：
+
+```text
+preferredAuthID
+preferredSuccessAt
+```
+
+它只记录透明请求的成功结果，不记录：
+
+- 主动 probe 成功
+- passive 观测成功
+- session affinity 直接命中的成功
+- 被 session 绑定直接使用的成功
+
+顺序流量语义：
+
+1. 没有 preferred 时按当前层策略选号
+2. 选中 auth A 且质量门通过后，A 成为 preferred
+3. 后续请求优先使用 A
+4. 只要 A 仍为 `healthy`、属于当前最高层且当前没有进行中的请求，就继续使用 A
+5. A 额度耗尽、进入冷却、变成非候选状态、被删除或不可执行后清除 preferred
+6. fallback 成功后，如果当前 preferred 已失效，则新 auth 成为 preferred
+
+并发语义：
+
+- `TryReservePreferred` 必须在同一把锁内完成“检查空闲并占用”
+- 第一个请求占用 preferred A
+- 第二个请求看到 A 正在使用，保留 preferred，但本轮不等待 A
+- 第二个请求进入当前层的基础策略
+- 基础策略优先选择其他空闲 auth
+- 只有当前层所有候选都忙时，才允许通过第二遍 busy fallback 共享已有 in-flight 的 auth
+- A 完成后释放 in-flight，后续顺序请求仍优先回到 A
+
+preferred 更新规则：
+
+- 当前没有 preferred：设置成功 auth
+- 当前 preferred 就是成功 auth：刷新 `preferredSuccessAt`
+- 当前 preferred 已失效或已不在最高层：用成功 auth 替换
+- 当前 preferred 仍健康且只是 busy：fallback 成功不替换 preferred
+- session affiliation 命中：只刷新 session 绑定，不修改全局 preferred
+
+插件没有实时额度余额来源，因此“额度用完”通过以下信号体现：
+
+- 上游 402
+- 上游 429 且判定为明确 quota exhaustion
+- state machine 转为 `quota_exhausted`
+- auth 进入冷却、隔离或退出透明候选
+
+不承诺提前预测额度，只保证出现这些信号后停止优先使用该 auth。
+
+#### 6.10.7 Session Affinity
+
+目标是在 auth 正常时，将同一稳定会话尽量固定到同一 auth。
+
+支持的 session signal 按优先级提取：
+
+1. `X-Claude-Code-Session-Id`
+2. `X-Codex-Turn-Metadata` 中的 `prompt_cache_key`
+3. `X-Codex-Turn-Metadata` 中的 `window_id`
+4. `X-Codex-Window-Id`
+5. `X-Session-Id`
+6. `Session-Id`
+7. `Session_id`
+8. `X-Conversation-Id`
+9. `Conversation-Id`
+10. `Conversation_id`
+11. `X-Client-Session-Id`
+12. `X-Grok-Conv-Id`
+13. body `prompt_cache_key`
+14. body `metadata.session_id` / `metadata.sessionId`
+15. body `conversation_id` / `conversationId`
+16. body `client_metadata.x-codex-turn-metadata`
+17. body `client_metadata.x-codex-window-id`
+
+不使用：
+
+- `X-Request-ID`
+- trace ID
+- 每次请求变化的 request UUID
+- 随机生成的 session ID
+
+session key：
+
+```text
+sessionKey = SHA256(
+  "grok-quality-guard:affinity:v1" +
+  callerScope +
+  provider +
+  model +
+  sourceFormat +
+  sessionSeed
+)
+```
+
+`callerScope` 优先取 CPA metadata 的 `CallerScopeMetadataKey`。缺失时使用下行 API Key 的 SHA-256 摘要作为隔离域。原始 key 和原始 session signal 不写日志、不写 state。
+
+绑定语义：
+
+- 绑定 auth 在当前最高层且仍可用时优先使用
+- 绑定 auth 不在当前最高层时，不跨层强行使用
+- 绑定 auth 被删除、禁用、不可执行或状态不再合格时删除绑定
+- 绑定 auth 健康但正被其他请求使用时，session affinity 仍允许同一会话继续使用它，以保持会话连续性
+- 同一 session 的并发首请求通过原子 `GetOrBind` 选择一个 auth，避免各自选到不同账号
+- 成功请求刷新 TTL
+- TTL 过期后删除绑定
+- 绑定只在内存中保存，进程重启后自然丢失
+- 超过 `session_affinity_max_entries` 时淘汰最旧绑定
+
+没有稳定 session signal 时不创建绑定，请求仍享受分层、preferred 和并发分散。
+
+#### 6.10.8 In-flight 与层内策略
+
+插件维护进程内：
+
+```text
+activeAttempts map[authID]int
+```
+
+计数时机：
+
+- 在真正调用 host model execution 前占用
+- 非流式、缓冲流、实时流结束或失败后释放
+- auth 解析失败、执行前失败、Resin 轮换后失败和所有提前返回路径都必须释放
+- 使用 `attempt.Release()` 统一释放，禁止在 selection lock 内调用上游网络
+
+普通策略采用两遍选择：
+
+1. idle pass：优先尝试当前层中未被占用且未尝试的 auth
+2. busy pass：只有 idle pass 没有任何候选时，才允许按同一策略使用正在被其他请求占用的 auth
+
+这避免了 preferred 正在使用时，普通 round-robin 又立刻选中同一个 auth，同时不会因为所有 auth 都忙而直接返回无候选。
+
+层内策略：
+
+`round_robin`
+
+- 每个 `(quality, priority)` 层维护独立游标
+- 每个新请求从游标当前位置开始
+- 游标在选号时原子推进，不等待网络请求完成
+- session 或 preferred 命中不推进普通游标
+- 回退顺序按层内环形顺序遍历，不重复尝试
+
+`random`
+
+- 每次请求在当前层随机选择一个起始下标
+- 从该下标开始环形遍历
+- 不生成完整随机排列
+- 不使用有放回随机
+
+`fill_first`
+
+- 当前层始终从排序后的第一个 auth 开始
+- 如果第一个 auth 忙，idle pass 会继续寻找空闲 auth
+- 当前层全部不可用后才进入下一层
+- 适合明确希望集中消耗账号的场景，不作为默认值
+
+默认：
+
+```yaml
+routing:
+  selection_strategy: round_robin
+  prefer_last_success: true
+  session_affinity: true
+  session_affinity_ttl: 1h
+  session_affinity_max_entries: 10000
+```
+
+#### 6.10.9 单请求选择流程
+
+```text
+snapshot := selectionIndex.Load()
+
+for each layer in snapshot.Order:
+  if no remaining attempts: stop
+
+  if session binding exists and belongs to this layer:
+    if binding auth is eligible:
+      try bound auth
+      if success: refresh binding, return
+      if hard account failure: delete binding
+      continue to next candidate in this layer
+
+  if preferred auth exists and belongs to top layer:
+    if preferred is healthy and TryReservePreferred succeeds:
+      try preferred
+      if success: refresh preferred, return
+      if hard account failure: clear preferred
+      continue to next candidate in this layer
+    else if preferred is healthy but busy:
+      keep preferred
+      skip it in idle pass
+
+  start := strategyStart(layer)
+  for idle candidate in layer:
+    if excluded, tried, ineligible or busy: continue
+    reserve idle attempt
+    resolve auth
+    if session binding was created by a concurrent request: switch to bound auth
+    try candidate
+    if success: bind/refresh session and update preferred if needed
+    if retryable with Resin rotation: retry same candidate once
+    mark excluded
+
+  if idle pass found no candidate:
+    for busy candidate in layer:
+      same strategy order, reserve shared attempt, try once
+
+  release attempt
+end for
+return quality_degraded
+```
+
+请求不会复制完整 catalog，也不会对全部 auth 排序。
+
+#### 6.10.10 失败分类与绑定更新
+
+账号级失败包括：
+
+- credential invalid
+- quota exhausted
+- missing thinking 达到处置阈值
+- isolate / degraded
+- auth disabled
+- auth removed
+- auth 不可执行
+
+处理：
+
+- 当前 candidate 在请求内排除
+- 清除该 auth 的 session 绑定
+- 若该 auth 是 preferred，清除 preferred
+- 继续当前层剩余 auth
+- 当前层结束后再进入下一层
+
+临时容量或传输失败包括：
+
+- host 暂时无容量
+- 临时 proxy 错误
+- 网络超时
+- 可重试临时执行错误
+
+处理：
+
+- 当前请求可以切换到当前层其他 auth
+- 不因为一次临时失败就替换全局 preferred
+- auth 仍为 healthy 时保留 preferred 和 session 绑定
+- 后续 state machine 若将其转为非候选状态，再按账号级失败处理
+
+Resin 轮换语义保持不变：
+
+- 仅对可安全重放请求执行
+- 同一 candidate 最多轮换一次
+- 轮换后重新解析 auth，确保使用新的 `proxy_url`
+- `missing_thinking` 存在其他候选时优先换号，不先轮换代理
+- 单账号池才使用代理轮换作为兜底
+- 轮换次数计入 `max_attempts`
+
+#### 6.10.11 配置与热更新
+
+新增运行时策略：
+
+```yaml
+routing:
+  selection_strategy: round_robin
+  prefer_last_success: true
+  session_affinity: true
+  session_affinity_ttl: 1h
+  session_affinity_max_entries: 10000
+```
+
+校验：
+
+- `selection_strategy` 只能是 `round_robin`、`random`、`fill_first`
+- `session_affinity_ttl > 0` 且不超过 `168h`
+- `session_affinity_max_entries > 0` 且不超过 `100000`
+- 缺失字段使用默认值
+- 旧 state.json 没有 `routing` 时不需要 schema 迁移
+- 管理页保存策略后必须同步更新 `p.policy.Routing` 和 `p.cfg.Routing`
+
+preferred、session binding、round-robin 游标和 in-flight 计数不写入 state.json。
+
+#### 6.10.12 并发安全要求
+
+必须保证：
+
+- `routingSelectionSnapshot` 发布后不可变
+- 请求只读取加载到本次请求的原子快照
+- 索引更新使用 copy-on-write，不修改旧快照
+- preferred 的空闲检查和占用是原子的
+- round-robin 游标推进是原子的
+- session binding 的 `GetOrBind` 是原子的
+- activeAttempts 的增减是原子的
+- 不同层游标互不影响
+- 选择锁不得跨越上游网络调用
+- 不得在持有 selection lock 时执行 host callback、Resin API 调用或长耗时 I/O
+- 请求失败时只能条件删除自己的 session 绑定，不能误删其他请求刚写入的新绑定
+- `unknown -> healthy` 在 state 提交成功后触发增量移动，下一个请求读取到的新快照即可看到 healthy 层
+- 普通事件写入不得使索引失效或触发全量重建
+
+#### 6.10.13 测试与验收
+
+已覆盖的测试：
+
+- Priority 数值越大越优先
+- `healthy` 整体优先于 `unknown`
+- `suspect` / `degraded` 不进入候选
+- `unknown -> healthy` 增量移动到 healthy 层且不触发全量重建
+- 10 个同层 healthy auth 并发首轮选择 10 个不同 auth
+- round-robin 游标并发的精确推进
+- preferred 健康且空闲时被复用
+- preferred busy 时新请求选择其他 idle auth
+- preferred busy 期间 fallback 成功不替换 preferred
+- session 并发首请求通过原子绑定落到同一 auth
+- 不同 caller scope 和不同 session 不共享绑定
+- binding auth 失效后重新选择并更新绑定
+- binding TTL 和 max entries 淘汰
+- 普通事件写入不使选择索引失效
+- 路由配置热更新
+- Resin 轮换后同 auth 重试使用新 proxy
+- `go test ./...`
+- `go test -race ./...`
+
+透明选择重构的实现验收还必须满足：
+
+1. 10 个以上 healthy auth 并发请求时不会全部使用同一个 auth
+2. 顺序请求在 preferred 健康且空闲时优先使用同一 auth
+3. preferred 正在使用时，新请求能立即使用其他 auth
+4. 同一 session 的连续请求在正常状态下保持同一 auth
+5. 当前最高 Priority 层未耗尽时不会使用低 Priority 层
+6. 当前层全部失败后才 fallback 到下一层
+7. 账号额度耗尽、隔离或删除后自动换号并重建绑定
+8. probe 成功不会改变普通流量的 preferred
+9. Resin 轮换、`max_attempts` 和非重放语义保持不变
+10. unknown -> healthy 后，下一个请求能从后台索引的 healthy 层看到该 auth
+11. 请求路径不因账号总数增加而执行全量复制、全量状态读取或全量排序
+12. race 检测通过，且日志不泄露 session/token 原文
 ## 7. passive 设计
 
 ### 7.1 StreamChunkInterceptor
@@ -1378,6 +1892,13 @@ plugins:
       model_prefixes:
         - "grok-"
 
+      routing:
+        selection_strategy: round_robin
+        prefer_last_success: true
+        session_affinity: true
+        session_affinity_ttl: "1h"
+        session_affinity_max_entries: 10000
+
       quality:
         soft_tps: 500
         hard_tps: 1000
@@ -1450,6 +1971,7 @@ Resin 配置采用“YAML 初始化，管理页验证后保存并优先使用”
 - `transparent_guard`
 - `auto_action`
 - `model_prefixes`
+- `routing`
 - `quality`
 - `probe`
 - `resin.auto_rotate_after_quality_failure`
@@ -1464,6 +1986,11 @@ Resin 配置采用“YAML 初始化，管理页验证后保存并优先使用”
 - `auto_action=observe`
 - `on_exhausted=fail_closed`
 - `max_attempts=6`
+- `routing.selection_strategy=round_robin`
+- `routing.prefer_last_success=true`
+- `routing.session_affinity=true`
+- `routing.session_affinity_ttl=1h`
+- `routing.session_affinity_max_entries=10000`
 - `quality.consecutive_soft=2`
 - `quality.consecutive_errors=2`
 - `quality.consecutive_missing_thinking=1`
@@ -1677,6 +2204,26 @@ Docker 部署必须将 `/CLIProxyAPI/plugin-data/grok-quality-guard` 挂载为�
 - 外部 disabled 不自动恢复
 - 手动 restore 清除 strike
 
+透明选择与路由：
+
+- Priority 数值越大越优先
+- `healthy` 整体优先于 `unknown`
+- `suspect` / `degraded` / `cooling` 等状态不进入候选
+- 当前层未耗尽时不进入下一层
+- `unknown -> healthy` 增量移动且不触发全量重建
+- 10 个同层健康 auth 的并发首轮选择使用不同 auth
+- round-robin 游标并发精确推进
+- preferred 健康且空闲时复用
+- preferred busy 时选择其他 idle auth
+- preferred busy 期间 fallback 成功不替换 preferred
+- session 并发首请求通过原子绑定落到同一 auth
+- 不同 caller scope 和不同 session 不共享绑定
+- binding auth 失效后重新绑定
+- binding TTL 过期和 max entries 淘汰
+- 普通事件写入不使选择索引失效
+- routing 策略热更新
+- Resin 轮换后同 auth 重试使用新 proxy
+
 Resin：
 
 - account 清洗
@@ -1726,6 +2273,8 @@ Resin：
 - DELETE 401 保留任务并退避重试
 - 插件 reload 后状态恢复
 - 并发请求状态一致
+- 10 个以上同层健康 auth 的并发首轮请求分散到不同 auth
+- preferred 和 session affinity 在透明流式路径中生效
 - 大量账号加载不阻塞注册
 - Home 模式元数据不会旁路透明路由
 - 管理 API action 正常和错误响应
@@ -1799,6 +2348,9 @@ git diff --check
 - 插件 Executor
 - 流式 hold / emit
 - 多账号重试
+- 后台分层选择索引和原子快照
+- preferred last-success、session affinity 和 in-flight 跟踪
+- round_robin / random / fill_first 层内策略
 - fail closed
 - HostCallbackID 防递归
 
@@ -1829,6 +2381,12 @@ git diff --check
 13. API 模式的 Resin 配置只有在 Admin API、Admin Token、平台 ID 和 Proxy Token 全部验证通过后才会保存；本地轮换模式无需这些字段。
 14. 插件注册和热重载不因账号扫描阻塞。
 15. 文档中的路径统一为 `/dashboard`、`/v0/resource/plugins/grok-quality-guard/dashboard`、`/plugins/grok-quality-guard/api` 和 `/v0/management/plugins/grok-quality-guard/api`。
+16. 透明模式下 10 个以上健康同层 auth 的并发首请求不会全部使用同一个 auth。
+17. 顺序请求在 preferred 健康且空闲时优先复用同一 auth，busy 时不等待并转向其他 auth。
+18. 同一稳定 session 在 auth 正常时保持同一 auth，跨 caller scope 不共享绑定。
+19. 当前最高 Priority 层未耗尽时不使用低 Priority 层，当前层全部失败后才 fallback。
+20. unknown -> healthy 后下一个请求能从后台索引看到新的 healthy 层。
+21. 普通事件写入不得触发透明选择索引全量重建。
 
 ## 19. 明确默认决策
 
@@ -1842,6 +2400,9 @@ git diff --check
 | auto_action | observe |
 | 透明失败策略 | fail_closed |
 | 最大尝试次数 | 6 |
+| 层内选择策略 | round_robin |
+| preferred last-success | true，仅健康且空闲时生效 |
+| session affinity | true，TTL 1h，最多 10000 条 |
 | 主动探测 | 仅恢复性 |
 | Resin 首次绑定 | 管理员显式操作 |
 | Resin 轮换 | API 模式立即切换新代理并异步排队删除旧租约；本地模式只改写已有代理用户名，不查 IP |
@@ -1860,6 +2421,10 @@ git diff --check
 - [quality_probe.go](https://github.com/chenyme/grok2api/blob/main/backend/internal/application/gateway/quality_probe.go)
 - [degrade.go](https://github.com/chenyme/grok2api/blob/main/backend/internal/domain/audit/degrade.go)
 - [bootstrap.go](https://github.com/chenyme/grok2api/blob/main/backend/internal/infra/qualityguard/bootstrap.go)
+- [selector.go](https://github.com/chenyme/grok2api/blob/main/backend/internal/application/gateway/selector.go)
+- [selector_plan.go](https://github.com/chenyme/grok2api/blob/main/backend/internal/application/gateway/selector_plan.go)
+- [selector_session.go](https://github.com/chenyme/grok2api/blob/main/backend/internal/application/gateway/selector_session.go)
+- [selector_test.go](https://github.com/chenyme/grok2api/blob/main/backend/internal/application/gateway/selector_test.go)
 
 ### CLIProxyAPI v8
 

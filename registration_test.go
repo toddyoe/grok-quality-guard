@@ -39,3 +39,21 @@ func TestPluginLogoConfiguration(t *testing.T) {
 	}
 	t.Fatalf("registry does not contain plugin %q", pluginID)
 }
+func TestRegistrationIncludesRoutingSelectionConfig(t *testing.T) {
+	registration := pluginRegistration()
+	fields := make(map[string]bool, len(registration.Metadata.ConfigFields))
+	for _, field := range registration.Metadata.ConfigFields {
+		fields[field.Name] = true
+	}
+	for _, name := range []string{
+		"routing.selection_strategy",
+		"routing.prefer_last_success",
+		"routing.session_affinity",
+		"routing.session_affinity_ttl",
+		"routing.session_affinity_max_entries",
+	} {
+		if !fields[name] {
+			t.Fatalf("registration is missing config field %q", name)
+		}
+	}
+}

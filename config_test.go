@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 )
@@ -79,5 +80,50 @@ func TestProbeQueueConfigDefaultsAndBounds(t *testing.T) {
 	tooLarge.Probe.QueueSize = maxProbeQueueSize + 1
 	if errNormalize := normalizeConfig(&tooLarge); errNormalize == nil {
 		t.Fatal("expected oversized probe queue error")
+	}
+}
+func TestDecodeConfigRoutingDefaults(t *testing.T) {
+	cfg, errDecode := decodeConfig(nil)
+	if errDecode != nil {
+		t.Fatalf("decodeConfig() error = %v", errDecode)
+	}
+	if cfg.Routing.SelectionStrategy != "round_robin" || !cfg.Routing.PreferLastSuccess || !cfg.Routing.SessionAffinity {
+		t.Fatalf("unexpected routing defaults: %#v", cfg.Routing)
+	}
+	if cfg.Routing.SessionAffinityTTL.Duration != time.Hour || cfg.Routing.SessionAffinityMaxSize != 10000 {
+		t.Fatalf("unexpected routing affinity defaults: %#v", cfg.Routing)
+	}
+}
+
+func TestDecodeConfigRoutingValidation(t *testing.T) {
+	for _, raw := range []string{
+		"routing:\n  selection_strategy: unsupported\n",
+		"routing:\n  session_affinity_ttl: 169h\n",
+		"routing:\n  session_affinity_max_entries: 100001\n",
+	} {
+		if _, errDecode := decodeConfig([]byte(raw)); errDecode == nil {
+			t.Fatalf("expected routing config error for %q", raw)
+		}
+	}
+}
+func TestDecodeConfigPartialRoutingKeepsBooleanDefaults(t *testing.T) {
+	cfg, errDecode := decodeConfig([]byte("routing:\n  selection_strategy: fill_first\n"))
+	if errDecode != nil {
+		t.Fatalf("decodeConfig() error = %v", errDecode)
+	}
+	if cfg.Routing.SelectionStrategy != "fill_first" || !cfg.Routing.PreferLastSuccess || !cfg.Routing.SessionAffinity {
+		t.Fatalf("partial routing config lost defaults: %#v", cfg.Routing)
+	}
+}
+func TestPolicyJSONWithoutRoutingUsesRoutingDefaults(t *testing.T) {
+	var policy Policy
+	if errUnmarshal := json.Unmarshal([]byte(`{"passive_guard":true,"auto_action":"observe"}`), &policy); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if policy.Routing.SelectionStrategy != "round_robin" || !policy.Routing.PreferLastSuccess || !policy.Routing.SessionAffinity {
+		t.Fatalf("old state policy did not inherit routing defaults: %#v", policy.Routing)
+	}
+	if policy.Routing.SessionAffinityTTL.Duration != time.Hour || policy.Routing.SessionAffinityMaxSize != 10000 {
+		t.Fatalf("old state policy did not inherit affinity defaults: %#v", policy.Routing)
 	}
 }

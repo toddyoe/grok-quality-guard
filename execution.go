@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 
@@ -138,27 +137,39 @@ func (p *Plugin) transparentExecute(ctx context.Context, req rpcExecutorRequest)
 	}
 	body = ensureTransparentReasoningEvidence(body, sourceFormat, executionModel(req, body))
 	replayable := safeReplayRequest(body, sourceFormat, firstNonEmpty(req.Model, req.Alt))
-	candidates, errCandidates := p.transparentCandidates(ctx)
-	if errCandidates != nil {
-		return transparentResult{}, errCandidates
+	selection, errSelection := p.newTransparentSelection(req, body, sourceFormat)
+	if errSelection != nil {
+		return transparentResult{}, errSelection
 	}
 	maxAttempts := transparentMaxAttempts(policy, replayable)
 	attempts := 0
 	last := transparentResult{}
-	for _, candidate := range candidates {
+candidateLoop:
+	for {
+		attempt, ok := selection.Next(ctx)
+		if !ok {
+			break
+		}
+		attemptID := attempt.Account.ID
+		source := attempt.Source
 		rotated := false
 		for {
 			if attempts >= maxAttempts {
-				break
+				attempt.Release()
+				break candidateLoop
 			}
-			account, raw, ok := p.executableAuth(ctx, candidate.ID)
+			account, raw, ok := p.executableAuth(ctx, attemptID)
 			if !ok {
+				attempt.Release()
+				p.refreshSelectionAccount(attemptID)
 				break
 			}
 			attempts++
 			execution := buildHostExecution(req, body, sourceFormat, account.ID, authRawString(raw, "proxy_url"), false)
 			result, verdict, errAttempt := p.executeTransparentOnce(ctx, execution, req.HostCallbackID, body, policy.Quality)
 			if errAttempt == nil {
+				selection.MarkSuccess(account.ID, source)
+				attempt.Release()
 				return result, nil
 			}
 			class := verdict.Class
@@ -166,7 +177,8 @@ func (p *Plugin) transparentExecute(ctx context.Context, req rpcExecutorRequest)
 				last = result
 			}
 			_ = p.recordAttemptError(account.ID, class, errAttempt)
-			if replayable && attempts < maxAttempts && !rotated && shouldRotateTransparentFailure(len(candidates), class) {
+			selection.MarkFailure(account.ID, source, class)
+			if replayable && attempts < maxAttempts && !rotated && shouldRotateTransparentFailure(selection.totalCandidates, class) {
 				didRotate, errRotate := p.rotateAfterFailure(ctx, account.ID, class)
 				if errRotate == nil && didRotate {
 					rotated = true
@@ -174,6 +186,7 @@ func (p *Plugin) transparentExecute(ctx context.Context, req rpcExecutorRequest)
 				}
 			}
 			p.applyTransparentFailureVerdict(ctx, account.ID, verdict, class, errAttempt, req.HostCallbackID)
+			attempt.Release()
 			break
 		}
 	}
@@ -196,27 +209,39 @@ func (p *Plugin) transparentExecuteBufferedStream(ctx context.Context, req rpcEx
 	}
 	body = ensureTransparentReasoningEvidence(body, sourceFormat, executionModel(req, body))
 	replayable := safeReplayRequest(body, sourceFormat, firstNonEmpty(req.Model, req.Alt))
-	candidates, errCandidates := p.transparentCandidates(ctx)
-	if errCandidates != nil {
-		return transparentResult{}, errCandidates
+	selection, errSelection := p.newTransparentSelection(req, body, sourceFormat)
+	if errSelection != nil {
+		return transparentResult{}, errSelection
 	}
 	maxAttempts := transparentMaxAttempts(policy, replayable)
 	attempts := 0
 	last := transparentResult{}
-	for _, candidate := range candidates {
+candidateLoop:
+	for {
+		attempt, ok := selection.Next(ctx)
+		if !ok {
+			break
+		}
+		attemptID := attempt.Account.ID
+		source := attempt.Source
 		rotated := false
 		for {
 			if attempts >= maxAttempts {
-				break
+				attempt.Release()
+				break candidateLoop
 			}
-			account, raw, ok := p.executableAuth(ctx, candidate.ID)
+			account, raw, ok := p.executableAuth(ctx, attemptID)
 			if !ok {
+				attempt.Release()
+				p.refreshSelectionAccount(attemptID)
 				break
 			}
 			attempts++
 			execution := buildHostExecution(req, body, sourceFormat, account.ID, authRawString(raw, "proxy_url"), true)
 			result, verdict, errAttempt := p.executeTransparentBufferedAttempt(ctx, execution, req.HostCallbackID, body, policy.Quality)
 			if errAttempt == nil {
+				selection.MarkSuccess(account.ID, source)
+				attempt.Release()
 				return result, nil
 			}
 			class := verdict.Class
@@ -224,7 +249,8 @@ func (p *Plugin) transparentExecuteBufferedStream(ctx context.Context, req rpcEx
 				last = result
 			}
 			_ = p.recordAttemptError(account.ID, class, errAttempt)
-			if replayable && attempts < maxAttempts && !rotated && shouldRotateTransparentFailure(len(candidates), class) {
+			selection.MarkFailure(account.ID, source, class)
+			if replayable && attempts < maxAttempts && !rotated && shouldRotateTransparentFailure(selection.totalCandidates, class) {
 				didRotate, errRotate := p.rotateAfterFailure(ctx, account.ID, class)
 				if errRotate == nil && didRotate {
 					rotated = true
@@ -232,6 +258,7 @@ func (p *Plugin) transparentExecuteBufferedStream(ctx context.Context, req rpcEx
 				}
 			}
 			p.applyTransparentFailureVerdict(ctx, account.ID, verdict, class, errAttempt, req.HostCallbackID)
+			attempt.Release()
 			break
 		}
 	}
@@ -355,22 +382,32 @@ func (p *Plugin) runTransparentStreamBridge(ctx context.Context, req rpcExecutor
 	}
 	body = ensureTransparentReasoningEvidence(body, sourceFormat, executionModel(req, body))
 	replayable := safeReplayRequest(body, sourceFormat, firstNonEmpty(req.Model, req.Alt))
-	candidates, errCandidates := p.transparentCandidates(ctx)
-	if errCandidates != nil {
+	selection, errSelection := p.newTransparentSelection(req, body, sourceFormat)
+	if errSelection != nil {
 		p.closePluginStream(streamID, "quality_degraded", "no healthy Grok account produced a valid response", http.StatusServiceUnavailable)
 		return
 	}
 	maxAttempts := transparentMaxAttempts(policy, replayable)
 	attempts := 0
 	last := transparentStreamAttempt{}
-	for _, candidate := range candidates {
+candidateLoop:
+	for {
+		attempt, ok := selection.Next(ctx)
+		if !ok {
+			break
+		}
+		attemptID := attempt.Account.ID
+		source := attempt.Source
 		rotated := false
 		for {
 			if attempts >= maxAttempts {
-				break
+				attempt.Release()
+				break candidateLoop
 			}
-			account, raw, ok := p.executableAuth(ctx, candidate.ID)
+			account, raw, ok := p.executableAuth(ctx, attemptID)
 			if !ok {
+				attempt.Release()
+				p.refreshSelectionAccount(attemptID)
 				break
 			}
 			attempts++
@@ -378,17 +415,24 @@ func (p *Plugin) runTransparentStreamBridge(ctx context.Context, req rpcExecutor
 			outcome := p.executeTransparentStreamAttempt(ctx, execution, req.HostCallbackID, body, policy.Quality, streamID)
 			if outcome.Emitted {
 				if outcome.Err != nil {
+					selection.MarkFailure(account.ID, source, outcome.Class)
+					attempt.Release()
 					p.closePluginStream(streamID, "upstream_stream_error", "upstream stream failed after delivery started", http.StatusBadGateway)
 					return
 				}
+				selection.MarkSuccess(account.ID, source)
+				attempt.Release()
 				p.closePluginStream(streamID, "", "", 0)
 				return
 			}
 			if outcome.Err == nil {
+				selection.MarkSuccess(account.ID, source)
+				attempt.Release()
 				p.closePluginStream(streamID, "", "", 0)
 				return
 			}
 			if ctx.Err() != nil {
+				attempt.Release()
 				p.closePluginStream(streamID, "", "", 0)
 				return
 			}
@@ -400,7 +444,8 @@ func (p *Plugin) runTransparentStreamBridge(ctx context.Context, req rpcExecutor
 				last = outcome
 			}
 			_ = p.recordAttemptError(account.ID, class, outcome.Err)
-			if replayable && attempts < maxAttempts && !rotated && shouldRotateTransparentFailure(len(candidates), class) {
+			selection.MarkFailure(account.ID, source, class)
+			if replayable && attempts < maxAttempts && !rotated && shouldRotateTransparentFailure(selection.totalCandidates, class) {
 				didRotate, errRotate := p.rotateAfterFailure(ctx, account.ID, class)
 				if errRotate == nil && didRotate {
 					rotated = true
@@ -408,6 +453,7 @@ func (p *Plugin) runTransparentStreamBridge(ctx context.Context, req rpcExecutor
 				}
 			}
 			p.applyTransparentFailureVerdict(ctx, account.ID, outcome.Verdict, class, outcome.Err, req.HostCallbackID)
+			attempt.Release()
 			break
 		}
 	}
@@ -768,79 +814,12 @@ func (p *Plugin) closePluginStream(streamID, code, message string, status int) {
 	_, _ = hostCall(pluginabi.MethodHostStreamClose, request)
 }
 
-func (p *Plugin) transparentCandidates(ctx context.Context) ([]Account, error) {
-	if len(p.catalogSnapshot()) == 0 {
-		if errRefresh := p.RefreshCatalog(ctx); errRefresh != nil {
-			return nil, errRefresh
-		}
-	}
-	candidates := make([]Account, 0)
-	for _, account := range p.catalogSnapshot() {
-		if account.Unavailable || account.Disabled {
-			continue
-		}
-		if account.Provider != "" && !isGrokProvider(account.Provider) && !isGrokProvider(account.Type) {
-			continue
-		}
-		stateAccount, okState := p.stateAccount(account.ID)
-		if okState && !isTransparentCandidateState(stateAccount.State) {
-			continue
-		}
-		candidates = append(candidates, account)
-	}
-	now := time.Now().UTC()
-	sort.SliceStable(candidates, func(i, j int) bool {
-		left := stateRank(p.stateAccountValue(candidates[i].ID))
-		right := stateRank(p.stateAccountValue(candidates[j].ID))
-		if left != right {
-			return left < right
-		}
-		leftRecent := p.recentSuccessAt(candidates[i].ID)
-		rightRecent := p.recentSuccessAt(candidates[j].ID)
-		leftRecent = recentWithin(leftRecent, now, time.Hour)
-		rightRecent = recentWithin(rightRecent, now, time.Hour)
-		if !leftRecent.IsZero() || !rightRecent.IsZero() {
-			if leftRecent.IsZero() != rightRecent.IsZero() {
-				return !leftRecent.IsZero()
-			}
-			if !leftRecent.Equal(rightRecent) {
-				return leftRecent.After(rightRecent)
-			}
-		}
-		if candidates[i].Priority != candidates[j].Priority {
-			return candidates[i].Priority < candidates[j].Priority
-		}
-		return stableHash(candidates[i].ID, now.Unix()/3600) < stableHash(candidates[j].ID, now.Unix()/3600)
-	})
-	return candidates, nil
-}
-
 func isTransparentCandidateState(state string) bool {
 	switch state {
 	case "", StateHealthy, StateUnknown:
 		return true
 	default:
 		return false
-	}
-}
-
-func (p *Plugin) stateAccountValue(authID string) AccountState {
-	value, _ := p.stateAccount(authID)
-	return value
-}
-
-func stateRank(value AccountState) int {
-	switch value.State {
-	case StateHealthy:
-		return 0
-	case StateUnknown:
-		return 1
-	case StateSuspect:
-		return 2
-	case StateDegraded:
-		return 3
-	default:
-		return 4
 	}
 }
 
@@ -1199,22 +1178,6 @@ func reasoningDisabledBody(payload map[string]any) bool {
 	return false
 }
 
-func recentWithin(value, now time.Time, window time.Duration) time.Time {
-	if value.IsZero() || now.Sub(value) > window {
-		return time.Time{}
-	}
-	return value
-}
-
-func stableHash(value string, bucket int64) uint64 {
-	var hash uint64 = 14695981039346656037
-	for i := 0; i < len(value); i++ {
-		hash ^= uint64(value[i])
-		hash *= 1099511628211
-	}
-	hash ^= uint64(bucket)
-	return hash
-}
 func containsUnsafeContentType(value any) bool {
 	switch typed := value.(type) {
 	case map[string]any:

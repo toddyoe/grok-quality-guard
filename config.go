@@ -125,6 +125,14 @@ type ResinConfig struct {
 	AutoRotateAfterQualityFailure bool   `yaml:"auto_rotate_after_quality_failure" json:"auto_rotate_after_quality_failure"`
 }
 
+type RoutingConfig struct {
+	SelectionStrategy      string   `yaml:"selection_strategy" json:"selection_strategy"`
+	PreferLastSuccess      bool     `yaml:"prefer_last_success" json:"prefer_last_success"`
+	SessionAffinity        bool     `yaml:"session_affinity" json:"session_affinity"`
+	SessionAffinityTTL     Duration `yaml:"session_affinity_ttl" json:"session_affinity_ttl"`
+	SessionAffinityMaxSize int      `yaml:"session_affinity_max_entries" json:"session_affinity_max_entries"`
+}
+
 type Config struct {
 	Enabled          bool          `yaml:"enabled" json:"enabled"`
 	Priority         int           `yaml:"priority" json:"priority"`
@@ -132,6 +140,7 @@ type Config struct {
 	TransparentGuard bool          `yaml:"transparent_guard" json:"transparent_guard"`
 	AutoAction       string        `yaml:"auto_action" json:"auto_action"`
 	ModelPrefixes    []string      `yaml:"model_prefixes" json:"model_prefixes"`
+	Routing          RoutingConfig `yaml:"routing" json:"routing"`
 	Quality          QualityConfig `yaml:"quality" json:"quality"`
 	Probe            ProbeConfig   `yaml:"probe" json:"probe"`
 	Resin            ResinConfig   `yaml:"resin" json:"resin"`
@@ -145,10 +154,21 @@ type Policy struct {
 	TransparentGuard                bool          `json:"transparent_guard"`
 	AutoAction                      string        `json:"auto_action"`
 	ModelPrefixes                   []string      `json:"model_prefixes"`
+	Routing                         RoutingConfig `json:"routing"`
 	Quality                         QualityConfig `json:"quality"`
 	Probe                           ProbeConfig   `json:"probe"`
 	ResinAutoRotateAfterQualityFail bool          `json:"resin_auto_rotate_after_quality_failure"`
 	EventsLimit                     int           `json:"events_limit"`
+}
+
+func DefaultRoutingConfig() RoutingConfig {
+	return RoutingConfig{
+		SelectionStrategy:      "round_robin",
+		PreferLastSuccess:      true,
+		SessionAffinity:        true,
+		SessionAffinityTTL:     NewDuration(time.Hour),
+		SessionAffinityMaxSize: 10000,
+	}
 }
 
 func DefaultQualityConfig() QualityConfig {
@@ -201,6 +221,7 @@ func DefaultConfig() Config {
 		TransparentGuard: false,
 		AutoAction:       "observe",
 		ModelPrefixes:    []string{"grok-"},
+		Routing:          DefaultRoutingConfig(),
 		Quality:          DefaultQualityConfig(),
 		Probe:            DefaultProbeConfig(),
 		Resin: ResinConfig{
@@ -249,6 +270,9 @@ func normalizeConfig(cfg *Config) error {
 	if cfg.EventsLimit <= 0 {
 		cfg.EventsLimit = defaultEventsLimit
 	}
+	if errRouting := normalizeRouting(&cfg.Routing); errRouting != nil {
+		return errRouting
+	}
 	if errQuality := normalizeQuality(&cfg.Quality); errQuality != nil {
 		return errQuality
 	}
@@ -281,6 +305,35 @@ func (q *QualityConfig) UnmarshalJSON(data []byte) error {
 		return errUnmarshal
 	}
 	*q = QualityConfig(decoded)
+	return nil
+}
+
+func normalizeRouting(r *RoutingConfig) error {
+	if r == nil {
+		return errors.New("routing config is nil")
+	}
+	defaults := DefaultRoutingConfig()
+	r.SelectionStrategy = strings.ToLower(strings.TrimSpace(r.SelectionStrategy))
+	if r.SelectionStrategy == "" {
+		r.SelectionStrategy = defaults.SelectionStrategy
+	}
+	switch r.SelectionStrategy {
+	case "round_robin", "random", "fill_first":
+	default:
+		return fmt.Errorf("routing.selection_strategy must be round_robin, random, or fill_first")
+	}
+	if r.SessionAffinityTTL.Duration <= 0 {
+		r.SessionAffinityTTL = defaults.SessionAffinityTTL
+	}
+	if r.SessionAffinityTTL.Duration > 168*time.Hour {
+		return fmt.Errorf("routing.session_affinity_ttl must be <= 168h")
+	}
+	if r.SessionAffinityMaxSize <= 0 {
+		r.SessionAffinityMaxSize = defaults.SessionAffinityMaxSize
+	}
+	if r.SessionAffinityMaxSize > 100000 {
+		return fmt.Errorf("routing.session_affinity_max_entries must be <= 100000")
+	}
 	return nil
 }
 
@@ -410,6 +463,7 @@ func PolicyFromConfig(cfg Config) Policy {
 		TransparentGuard:                cfg.TransparentGuard,
 		AutoAction:                      cfg.AutoAction,
 		ModelPrefixes:                   append([]string(nil), cfg.ModelPrefixes...),
+		Routing:                         cfg.Routing,
 		Quality:                         cfg.Quality,
 		Probe:                           cfg.Probe,
 		ResinAutoRotateAfterQualityFail: cfg.Resin.AutoRotateAfterQualityFailure,
@@ -425,6 +479,7 @@ func ApplyPolicy(cfg *Config, policy Policy) error {
 	cfg.TransparentGuard = policy.TransparentGuard
 	cfg.AutoAction = policy.AutoAction
 	cfg.ModelPrefixes = append([]string(nil), policy.ModelPrefixes...)
+	cfg.Routing = policy.Routing
 	cfg.Quality = policy.Quality
 	cfg.Probe = policy.Probe
 	cfg.Resin.AutoRotateAfterQualityFailure = policy.ResinAutoRotateAfterQualityFail
@@ -438,6 +493,7 @@ func normalizePolicy(policy Policy) (Policy, error) {
 	cfg.TransparentGuard = policy.TransparentGuard
 	cfg.AutoAction = policy.AutoAction
 	cfg.ModelPrefixes = append([]string(nil), policy.ModelPrefixes...)
+	cfg.Routing = policy.Routing
 	cfg.Quality = policy.Quality
 	cfg.Probe = policy.Probe
 	cfg.Resin.AutoRotateAfterQualityFailure = policy.ResinAutoRotateAfterQualityFail

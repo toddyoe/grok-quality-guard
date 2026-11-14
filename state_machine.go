@@ -51,6 +51,7 @@ func (p *Plugin) applyVerdictLocked(
 	if store == nil {
 		return verdictResult{}, errors.New("state store is not initialized")
 	}
+	defer p.refreshSelectionAccount(authID)
 	p.mu.RLock()
 	policy := p.policy
 	p.mu.RUnlock()
@@ -241,10 +242,6 @@ func (p *Plugin) applyVerdictLocked(
 	})
 	if errUpdate != nil {
 		return outcome, errUpdate
-	}
-
-	if verdict.Class == ClassNone {
-		p.markRecentSuccess(authID)
 	}
 
 	if isAccountStatusClass(verdict.Class) {
@@ -477,6 +474,7 @@ func (p *Plugin) saveGuardDisableLocked(
 	class, source string,
 	strike bool,
 ) error {
+	defer p.refreshSelectionAccount(authID)
 	store := p.stateStore()
 	if store == nil {
 		return errors.New("state store is not initialized")
@@ -532,6 +530,7 @@ func (p *Plugin) saveGuardDisableLocked(
 }
 
 func (p *Plugin) setStateExternal(authID, class string) error {
+	defer p.refreshSelectionAccount(authID)
 	return p.stateStore().Update(func(state *State) error {
 		account := p.ensureStateAccount(state, authID, "", "")
 		account.State = StateExternallyDisabled
@@ -564,6 +563,7 @@ func (p *Plugin) ManualDisable(ctx context.Context, authID, reason string) error
 }
 
 func (p *Plugin) ManualRestore(ctx context.Context, authID string) error {
+	defer p.refreshSelectionAccount(authID)
 	lock := p.accountLock(authID)
 	lock.Lock()
 	defer lock.Unlock()
@@ -660,6 +660,7 @@ func (p *Plugin) Reconcile(ctx context.Context) error {
 }
 
 func (p *Plugin) reconcileAccount(ctx context.Context, authID string) {
+	defer p.refreshSelectionAccount(authID)
 	lock := p.accountLock(authID)
 	lock.Lock()
 	defer lock.Unlock()

@@ -10,6 +10,7 @@ Grok Quality Guard 观测 Grok / xAI auth 的真实响应质量，识别 HTTP 20
 
 - 被动观测 `passive_guard`：通过 response、stream chunk 和 usage 分析已有请求，不改变路由
 - 可选透明保护 `transparent_guard`：拦截所有可识别的 Grok / xAI OAuth 请求，在首次向客户端 emit 前完成质量门
+- 透明模式由插件完整接管 auth 选择：`healthy` / `unknown` 分层、Priority 数值越大越优先、后台快照索引、round-robin/random/fill-first、preferred last-success 与 session affinity
 - 真实 thinking 证据判定，不使用空 reasoning stub 或单独的 `reasoning_tokens` 判断健康
 - 检测 `missing_thinking`、`buffered_burst`、`cipher_drool`、`fake_encrypted_dump`、`fast_reasoning_ratio_dump`、`soft_tps`、`hard_tps`、`empty_stream`、`probe_error`、`proxy_error`
 - 账号状态机：`unknown`、`healthy`、`suspect`、`degraded`、`cooling`、`quota_exhausted`、`credential_invalid`、`disabled_by_guard`、`externally_disabled`
@@ -169,6 +170,13 @@ plugins:
       model_prefixes:
         - "grok-"
 
+      routing:
+        selection_strategy: round_robin
+        prefer_last_success: true
+        session_affinity: true
+        session_affinity_ttl: "1h"
+        session_affinity_max_entries: 10000
+
       quality:
         soft_tps: 500
         hard_tps: 1000
@@ -253,6 +261,20 @@ plugins:
 主动探测只按请求级证据忽略内部 probe usage，不会在探测窗口内按 AuthID 丢弃真实请求的 usage，也不会把该账号从透明候选集中排除。
 
 透明候选只使用 `healthy` / `unknown` 账号；已进入 `suspect` 或 `degraded` 的账号不会继续承接透明请求，直到主动探测或手动恢复。`missing_thinking` 被视为账号级证据：存在其他可用账号时立即切号，代理轮换只作为单账号池的兜底；所有候选都不可用时返回 `503 quality_degraded`。
+
+### 透明 Auth 选择
+
+透明模式完全接管 Grok/xAI auth 选择，CPA 只执行插件指定的 `AuthID`。插件在后台维护不可变分层快照，请求只加载快照，不扫描账号池：
+
+- 先按质量分层：`healthy` 整体优先于 `unknown`
+- 同一质量状态下按 Auth Priority 数值从大到小分层
+- 层内可选择 `round_robin`、`random` 或 `fill_first`
+- 当前层未耗尽时不进入下一层
+- 普通策略优先选择空闲 auth；只有当前层全部 busy 时才进入 busy fallback
+- `prefer_last_success=true` 时，上次透明请求成功的 auth 只在仍健康、仍属于最高层且当前空闲时优先使用
+- `session_affinity=true` 时，同一稳定 session 尽量固定到同一 auth；绑定只存在内存中，默认 TTL `1h`，最多 `10000` 条
+
+这解决 10 个以上健康 auth 并发时，所有请求都从第一个账号开始、把流量压到同一 auth 的问题。顺序流量仍会优先填满健康且空闲的 preferred auth；并发流量在 preferred busy 时自动分散。账号 `unknown -> healthy` 后，索引在 state 提交成功后增量移动，下一个请求即可从 healthy 层看到该账号，不需要等待周期性全量刷新。
 
 透明模式在首次向客户端 emit 前完成质量门。一旦开始 emit，插件不能回滚已经发送的内容；如果所有候选账号耗尽，默认返回 `503 quality_degraded`。可配置 `on_exhausted: fail_open` 在失败时返回最后一个已缓冲响应，但这会牺牲 fail-closed 语义。透明缓冲超过 `hold_max_buffer_bytes` 时也会 fail closed，不会把未完成质量判定的内容下发给客户端。
 

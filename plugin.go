@@ -52,9 +52,11 @@ type Plugin struct {
 	workersActive      bool
 	quiescing          bool
 
-	catalogMu sync.RWMutex
-	catalog   []Account
-	catalogAt time.Time
+	catalogMu          sync.RWMutex
+	catalog            []Account
+	catalogByID        map[string]Account
+	catalogByAuthIndex map[string]Account
+	catalogAt          time.Time
 
 	authModelsMu sync.RWMutex
 	grokModels   map[string]struct{}
@@ -74,8 +76,8 @@ type Plugin struct {
 	probeSkipMu sync.Mutex
 	probeSkip   map[string]time.Time
 
-	recentSuccessMu sync.Mutex
-	recentSuccess   map[string]time.Time
+	selectionIndex   routingSelectionIndex
+	selectionRuntime routingSelectionRuntime
 
 	modelStreamsMu sync.Mutex
 	modelStreams   map[string]struct{}
@@ -94,7 +96,7 @@ func NewPlugin() *Plugin {
 		accountLocks:         make(map[string]*sync.Mutex),
 		pending:              make(map[string]*PendingObservation),
 		probeSkip:            make(map[string]time.Time),
-		recentSuccess:        make(map[string]time.Time),
+		selectionRuntime:     newRoutingSelectionRuntime(),
 		modelStreams:         make(map[string]struct{}),
 		tasks:                make(map[string]*taskRecord),
 		probing:              make(map[string]struct{}),
@@ -103,24 +105,6 @@ func NewPlugin() *Plugin {
 	}
 	plugin.probeCond = sync.NewCond(&plugin.probeGate)
 	return plugin
-}
-
-func (p *Plugin) markRecentSuccess(authID string) {
-	if p == nil || strings.TrimSpace(authID) == "" {
-		return
-	}
-	p.recentSuccessMu.Lock()
-	p.recentSuccess[authID] = time.Now().UTC()
-	p.recentSuccessMu.Unlock()
-}
-
-func (p *Plugin) recentSuccessAt(authID string) time.Time {
-	if p == nil {
-		return time.Time{}
-	}
-	p.recentSuccessMu.Lock()
-	defer p.recentSuccessMu.Unlock()
-	return p.recentSuccess[authID]
 }
 
 func (p *Plugin) stateStore() *StateStore {
@@ -349,18 +333,29 @@ func (p *Plugin) RefreshCatalog(_ context.Context) error {
 	}
 	sort.Slice(accounts, func(i, j int) bool {
 		if accounts[i].Priority != accounts[j].Priority {
-			return accounts[i].Priority < accounts[j].Priority
+			return accounts[i].Priority > accounts[j].Priority
 		}
 		return accounts[i].ID < accounts[j].ID
 	})
+	byID := make(map[string]Account, len(accounts))
+	byAuthIndex := make(map[string]Account, len(accounts))
+	for _, account := range accounts {
+		byID[account.ID] = account
+		if authIndex := strings.TrimSpace(account.AuthIndex); authIndex != "" {
+			byAuthIndex[authIndex] = account
+		}
+	}
 	p.catalogMu.Lock()
 	p.catalog = accounts
+	p.catalogByID = byID
+	p.catalogByAuthIndex = byAuthIndex
 	p.catalogAt = time.Now().UTC()
 	p.catalogMu.Unlock()
 	if authModels, errModels := p.listAuthModels(); errModels == nil {
 		p.setGrokAuthModels(authModels)
 	}
 	_ = p.syncCatalogState(accounts)
+	_ = p.rebuildSelectionIndex()
 	return nil
 }
 
@@ -435,11 +430,16 @@ func (p *Plugin) findAccount(authID string) (Account, bool) {
 	if normalized == "" {
 		return Account{}, false
 	}
-	for _, account := range p.catalogSnapshot() {
-		if account.ID == normalized || account.AuthIndex == normalized {
-			return account, true
-		}
+	p.catalogMu.RLock()
+	if account, ok := p.catalogByID[normalized]; ok {
+		p.catalogMu.RUnlock()
+		return account, true
 	}
+	if account, ok := p.catalogByAuthIndex[normalized]; ok {
+		p.catalogMu.RUnlock()
+		return account, true
+	}
+	p.catalogMu.RUnlock()
 	return Account{}, false
 }
 
@@ -513,10 +513,14 @@ func (p *Plugin) updateStateAccount(authID string, fn func(*AccountState) error)
 	if p.stateStore() == nil {
 		return errors.New("state store is not initialized")
 	}
-	return p.stateStore().UpdateIfChanged(func(state *State) error {
+	errUpdate := p.stateStore().UpdateIfChanged(func(state *State) error {
 		account := p.ensureStateAccount(state, authID, "", "")
 		return fn(account)
 	})
+	if errUpdate == nil {
+		p.refreshSelectionAccount(authID)
+	}
+	return errUpdate
 }
 
 func (p *Plugin) recordEvent(state *State, authID, class, action, result, detail string) {

@@ -730,6 +730,7 @@ func (p *Plugin) actionPolicyUpdate(params map[string]any) (any, int, error) {
 	p.cfg.PassiveGuard = normalized.PassiveGuard
 	p.cfg.AutoAction = normalized.AutoAction
 	p.cfg.ModelPrefixes = append([]string(nil), normalized.ModelPrefixes...)
+	p.cfg.Routing = normalized.Routing
 	p.cfg.Quality = normalized.Quality
 	p.cfg.Probe = normalized.Probe
 	p.cfg.Resin.AutoRotateAfterQualityFailure = normalized.ResinAutoRotateAfterQualityFail
@@ -764,6 +765,7 @@ func (p *Plugin) actionPolicyReset() (any, int, error) {
 	p.cfg.PassiveGuard = normalized.PassiveGuard
 	p.cfg.AutoAction = normalized.AutoAction
 	p.cfg.ModelPrefixes = append([]string(nil), normalized.ModelPrefixes...)
+	p.cfg.Routing = normalized.Routing
 	p.cfg.Quality = normalized.Quality
 	p.cfg.Probe = normalized.Probe
 	p.cfg.Resin.AutoRotateAfterQualityFailure = normalized.ResinAutoRotateAfterQualityFail
